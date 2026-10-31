@@ -1,0 +1,305 @@
+// 旁观者 3D 视图 (three.js): 灯、眼、地面网格, 晕面点云, 边界/焦散折线, 锥切片的入射锥, 发散度球壳.
+// 世界系与引擎一致: Z 朝上, 灯在 +X 方向的 XZ 平面内, 眼在 (0,0,h). 按需渲染 (改动或拖动时才画).
+
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js';
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js';
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
+
+const rgbHex = c => (c[0] << 16) | (c[1] << 8) | c[2];
+const col3 = c => new THREE.Color(`rgb(${c[0]},${c[1]},${c[2]})`);
+
+/** 折线集 → 线段端点数组 (LineSegmentsGeometry 用) */
+function segPositions(segs) {
+  let n = 0;
+  for (const s of segs) n += Math.max(0, s.length / 3 - 1);
+  const out = new Float32Array(n * 6);
+  let k = 0;
+  for (const s of segs) {
+    const m = s.length / 3;
+    for (let i = 0; i + 1 < m; i++) {
+      out[k++] = s[3 * i]; out[k++] = s[3 * i + 1]; out[k++] = s[3 * i + 2];
+      out[k++] = s[3 * i + 3]; out[k++] = s[3 * i + 4]; out[k++] = s[3 * i + 5];
+    }
+  }
+  return out;
+}
+
+// 圆点贴图 (点云 / 标记用)
+function dotTexture() {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.beginPath(); g.arc(32, 32, 28, 0, 2 * Math.PI); g.fill();
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+export class Scene3D {
+  constructor(host) {
+    this.host = host;
+    this.renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    this.renderer.setClearColor(0xffffff, 1);
+    host.appendChild(this.renderer.domElement);
+    this.renderer.domElement.className = 'cv3d';
+    this.scene = new THREE.Scene();
+    this.camera = new THREE.PerspectiveCamera(42, 1, 0.05, 5000);
+    this.camera.up.set(0, 0, 1);
+    this.controls = new OrbitControls(this.camera, this.renderer.domElement);
+    this.controls.enableDamping = true; this.controls.dampingFactor = 0.12;
+    this.controls.screenSpacePanning = true;
+    this.controls.addEventListener('change', () => this.dirty = true);
+    this.dot = dotTexture();
+    this.lineMats = [];
+    this.content = new THREE.Group(); this.scene.add(this.content);
+    this.base = new THREE.Group(); this.scene.add(this.base);
+    this.labels = host.querySelector('.labels3d');
+    this.dirty = true;
+    this.active = true;
+    this.userMoved = false;
+    this.renderer.domElement.addEventListener('pointerdown', () => { this.userMoved = true; });
+    this.renderer.domElement.addEventListener('wheel', () => { this.userMoved = true; }, { passive: true });
+    new ResizeObserver(() => { this._resize(); this.dirty = true; }).observe(host);
+    this._resize();
+    const loop = () => {
+      requestAnimationFrame(loop);
+      if (!this.active) return;
+      this.controls.update();
+      if (this.dirty) { this.dirty = false; this._render(); }
+    };
+    requestAnimationFrame(loop);
+  }
+
+  setActive(on) { this.active = on; if (on) { this._resize(); this.dirty = true; } }
+
+  _resize() {
+    const r = this.host.getBoundingClientRect();
+    const W = Math.max(1, Math.floor(r.width)), H = Math.max(1, Math.floor(r.height));
+    this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+    this.renderer.setSize(W, H, false);
+    this.renderer.domElement.style.width = W + 'px';
+    this.renderer.domElement.style.height = H + 'px';
+    this.camera.aspect = W / H; this.camera.updateProjectionMatrix();
+    for (const m of this.lineMats) m.resolution.set(W, H);
+    this.W = W; this.H = H;
+  }
+
+  _lineMat(col, width, o = {}) {
+    const m = new LineMaterial({
+      color: col3(col).getHex(), linewidth: width, worldUnits: false,
+      dashed: !!o.dashed, dashSize: o.dashSize || 0.6, gapSize: o.gapSize || 0.45,
+      transparent: (o.alpha ?? 1) < 1, opacity: o.alpha ?? 1,
+    });
+    m.resolution.set(this.W || 1, this.H || 1);
+    this.lineMats.push(m);
+    return m;
+  }
+
+  _clear(group) {
+    for (const ch of [...group.children]) {
+      group.remove(ch);
+      ch.traverse(o => {
+        if (o.geometry && !o.userData.shared) o.geometry.dispose();
+        if (o.material && !o.userData.sharedMat) {
+          const ms = Array.isArray(o.material) ? o.material : [o.material];
+          for (const m of ms) { const i = this.lineMats.indexOf(m); if (i >= 0) this.lineMats.splice(i, 1); m.dispose(); }
+        }
+      });
+    }
+  }
+
+  /** 灯 / 眼 / 地面 / 灯-眼连线 (场景尺度随灯距变) */
+  setBase(B) {
+    this._clear(this.base);
+    const L = B.lamp, E = B.eye;
+    const span = Math.max(20, B.extent || 60);
+    this.span = span;
+    const rS = Math.max(0.12, span * 0.008);
+    if (B.ground) {
+      const size = Math.ceil(span * 1.25 / 10) * 20;
+      const grid = new THREE.GridHelper(size, Math.round(size / niceStep(size / 30)), 0xb9c0c9, 0xe3e6ea);
+      grid.rotation.x = Math.PI / 2;
+      grid.position.set(L[0] * 0.5, 0, 0);
+      this.base.add(grid);
+    }
+    if (B.foci) {
+      const sg = new THREE.SphereGeometry(rS, 24, 16);
+      const lamp = new THREE.Mesh(sg, new THREE.MeshBasicMaterial({ color: 0xf29a1a }));
+      lamp.position.set(L[0], L[1], L[2]);
+      const eye = new THREE.Mesh(sg.clone(), new THREE.MeshBasicMaterial({ color: 0x2563eb }));
+      eye.position.set(E[0], E[1], E[2]);
+      this.base.add(lamp, eye);
+      this.focusMeshes = [lamp, eye]; this.rS = rS;
+      this._scaleFoci();
+      const g = new LineSegmentsGeometry(); g.setPositions([L[0], L[1], L[2], E[0], E[1], E[2]]);
+      const ln = new LineSegments2(g, this._lineMat([120, 120, 120], 1.2, { dashed: true, dashSize: span * 0.012, gapSize: span * 0.01 }));
+      ln.computeLineDistances();
+      this.base.add(ln);
+      // 灯 / 眼 在地面上的投影竖线
+      const g2 = new LineSegmentsGeometry(); g2.setPositions([L[0], L[1], 0, L[0], L[1], L[2], E[0], E[1], 0, E[0], E[1], E[2]]);
+      this.base.add(new LineSegments2(g2, this._lineMat([150, 150, 150], 1, { alpha: 0.6 })));
+    }
+    this.lamp = L; this.eye = E;
+    this.labelPts = B.foci ? [{ p: L, text: B.lampText || 'L', cls: 'lamp' }, { p: E, text: B.eyeText || 'E', cls: 'eye' }] : [];
+    if (!this.userMoved) this.preset('oblique', true);
+    this.dirty = true;
+  }
+
+  /** 晕面内容 (同 SkyView 的显示列表; 只取 3D 有意义的部分) */
+  setScene(S) {
+    this._clear(this.content);
+    if (!S) { this.dirty = true; return; }
+    const add = (obj) => {
+      this.content.add(obj);
+      if (S.mirror) {
+        const m = obj.clone();
+        m.userData.shared = true; m.userData.sharedMat = true;
+        m.traverse(o => { o.userData.shared = true; o.userData.sharedMat = true; });
+        m.scale.y = -1;
+        this.content.add(m);
+      }
+    };
+    for (const cl of S.clouds) {
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(cl.pts, 3));
+      let mat;
+      if (cl.cols) {
+        g.setAttribute('color', new THREE.BufferAttribute(cl.cols, 3, true));
+        mat = new THREE.PointsMaterial({ size: (cl.size || 1.6) * 1.6, sizeAttenuation: false, vertexColors: true,
+          map: this.dot, alphaTest: 0.4, transparent: true, opacity: Math.min(1, (cl.alpha ?? 0.5) + 0.3), depthWrite: false });
+      } else {
+        mat = new THREE.PointsMaterial({ size: (cl.size || 1.6) * 1.6, sizeAttenuation: false, color: col3(cl.col || [70, 130, 180]),
+          map: this.dot, alphaTest: 0.4, transparent: true, opacity: Math.min(1, (cl.alpha ?? 0.5) + 0.3), depthWrite: false });
+      }
+      add(new THREE.Points(g, mat));
+    }
+    for (const ln of S.lines) {
+      if (ln.skyOnly) continue;
+      const pos = segPositions(ln.segs3d || ln.segs);
+      if (pos.length === 0) continue;
+      const g = new LineSegmentsGeometry(); g.setPositions(pos);
+      const obj = new LineSegments2(g, this._lineMat(ln.col, (ln.width || 1.6) * 1.15, { dashed: !!ln.dash, alpha: ln.alpha ?? 1, dashSize: this.span * 0.012, gapSize: this.span * 0.008 }));
+      if (ln.dash) obj.computeLineDistances();
+      add(obj);
+    }
+    for (const mk of S.marks) {
+      if (mk.skyOnly) continue;
+      const pts = mk.pts3d || mk.pts;
+      if (!pts || pts.length < 3) continue;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(pts, 3));
+      add(new THREE.Points(g, new THREE.PointsMaterial({ size: (mk.size || 4) * 2.4, sizeAttenuation: false, color: col3(mk.col),
+        map: this.dot, alphaTest: 0.4, transparent: true })));
+    }
+    // 锥切片: 灯处仰角 h 的入射锥 (光线方向 û 的仰角 = −h)
+    if (S.cone) {
+      const { h, R, alpha } = S.cone, L = this.lamp;
+      const half = (90 - h) * Math.PI / 180, sA = Math.sin(half), cA = Math.cos(half);
+      const seg = 72, rings = 16, pos = [], idx = [];
+      for (let r = 0; r <= rings; r++) {
+        const t = r / rings * R;
+        for (let i = 0; i <= seg; i++) {
+          const ph = 2 * Math.PI * i / seg;
+          pos.push(L[0] + sA * Math.cos(ph) * t, L[1] + sA * Math.sin(ph) * t, L[2] - cA * t);
+        }
+      }
+      for (let r = 0; r < rings; r++)
+        for (let i = 0; i < seg; i++) {
+          const a = r * (seg + 1) + i, b = a + 1, c = a + seg + 1, d = c + 1;
+          idx.push(a, c, b, b, c, d);
+        }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setIndex(idx);
+      const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xf2a33a, transparent: true, opacity: alpha, side: THREE.DoubleSide, depthWrite: false }));
+      this.content.add(mesh);
+      const rim = [];
+      for (let i = 0; i <= seg; i++) { const ph = 2 * Math.PI * i / seg; rim.push(L[0] + sA * Math.cos(ph) * R, L[1] + sA * Math.sin(ph) * R, L[2] - cA * R); }
+      const rg = new LineSegmentsGeometry(); rg.setPositions(segPositions([new Float32Array(rim)]));
+      this.content.add(new LineSegments2(rg, this._lineMat([214, 130, 20], 1.2, { alpha: 0.8 })));
+    }
+    // 发散度球壳: 以眼为心、半径 r 的半透明球 + 三个大圆
+    if (S.shell && S.shell.sphere) {
+      const { r, alpha } = S.shell, E = this.eye;
+      const g = new THREE.SphereGeometry(1, 64, 32);
+      const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0x2bb39a, transparent: true, opacity: alpha, side: THREE.DoubleSide, depthWrite: false }));
+      mesh.scale.setScalar(r); mesh.position.set(E[0], E[1], E[2]);
+      this.content.add(mesh);
+      const rings = [];
+      for (let k = 0; k < 3; k++) {
+        const a = [];
+        for (let i = 0; i <= 120; i++) {
+          const t = 2 * Math.PI * i / 120, c = Math.cos(t) * r, s = Math.sin(t) * r;
+          if (k === 0) a.push(E[0] + c, E[1] + s, E[2]); else if (k === 1) a.push(E[0] + c, E[1], E[2] + s); else a.push(E[0], E[1] + c, E[2] + s);
+        }
+        rings.push(new Float32Array(a));
+      }
+      const rg = new LineSegmentsGeometry(); rg.setPositions(segPositions(rings));
+      this.content.add(new LineSegments2(rg, this._lineMat([30, 140, 120], 1, { alpha: 0.55 })));
+    }
+    this.dirty = true;
+  }
+
+  /** 新结果的取景范围 (中心, 半径); 用户没动过镜头时自动取景 */
+  frame(c, r) {
+    this.focus = { c, r: Math.max(2, r) };
+    this._scaleFoci();
+    if (!this.userMoved) this.preset(this.lastPreset || 'oblique', true);
+  }
+
+  // 灯 / 眼小球: 半径 ≈ 取景半径的 1.6%
+  _scaleFoci() {
+    if (!this.focusMeshes || !this.focus) return;
+    const s = clampN(this.focus.r * 0.016, 0.05, 1e9) / this.rS;
+    for (const m of this.focusMeshes) m.scale.setScalar(s);
+    this.dirty = true;
+  }
+
+  /** 镜头预设: oblique 斜看 / side 侧面 / top 俯视 / eye 从眼睛看灯 */
+  preset(kind, quiet) {
+    const L = this.lamp || [15, 0, 3], E = this.eye || [0, 0, 0];
+    const span = this.span || 40;
+    this.lastPreset = kind;
+    const f = this.focus;
+    const tgt = f ? new THREE.Vector3(f.c[0], f.c[1], f.c[2]) : new THREE.Vector3((L[0] + E[0]) / 2, 0, (L[2] + E[2]) / 2);
+    const tv = Math.tan(this.camera.fov * Math.PI / 360), th = tv * Math.max(0.2, this.camera.aspect);
+    const d = f ? f.r / Math.min(tv, th) * 1.05 : span * 1.35;
+    const cam = this.camera;
+    if (kind === 'side') cam.position.set(tgt.x, tgt.y - d, tgt.z + d * 0.05);
+    else if (kind === 'top') cam.position.set(tgt.x, tgt.y - d * 0.02, tgt.z + d * 1.1);
+    else if (kind === 'eye') {
+      cam.position.set(E[0] - span * 0.02, E[1], E[2] + 0.001);
+      tgt.set(L[0], L[1], L[2]);
+    } else cam.position.set(tgt.x - d * 0.55, tgt.y - d * 0.75, tgt.z + d * 0.55);
+    this.controls.target.copy(tgt);
+    cam.lookAt(tgt);
+    this.controls.update();
+    if (!quiet) this.userMoved = true;
+    this.dirty = true;
+  }
+
+  _render() {
+    this.renderer.render(this.scene, this.camera);
+    // 灯 / 眼 文字标签
+    if (this.labels) {
+      let html = '';
+      const v = new THREE.Vector3();
+      for (const lb of this.labelPts || []) {
+        v.set(lb.p[0], lb.p[1], lb.p[2]).project(this.camera);
+        if (v.z > 1 || v.z < -1) continue;
+        const x = (v.x + 1) / 2 * this.W, y = (1 - v.y) / 2 * this.H;
+        html += `<span class="lb3 ${lb.cls}" style="left:${x.toFixed(1)}px;top:${y.toFixed(1)}px">${lb.text}</span>`;
+      }
+      this.labels.innerHTML = html;
+    }
+  }
+
+  snapshot() { this._render(); return this.renderer.domElement; }
+}
+
+const clampN = (x, a, b) => Math.max(a, Math.min(b, x));
+function niceStep(x) {
+  const p = Math.pow(10, Math.floor(Math.log10(x))), m = x / p;
+  return (m < 1.5 ? 1 : m < 3.5 ? 2 : m < 7.5 ? 5 : 10) * p;
+}
+export { rgbHex };

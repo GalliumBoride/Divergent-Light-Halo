@@ -1,0 +1,19 @@
+{
+  "name": "divergent-light-halo",
+  "version": "0.1.0",
+  "description": "Divergent-light (street-lamp) ice halos in 3D: exact halo surfaces, boundaries, caustics and divergency shells in a single offline HTML file",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/GalliumBoride/Divergent-Light-Halo.git" },
+  "homepage": "https://galliumboride.github.io/Divergent-Light-Halo/",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "serve": "node tools/serve.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.24.2",
+    "three": "0.160.0"
+  }
+}
