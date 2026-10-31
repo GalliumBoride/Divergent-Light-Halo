@@ -8,6 +8,8 @@ import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeome
 import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js';
 
 const rgbHex = c => (c[0] << 16) | (c[1] << 8) | c[2];
+// sRGB 0–255 → 线性 (顶点色要线性值; 输出时 three 再转回 sRGB)
+const SRGB2LIN = new Float32Array(256).map((_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); });
 const col3 = c => new THREE.Color(`rgb(${c[0]},${c[1]},${c[2]})`);
 
 /** 折线集 → 线段端点数组 (LineSegmentsGeometry 用) */
@@ -174,13 +176,52 @@ export class Scene3D {
       }
       add(new THREE.Points(g, mat));
     }
+    // 晕面网格: 顶点色 × 烘焙的双面明暗 (MeshBasic, 不依赖灯光单位); 略往后推, 压在面上的线不被挡
+    for (const m of S.meshes || []) {
+      const P = m.pos, nV = P.length / 3;
+      if (!nV) continue;
+      const col = new Float32Array(3 * nV), base = m.col || [70, 130, 180];
+      const l1 = [-0.35, -0.55, 0.76], l2 = [0.6, 0.3, 0.3];
+      for (let t = 0; t < nV / 3; t++) {
+        const o = 9 * t;
+        const ux = P[o + 3] - P[o], uy = P[o + 4] - P[o + 1], uz = P[o + 5] - P[o + 2];
+        const vx = P[o + 6] - P[o], vy = P[o + 7] - P[o + 1], vz = P[o + 8] - P[o + 2];
+        let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+        const sh = 0.5 + 0.38 * Math.abs(nx * l1[0] + ny * l1[1] + nz * l1[2]) + 0.12 * Math.abs(nx * l2[0] + ny * l2[1] + nz * l2[2]);
+        for (let k = 0; k < 3; k++) {
+          const v = 3 * t + k;
+          const r = m.cols ? m.cols[3 * v] : base[0], g = m.cols ? m.cols[3 * v + 1] : base[1], b = m.cols ? m.cols[3 * v + 2] : base[2];
+          col[3 * v] = SRGB2LIN[r] * sh; col[3 * v + 1] = SRGB2LIN[g] * sh; col[3 * v + 2] = SRGB2LIN[b] * sh;
+        }
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.BufferAttribute(P, 3));
+      g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      add(new THREE.Mesh(g, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.9,
+        polygonOffset: true, polygonOffsetFactor: 1.5, polygonOffsetUnits: 2 })));
+    }
     for (const ln of S.lines) {
       if (ln.skyOnly) continue;
       const pos = segPositions(ln.segs3d || ln.segs);
       if (pos.length === 0) continue;
       const g = new LineSegmentsGeometry(); g.setPositions(pos);
-      const obj = new LineSegments2(g, this._lineMat(ln.col, (ln.width || 1.6) * 1.15, { dashed: !!ln.dash, alpha: ln.alpha ?? 1, dashSize: this.span * 0.012, gapSize: this.span * 0.008 }));
-      if (ln.dash) obj.computeLineDistances();
+      let obj;
+      if (ln.segCols) {                 // 每条一种颜色 (二自由度 h 层)
+        const cols = new Float32Array(pos.length);
+        let k = 0;
+        ln.segs.forEach((s, i) => {
+          const c = ln.segCols[i], r = SRGB2LIN[c[0] | 0], gg = SRGB2LIN[c[1] | 0], b = SRGB2LIN[c[2] | 0];
+          for (let j = 0; j < 2 * Math.max(0, s.length / 3 - 1); j++) { cols[k++] = r; cols[k++] = gg; cols[k++] = b; }
+        });
+        g.setColors(cols);
+        const mat = this._lineMat([255, 255, 255], (ln.width || 1.3) * 1.15, { alpha: ln.alpha ?? 1 });
+        mat.vertexColors = true;
+        obj = new LineSegments2(g, mat);
+      } else {
+        obj = new LineSegments2(g, this._lineMat(ln.col, (ln.width || 1.6) * 1.15, { dashed: !!ln.dash, alpha: ln.alpha ?? 1, dashSize: this.span * 0.012, gapSize: this.span * 0.008 }));
+        if (ln.dash) obj.computeLineDistances();
+      }
       add(obj);
     }
     for (const mk of S.marks) {

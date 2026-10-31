@@ -41,6 +41,60 @@ class Raster {
       }
     }
   }
+
+  // 面片图层: 三角形先写进覆盖层 (后写覆盖, 不叠加变暗), 最后按固定透明度合成到底图
+  layerBegin() {
+    const n = this.W * this.H;
+    if (!this.lcol || this.lcol.length !== n) { this.lcol = new Uint32Array(n); this.lmask = new Uint8Array(n); }
+    else this.lmask.fill(0);
+  }
+  // 三角形 (CSS 像素), c = 打包颜色 0xBBGGRR; 没盖住任何像素中心的小三角形点在重心
+  tri(x0, y0, x1, y1, x2, y2, c) {
+    const s = this.s, W = this.W, H = this.H;
+    x0 *= s; y0 *= s; x1 *= s; y1 *= s; x2 *= s; y2 *= s;
+    let minX = Math.floor(Math.min(x0, x1, x2)), maxX = Math.ceil(Math.max(x0, x1, x2));
+    let minY = Math.floor(Math.min(y0, y1, y2)), maxY = Math.ceil(Math.max(y0, y1, y2));
+    const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+    let hit = false;
+    if ((maxX - minX > 1 || maxY - minY > 1) && area !== 0) {
+      if (minX < 0) minX = 0; if (minY < 0) minY = 0;
+      if (maxX > W - 1) maxX = W - 1; if (maxY > H - 1) maxY = H - 1;
+      const sg = area > 0 ? 1 : -1;
+      for (let y = minY; y <= maxY; y++) {
+        const py = y + 0.5;
+        for (let x = minX; x <= maxX; x++) {
+          const px = x + 0.5;
+          if (sg * ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) < 0) continue;
+          if (sg * ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) < 0) continue;
+          if (sg * ((x0 - px) * (y1 - py) - (x1 - px) * (y0 - py)) < 0) continue;
+          const k = y * W + x; this.lcol[k] = c; this.lmask[k] = 1; hit = true;
+        }
+      }
+    }
+    if (!hit) {
+      const x = Math.floor((x0 + x1 + x2) / 3), y = Math.floor((y0 + y1 + y2) / 3);
+      if (x >= 0 && y >= 0 && x < W && y < H) { const k = y * W + x; this.lcol[k] = c; this.lmask[k] = 1; }
+    }
+  }
+  layerEnd(a, circle) {
+    const sa = Math.round(a * 256), ia = 256 - sa, buf = this.buf, lc = this.lcol, lm = this.lmask;
+    if (circle) {            // 画框圆外的覆盖清掉 (CSS 像素 → 设备像素)
+      const s = this.s, cx = circle.cx * s, cy = circle.cy * s, r2 = (circle.r * s) ** 2, W = this.W;
+      for (let k = 0; k < lm.length; k++) {
+        if (!lm[k]) continue;
+        const x = k % W + 0.5 - cx, y = (k / W | 0) + 0.5 - cy;
+        if (x * x + y * y > r2) lm[k] = 0;
+      }
+    }
+    for (let k = 0; k < lm.length; k++) {
+      if (!lm[k]) continue;
+      const d = buf[k], c = lc[k];
+      const r = ((c & 255) * sa + (d & 255) * ia + 128) >> 8;
+      const g = (((c >> 8) & 255) * sa + ((d >> 8) & 255) * ia + 128) >> 8;
+      const b = (((c >> 16) & 255) * sa + ((d >> 16) & 255) * ia + 128) >> 8;
+      buf[k] = 0xFF000000 | (b << 16) | (g << 8) | r;
+    }
+  }
 }
 
 // ============================================================ 天球镜头
@@ -103,6 +157,33 @@ export class SkyProj {
       default: r = rpx * th / hf;
     }
     this.x = cx + r * tr; this.y = cy - r * tu;
+    return true;
+  }
+
+  /** 同 project, 但不按视场裁 (面片跨画框时用; 之后按画框圆遮罩). 背后半球 / 正交镜头背面仍返回 false. */
+  projectLoose(Dx, Dy, Dz) {
+    const lens = this.lens;
+    if (lens === 5) return this.project(Dx, Dy, Dz);
+    const ax = this.ax;
+    let cc = Dx * ax[0] + Dy * ax[1] + Dz * ax[2];
+    if (cc > 1) cc = 1; else if (cc < -1) cc = -1;
+    if (lens === 0 && cc < 0.0087) return false;
+    if (cc < -0.999) return false;
+    const px = Dx - cc * ax[0], py = Dy - cc * ax[1], pz = Dz - cc * ax[2];
+    let pn = Math.sqrt(px * px + py * py + pz * pz);
+    if (pn < 1e-12) pn = 1;
+    const rt = this.rt, up = this.up;
+    const tr = (px * rt[0] + py * rt[1] + pz * rt[2]) / pn, tu = (px * up[0] + py * up[1] + pz * up[2]) / pn;
+    const th = Math.acos(cc), hf = this.hf, rpx = this.rpx;
+    let r;
+    switch (lens) {
+      case 0: r = this.linFocal * Math.tan(th); break;
+      case 1: r = rpx * Math.sin(th / 2) / Math.max(1e-9, Math.sin(hf / 2)); break;
+      case 3: r = rpx * Math.tan(Math.min(th, 3.1) / 2) / Math.max(1e-9, Math.tan(hf / 2)); break;
+      case 4: if (th > Math.PI / 2) return false; r = rpx * Math.sin(th) / Math.max(1e-9, Math.sin(Math.min(hf, Math.PI / 2))); break;
+      default: r = rpx * th / hf;
+    }
+    this.x = this.cx + r * tr; this.y = this.cy - r * tu;
     return true;
   }
 
@@ -257,7 +338,7 @@ export class SkyView {
     this.ras.resize(ctx, this.cv.width, this.cv.height, this.dpr);
     this.ras.clear([255, 255, 255]);
     const S = this.S;
-    if (S) this._drawClouds();
+    if (S) { this._drawMeshes(); this._drawClouds(); }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.putImageData(this.ras.img, 0, 0);
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -268,6 +349,49 @@ export class SkyView {
     this._drawFrame();
     this._base = ctx.getImageData(0, 0, this.cv.width, this.cv.height);
     this._drawHover();
+  }
+
+  // 晕面网格: 每个三角形三个顶点的视方向 → 画面; 颜色取三顶点平均.
+  // 跨画框的三角形照画 (不按视场裁), 合成时按画框圆遮罩; 只丢掉张角过大 (>30°) 或跨全景接缝的三角形
+  _drawMeshes() {
+    const S = this.S;
+    if (!S.meshes || !S.meshes.length) return;
+    const p = this.proj, ras = this.ras, E = S.eye;
+    const cosMax = Math.cos(30 * DEG);
+    const sides = S.mirror ? [1, -1] : [1];
+    const step = this.dragging ? 2 : 1;
+    ras.layerBegin();
+    const X = new Float64Array(3), Y = new Float64Array(3), U = new Float64Array(9);
+    for (const m of S.meshes) {
+      const P = m.pos, cols = m.cols, nT = P.length / 9, base = m.col || [70, 130, 180];
+      const packedBase = (base[2] << 16) | (base[1] << 8) | base[0];
+      for (const ys of sides)
+        for (let t = 0; t < nT; t += step) {
+          let ok = true;
+          for (let k = 0; k < 3; k++) {
+            const o = 9 * t + 3 * k;
+            const dx = P[o] - E[0], dy = ys * P[o + 1] - E[1], dz = P[o + 2] - E[2];
+            const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (r < 1e-9) { ok = false; break; }
+            U[3 * k] = dx / r; U[3 * k + 1] = dy / r; U[3 * k + 2] = dz / r;
+            if (!p.projectLoose(U[3 * k], U[3 * k + 1], U[3 * k + 2])) { ok = false; break; }
+            X[k] = p.x; Y[k] = p.y;
+          }
+          if (!ok) continue;
+          if (!p.connect(U[0], U[1], U[2], U[3], U[4], U[5], cosMax) || !p.connect(U[3], U[4], U[5], U[6], U[7], U[8], cosMax)
+            || !p.connect(U[0], U[1], U[2], U[6], U[7], U[8], cosMax)) continue;
+          let c = packedBase;
+          if (cols) {
+            const o = 9 * t;
+            const r = (cols[o] + cols[o + 3] + cols[o + 6]) / 3 | 0, g = (cols[o + 1] + cols[o + 4] + cols[o + 7]) / 3 | 0, b = (cols[o + 2] + cols[o + 5] + cols[o + 8]) / 3 | 0;
+            c = (b << 16) | (g << 8) | r;
+          }
+          ras.tri(X[0], Y[0], X[1], Y[1], X[2], Y[2], c);
+        }
+    }
+    // 鱼眼 (视场 < 360°): 只合成画框圆以内的像素
+    const V = this.V, round = V.lens >= 1 && V.lens <= 4 && V.fov < 359;
+    ras.layerEnd(0.62, round ? { cx: p.cx, cy: p.cy, r: p.rpx } : null);
   }
 
   _drawClouds() {
@@ -313,9 +437,18 @@ export class SkyView {
     ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     const sides = S.mirror ? [1, -1] : [1];
     for (const ln of S.lines) {
-      ctx.strokeStyle = css(ln.col, ln.alpha ?? 1);
       ctx.lineWidth = ln.width || 1.6;
       ctx.setLineDash(ln.dash || []);
+      if (ln.segCols) {                       // 每条一种颜色 (二自由度的 h 层)
+        ln.segs.forEach((seg, k) => {
+          ctx.strokeStyle = css(ln.segCols[k].map(v => v | 0), ln.alpha ?? 1);
+          ctx.beginPath();
+          for (const ys of sides) this._pathOf(seg, ys);
+          ctx.stroke();
+        });
+        continue;
+      }
+      ctx.strokeStyle = css(ln.col, ln.alpha ?? 1);
       ctx.beginPath();
       for (const ys of (ln.noMirror ? [1] : sides)) for (const seg of ln.segs) this._pathOf(seg, ys);
       ctx.stroke();

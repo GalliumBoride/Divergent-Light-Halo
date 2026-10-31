@@ -37,13 +37,14 @@ const DEFAULTS = {
   elev: 10, dist: 15, eye: 0,
   paths: '3-5', mode: 'parry', zeta: -90, theta: 0, colZeta: -90, lowTheta: 0, surf2: 'caustic',
   n: 1.31, apexUp: 56, apexLo: 56, q: 0, maxDist: 80, pyr: false,
-  lay: { pts: true, colorBy: 'h', bEntry: true, bMirror: true, bTir: true, bSeam: true, bTurn: true, bCusp: true,
+  lay: { surf: true, pts: false, colorBy: 'h', bEntry: true, bMirror: true, bTir: true, bSeam: true, bTurn: true, bCusp: true,
          caustic: false, cSeam: false, cAsym: true, parArc: true, ref22: false, foci: true, ground: true, mirror: true },
   cone: { on: false, h: 22, alpha: 30 },
   shell: { on: false, kappa: -0.301, r: 7.5, master: 'kappa', sphere: true, alpha: 12 },
-  view: 'split', sky: { az: 0, el: 10, fov: 180, lens: 2 }, lang: null,
+  view: 'split', single: 'sky', sky: { az: 0, el: 10, fov: 180, lens: 2 }, lang: null,
+  panel: true, rt: 'layers', crystalOpen: false,
 };
-const STORE = 'divergent-light-halo.v1';
+const STORE = 'divergent-light-halo.v2';
 function loadState() {
   let s = null;
   try { s = JSON.parse(localStorage.getItem(STORE) || 'null'); } catch (e) { s = null; }
@@ -123,15 +124,17 @@ function runMain() {
   cs.forEach((code, ip) => {
     const fp = parsePath(code);
     const base = { ...common(), fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta, lowitz: !!o.lowitz };
-    const P = { code, fp, dof: o.dof, h: [], s: [], layers: [], bdry: null, edges: null, cloud: null, t0: performance.now(), ms: 0, left: 0 };
+    const P = { code, fp, dof: o.dof, h: [], s: [], layers: [], nH: 0, mesh: null, bdry: null, edges: null, cloud: null, t0: performance.now(), ms: 0, left: 0 };
     R.paths.push(P);
     if (o.dof === 1) {
       const nH = [320, 640, 1280][q], nA = [360, 720, 1440][q], nAS = [360, 720, 1440][q], nPs = [720, 1440, 2880][q];
+      tasks.push({ kind: 'mesh1', args: { ...base, budget: [100000, 250000, 600000][q] } }); route.push([ip, 'mesh']);
       tasks.push({ kind: 'bdry1', args: base }); route.push([ip, 'bdry']);
       for (const [a, b] of ranges(nAS, K)) { tasks.push({ kind: 'coneS', args: { ...base, nA: nAS, nPsi: nPs, from: a, to: b } }); route.push([ip, 's', a]); }
       for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'coneH', args: { ...base, nH, nA, from: a, to: b } }); route.push([ip, 'h', a]); }
     } else {
       const nH = [72, 120, 180][q], nG = [101, 141, 181][q];
+      P.nH = nH;
       tasks.push({ kind: 'edges2', args: { ...base, surf: S.surf2, nG } }); route.push([ip, 'edges']);
       for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'layers2', args: { ...base, surf: S.surf2, nH, nG, from: a, to: b } }); route.push([ip, 'layers', a]); }
     }
@@ -146,10 +149,11 @@ function runMain() {
     const [ip, part, at] = route[i], P = R.paths[ip];
     if (part === 'bdry') P.bdry = d;
     else if (part === 'edges') P.edges = d;
+    else if (part === 'mesh') { P.mesh = d; P.meshCol = null; }
     else if (part === 'h') d.forEach((a, k) => { P.h[at + k] = a; });
     else if (part === 's') d.forEach((a, k) => { P.s[at + k] = a; });
     else if (part === 'layers') d.forEach((a, k) => { P.layers[at + k] = a; });
-    if (part !== 'bdry' && part !== 'edges') P.cloud = null;
+    if (part !== 'bdry' && part !== 'edges' && part !== 'mesh') P.cloud = null;
     if (--P.left === 0) P.ms = performance.now() - P.t0;
     R.done++;
     scheduleRefresh();
@@ -276,27 +280,53 @@ function rhoOf(P, i, E, D) {
   const r = Math.hypot(P[3 * i] - E[0], P[3 * i + 1] - E[1], P[3 * i + 2] - E[2]);
   return Math.log10(Math.max(1e-6, r / D));
 }
+// 一条光路的晕面位置 (网格顶点优先, 没有网格就用采样点) — 取景 / 着色范围 / 锥面大小用
+function surfPts(P) {
+  if (P.mesh && P.mesh.pos.length) return P.mesh.pos;
+  return pathCloud(P).pts;
+}
 function colorRange(mode) {
   if (!R || (mode !== 'h' && mode !== 'rho')) return null;
   const { L, E } = scene(), D = baseline();
   let lo = Infinity, hi = -Infinity;
+  const take = v => { if (v < lo) lo = v; if (v > hi) hi = v; };
   for (const P of R.paths) {
-    const pts = pathCloud(P).pts, n = pts.length / 3, step = Math.max(1, Math.floor(n / 20000));
-    for (let i = 0; i < n; i += step) {
-      const v = mode === 'h' ? hOf(pts, i, L) : rhoOf(pts, i, E, D);
-      if (v < lo) lo = v; if (v > hi) hi = v;
+    if (mode === 'h' && P.mesh && P.mesh.h.length) {
+      const a = P.mesh.h, st = Math.max(1, Math.floor(a.length / 40000));
+      for (let i = 0; i < a.length; i += st) take(a[i]);
+    } else {
+      const pts = surfPts(P), n = pts.length / 3, st = Math.max(1, Math.floor(n / 40000));
+      for (let i = 0; i < n; i += st) take(mode === 'h' ? hOf(pts, i, L) : rhoOf(pts, i, E, D));
     }
+    if (mode === 'h') P.layers.forEach((l, ih) => { if (l && l.curves.length) take(layerH(P, ih)); });
   }
   if (!(hi > lo)) { lo = (lo === Infinity ? 0 : lo) - 1; hi = lo + 2; }
   return [lo, hi];
 }
+const layerH = (P, ih) => -90 + 180 * ih / Math.max(1, P.nH - 1);
 
-// 锥面画多大: 晕面点离灯最远处 (不超过截断距离), 没有点时取灯距
+// 网格顶点颜色 (按 h 用网格自带的精确 h; 按 ρ 由位置算)
+function meshColors(P, mode, rng) {
+  if (mode === 'mono' || mode === 'path' || !rng) return null;
+  const key = mode + '|' + rng.join(',');
+  if (P.meshCol && P.meshCol.key === key) return P.meshCol.cols;
+  const pos = P.mesh.pos, n = pos.length / 3, cols = new Uint8Array(3 * n);
+  const { E } = scene(), D = baseline(), span = Math.max(1e-9, rng[1] - rng[0]);
+  for (let i = 0; i < n; i++) {
+    const v = mode === 'h' ? P.mesh.h[i] : rhoOf(pos, i, E, D);
+    const c = cmap((v - rng[0]) / span);
+    cols[3 * i] = c[0]; cols[3 * i + 1] = c[1]; cols[3 * i + 2] = c[2];
+  }
+  P.meshCol = { key, cols };
+  return cols;
+}
+
+// 锥面画多大: 晕面离灯最远处 (不超过截断距离), 没有晕面时取灯距
 function coneReach() {
   const { L } = scene();
   let m = 0;
   if (R) for (const P of R.paths) {
-    const a = pathCloud(P).pts, n = a.length / 3, st = Math.max(1, Math.floor(n / 5000));
+    const a = surfPts(P), n = a.length / 3, st = Math.max(1, Math.floor(n / 5000));
     for (let i = 0; i < n; i += st) m = Math.max(m, Math.hypot(a[3 * i] - L[0], a[3 * i + 1] - L[1], a[3 * i + 2] - L[2]));
   }
   return Math.min(S.maxDist, Math.max(S.dist, m * 1.1));
@@ -309,12 +339,30 @@ function lampElevFromEye() {
 
 function buildDL() {
   const { L, E } = scene();
-  const dl = { eye: E, lamp: L, mirror: S.lay.mirror, clouds: [], lines: [], marks: [], cone: null, shell: null };
+  const dl = { eye: E, lamp: L, mirror: S.lay.mirror, meshes: [], clouds: [], lines: [], marks: [], cone: null, shell: null };
   const lay = S.lay;
   const line = (segs, col, width, extra = {}) => { if (segs && segs.length) dl.lines.push({ segs, col, width, ...extra }); };
   const rng = colorRange(lay.colorBy);
   dl.colorRange = rng;
   if (R) R.paths.forEach((P, ip) => {
+    const pcol = lay.colorBy === 'path' ? PATHCOL[ip % PATHCOL.length] : C.pts;
+    if (lay.surf && P.mesh && P.mesh.pos.length)
+      dl.meshes.push({ pos: P.mesh.pos, cols: meshColors(P, lay.colorBy, rng), col: pcol });
+    if (lay.surf && P.dof === 2) {
+      // 二自由度: 每个 h 层是一条 (或几条) 平行光曲线经锥映射 → 按层着色的线
+      const segs = [], segCols = [], D = baseline(), span = rng ? Math.max(1e-9, rng[1] - rng[0]) : 1;
+      P.layers.forEach((l, ih) => {
+        if (!l) return;
+        const h = layerH(P, ih);
+        for (const c of l.curves) {
+          let col = pcol;
+          if (rng && lay.colorBy === 'h') col = cmap((h - rng[0]) / span);
+          else if (rng && lay.colorBy === 'rho') col = cmap((rhoOf(c, Math.floor(c.length / 6), E, D) - rng[0]) / span);
+          segs.push(c); segCols.push(col);
+        }
+      });
+      if (segs.length) dl.lines.push({ segs, segCols, col: pcol, width: 1.3, alpha: 0.9 });
+    }
     if (lay.pts) {
       const cl = pathCloud(P);
       if (cl.pts.length) {
@@ -396,11 +444,15 @@ function frame3d() {
   const { L, E } = scene();
   const xs = [L[0], E[0]], ys = [L[1], E[1]], zs = [L[2], E[2]];
   if (R) for (const P of R.paths) {
-    const a = pathCloud(P).pts, n = a.length / 3, st = Math.max(1, Math.floor(n / 4000));
-    for (let i = 0; i < n; i += st) { xs.push(a[3 * i]); ys.push(a[3 * i + 1], -a[3 * i + 1]); zs.push(a[3 * i + 2]); }
+    const parts = [surfPts(P)];
+    for (const l of P.layers) if (l) parts.push(...l.curves);
+    for (const a of parts) {
+      const n = a.length / 3, st = Math.max(1, Math.floor(n / 4000));
+      for (let i = 0; i < n; i += st) { xs.push(a[3 * i]); ys.push(a[3 * i + 1], -a[3 * i + 1]); zs.push(a[3 * i + 2]); }
+    }
   }
   const q = (v, f) => { const s = v.slice().sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.max(0, Math.round(f * (s.length - 1))))]; };
-  const lo = [q(xs, 0.02), q(ys, 0.02), q(zs, 0.02)], hi = [q(xs, 0.98), q(ys, 0.98), q(zs, 0.98)];
+  const lo = [q(xs, 0.005), q(ys, 0.005), q(zs, 0.005)], hi = [q(xs, 0.995), q(ys, 0.995), q(zs, 0.995)];
   for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], L[k], E[k]); hi[k] = Math.max(hi[k], L[k], E[k]); }
   v3.frame([(lo[0] + hi[0]) / 2, (lo[1] + hi[1]) / 2, (lo[2] + hi[2]) / 2], 0.5 * Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]));
 }
@@ -414,7 +466,7 @@ function scheduleRefresh() {
 function renderColorbar(rng) {
   const cb = $('colorbar');
   const mode = S.lay.colorBy;
-  if (!rng || !S.lay.pts || (mode !== 'h' && mode !== 'rho')) { cb.hidden = true; return; }
+  if (!rng || !(S.lay.pts || S.lay.surf) || (mode !== 'h' && mode !== 'rho')) { cb.hidden = true; return; }
   cb.hidden = false;
   const cv = $('cvBar'), g = cv.getContext('2d');
   for (let x = 0; x < cv.width; x++) { const c = cmap(x / (cv.width - 1)); g.fillStyle = `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`; g.fillRect(x, 0, 1, cv.height); }
@@ -429,6 +481,7 @@ function setStatus() {
   const any = busy.main || busy.obs || busy.cone || busy.shell;
   st.classList.toggle('busy', any);
   st.classList.toggle('err', errs.length > 0);
+  $('prog3d').classList.toggle('on', any); $('progSky').classList.toggle('on', any);
   if (errs.length) { tx.textContent = t('st.err', { e: errs[0].split('\n')[0].slice(0, 120) }); return; }
   if (!codes().length) { tx.textContent = t('st.noPath'); return; }
   if (busy.main && R) { tx.textContent = t('st.main', { d: R.done, n: R.total }); return; }
@@ -454,7 +507,10 @@ function renderResults() {
   R.paths.forEach((P, ip) => {
     const col = PATHCOL[ip % PATHCOL.length];
     const np = pathCloud(P).pts.length / 3;
-    const rows = [[t('res.points'), fmtN(np)]];
+    const rows = [];
+    if (P.mesh) rows.push([t('res.mesh'), t('res.meshLine', { n: fmtN(P.mesh.nTri), ms: P.mesh.ms })]);
+    if (P.dof === 2) rows.push([t('res.layers'), t('res.layersLine', { n: P.layers.filter(l => l && l.curves.length).length, c: P.layers.reduce((s, l) => s + (l ? l.curves.length : 0), 0) })]);
+    rows.push([t('res.points'), fmtN(np)]);
     if (P.bdry) rows.push([t('res.bdry'), `${P.bdry.entry.length} / ${P.bdry.mirror.length} / ${P.bdry.tir.length}` + `<span class="lcount"> ${t('res.bdryKinds1')}</span>`]);
     if (P.edges) rows.push([t('res.bdry'), `${P.edges.entry.length} / ${P.edges.tir.length} / ${P.edges.seam.length} / ${P.edges.turn.length} / ${P.edges.cusp.length}` + `<span class="lcount"> ${t('res.bdryKinds2')}</span>`]);
     if (P.edges && P.edges.surf && P.edges.surf !== S.surf2) rows.push([t('res.surf'), t('res.surfFallback')]);
@@ -468,11 +524,12 @@ function renderResults() {
     html += '</dl>';
     if (o && o.note) html += `<div class="rnote">${esc(engineNote(o.note))}</div>`;
     if (sh && sh.note) html += `<div class="rnote">${esc(sh.note)}</div>`;
-    if (!P.left && np === 0 && !(P.bdry && nPts(P.bdry.entry) + nPts(P.bdry.tir) > 0)) html += `<div class="rnote">${t('res.nothing')}</div>`;
+    if (!P.left && np === 0 && !(P.mesh && P.mesh.nTri) && !(P.bdry && nPts(P.bdry.entry) + nPts(P.bdry.tir) > 0)) html += `<div class="rnote">${t('res.nothing')}</div>`;
     html += '</div>';
   });
   for (const e of errs) html += `<div class="rnote err">${esc(e.split('\n')[0])}</div>`;
   box.innerHTML = html;
+  $('resBadge').hidden = !(html.includes('rnote') && S.rt !== 'res');
 }
 // 引擎的诊断文字原样来自 C# 窗体: 去掉 markdown 加粗, 窗体勾选名换成本页的图层名
 const engineNote = s => s.replace(/\*\*/g, '').replace(/"含缝像"|"With seams"/g, `「${t('lay.cSeam')}」`);
@@ -481,7 +538,8 @@ const faceStr = code => { const f = parsePath(code); return f ? f.map(faceNumFro
 // ============================================================ 图层面板
 const LAYERS = [
   { g: 'lg.surface' },
-  { id: 'pts', sw: 'dots', col: C.pts, term: 'surface', colorMode: true },
+  { id: 'surf', sw: 'fill', term: 'surface', colorMode: true },
+  { id: 'pts', sw: 'dots', col: C.pts, term: 'pts' },
   { g: 'lg.bdry' },
   { id: 'bEntry', col: C.entry, term: 'bEntry' },
   { id: 'bMirror', col: C.mirror, term: 'bMirror', dof: 1 },
@@ -510,6 +568,11 @@ function layerCount(id) {
   }
   if (RO && S.lay.caustic) for (const o of RO.paths) if (o) { if (id === 'caustic') { add(o.ridge); add(o.ridgeInf); } if (id === 'cSeam') add(o.seam); if (id === 'cAsym') add(o.asym); }
   if (id === 'pts') { let k = 0; for (const P of R.paths) k += pathCloud(P).pts.length / 3; return fmtN(k); }
+  if (id === 'surf') {
+    let k = 0, c = 0;
+    for (const P of R.paths) { if (P.mesh) k += P.mesh.nTri; for (const l of P.layers) if (l) c += l.curves.length; }
+    return k ? fmtN(k) + ' △' : c ? String(c) : '';
+  }
   if (['bEntry', 'bMirror', 'bTir', 'bSeam', 'bTurn', 'bCusp', 'caustic', 'cSeam', 'cAsym', 'parArc'].includes(id)) return String(n);
   return '';
 }
@@ -713,14 +776,49 @@ $('btnPresets').addEventListener('click', e => { e.stopPropagation(); togglePres
 document.addEventListener('click', e => { if (!$('presetsPop').hidden && !$('presetsPop').contains(e.target)) togglePresets(false); });
 
 // ============================================================ 视图切换 / 天空工具条 / 3D 镜头
+// 舞台太窄 (< 820 px) 或窄屏页签时不并排: 只显示一个视图 (S.single 记住最后单看的那个)
+const SPLIT_MIN = 820;
+let narrowStage = false;
+const effView = () => (S.view === 'split' && narrowStage ? S.single : S.view);
 function renderView() {
-  renderSeg('viewSeg', S.view, 'view');
+  const ev = effView();
+  renderSeg('viewSeg', ev, 'view');
   const v = $('views');
-  v.classList.toggle('v-3d', S.view === '3d'); v.classList.toggle('v-sky', S.view === 'sky');
-  v3.setActive(S.view !== 'sky');
+  v.classList.toggle('v-3d', ev === '3d'); v.classList.toggle('v-sky', ev === 'sky');
+  v3.setActive(ev !== 'sky');
+  if (typeof renderTabs === 'function') renderTabs();
   requestAnimationFrame(() => { sky.draw(); v3.dirty = true; });
 }
-for (const b of $('viewSeg').querySelectorAll('button')) b.addEventListener('click', () => { S.view = b.dataset.view; save(); renderView(); });
+for (const b of $('viewSeg').querySelectorAll('button')) b.addEventListener('click', () => {
+  S.view = b.dataset.view;
+  if (S.view !== 'split') S.single = S.view;
+  save(); renderView();
+});
+new ResizeObserver(() => {
+  const w = $('stage').getBoundingClientRect().width, nw = w > 0 && w < SPLIT_MIN;
+  if (nw !== narrowStage) { narrowStage = nw; $('app').classList.toggle('narrow-stage', nw); renderView(); }
+}).observe($('stage'));
+
+// 右栏: 收起 / 三页
+function renderPanel() {
+  $('app').classList.toggle('no-read', !S.panel);
+  $('btnPanel').setAttribute('aria-pressed', S.panel);
+  $('read').dataset.rt = S.rt;
+  for (const b of $('readTabs').querySelectorAll('button')) b.classList.toggle('on', b.dataset.rt === S.rt);
+  $('resBadge').hidden = !($('results').innerHTML.includes('rnote') && S.rt !== 'res');
+  requestAnimationFrame(() => { sky.draw(); v3.dirty = true; });
+}
+$('btnPanel').addEventListener('click', () => { S.panel = !S.panel; save(); renderPanel(); });
+for (const b of $('readTabs').querySelectorAll('button')) b.addEventListener('click', () => { S.rt = b.dataset.rt; save(); renderPanel(); });
+
+// 导出菜单
+function toggleMenu(on) { $('exportMenu').hidden = !on; $('btnExport').setAttribute('aria-expanded', on); }
+$('btnExport').addEventListener('click', e => { e.stopPropagation(); toggleMenu($('exportMenu').hidden); });
+document.addEventListener('click', e => { if (!$('exportMenu').hidden && !$('exportMenu').contains(e.target)) toggleMenu(false); });
+
+// 晶体点选 (默认收起)
+$('crystalDet').open = !!S.crystalOpen;
+$('crystalDet').addEventListener('toggle', () => { S.crystalOpen = $('crystalDet').open; save(); if (S.crystalOpen) requestAnimationFrame(() => cry.draw()); });
 for (const b of document.querySelectorAll('[data-cam]')) b.addEventListener('click', () => v3.preset(b.dataset.cam));
 
 function fillLens() {
@@ -841,9 +939,10 @@ function download(name, blob) {
 }
 const fileTag = () => codes().map(c => faceStr(c).replace(/-/g, '')).join('_') || 'none';
 $('btnPng').addEventListener('click', () => {
-  const parts = [];
-  if (S.view !== 'sky') parts.push(v3.snapshot());
-  if (S.view !== '3d') parts.push(sky.snapshot());
+  toggleMenu(false);
+  const parts = [], ev = effView();
+  if (ev !== 'sky') parts.push(v3.snapshot());
+  if (ev !== '3d') parts.push(sky.snapshot());
   const H = Math.max(...parts.map(c => c.height)), pad = 16, head = 44;
   const W = parts.reduce((s, c) => s + c.width, 0) + pad * (parts.length + 1);
   const cv = document.createElement('canvas'); cv.width = W; cv.height = H + head + pad;
@@ -857,6 +956,7 @@ $('btnPng').addEventListener('click', () => {
   cv.toBlob(b => download(`divergent_${fileTag()}_${stamp()}.png`, b));
 });
 $('btnCsv').addEventListener('click', () => {
+  toggleMenu(false);
   if (!R) return;
   const { L, E } = scene(), D = baseline(), o = orient();
   const lines = [];
@@ -878,6 +978,14 @@ $('btnCsv').addEventListener('click', () => {
     P.h.forEach((a, k) => { if (a) for (let i = 0; i < a.length / 3; i++) row('surface', pc, 'h-scan', k, a, i); });
     P.s.forEach((a, k) => { if (a) for (let i = 0; i < a.length / 3; i++) row('surface', pc, 'psi-scan', k, a, i); });
     P.layers.forEach((l, k) => { if (l && l.verts) for (let i = 0; i < l.verts.length / 3; i++) row('surface', pc, 'layer', k, l.verts, i); });
+    if (P.mesh) {                     // 网格顶点 (三角形不共享顶点, 这里去重)
+      const seen = new Set(), a = P.mesh.pos;
+      for (let i = 0; i < a.length / 3; i++) {
+        const k = a[3 * i] + ',' + a[3 * i + 1] + ',' + a[3 * i + 2];
+        if (seen.has(k)) continue;
+        seen.add(k); row('mesh', pc, 'vertex', seen.size - 1, a, i);
+      }
+    }
     if (P.bdry) { dumpSegs('entry', pc, P.bdry.entry); dumpSegs('mirror', pc, P.bdry.mirror); dumpSegs('exit', pc, P.bdry.tir); }
     if (P.edges) { dumpSegs('entry', pc, P.edges.entry); dumpSegs('exit', pc, P.edges.tir); dumpSegs('seam', pc, P.edges.seam); dumpSegs('turn', pc, P.edges.turn); dumpSegs('cusp', pc, P.edges.cusp); }
     const ob = RO && S.lay.caustic ? RO.paths[ip] : null;
@@ -899,13 +1007,22 @@ function applyLang(code) {
   schedule(true);
 }
 for (const b of $('langSeg').querySelectorAll('button')) b.addEventListener('click', () => applyLang(b.dataset.lang));
+// 窄屏页签: 设置 | 3D | 天空 | 显示 (视图切换并进页签)
+function renderTabs() {
+  const tab = $('app').dataset.tab, ev = effView();
+  for (const x of $('tabs').querySelectorAll('button'))
+    x.classList.toggle('on', x.dataset.tab === tab && (!x.dataset.v || x.dataset.v === ev));
+}
 for (const b of $('tabs').querySelectorAll('button')) b.addEventListener('click', () => {
   $('app').dataset.tab = b.dataset.tab;
-  for (const x of $('tabs').querySelectorAll('button')) x.classList.toggle('on', x === b);
-  renderView();
+  if (b.dataset.v) { S.view = b.dataset.v; S.single = b.dataset.v; save(); }
+  renderView(); renderTabs();
 });
 $('app').dataset.tab = 'stage';
 new ResizeObserver(() => sky.draw()).observe($('paneSky'));
+// 中等宽度屏幕: 右栏默认收起 (浮在视图上)
+if (localStorage.getItem(STORE) === null && innerWidth <= 1400) S.panel = false;
+renderPanel();
 
 $('inPath').value = S.paths;
 renderSeg('qSeg', String(S.q), 'q'); renderSeg('crySeg', S.pyr ? '1' : '0', 'cry');

@@ -9,11 +9,11 @@ Ice halos around a street lamp, in three dimensions. Sunlight arrives from one d
 The whole tool is one HTML file. You can also download [`dist/DivergentLightHalo.html`](dist/DivergentLightHalo.html) and double-click it; it runs offline in any modern browser.
 
 ![Column crystals, path 3-5 (tangent arcs) under a lamp at 15°: the halo surface in 3D with its boundaries, the observer caustic and a divergency shell](docs/screenshot-column.png)
-![Parry orientation, path 3-5, coloured by divergency ρ, with a cone slice](docs/screenshot-parry.png)
+![Plate crystals, path 1-3 (circumzenithal arc) under a lamp at 25°: the surface mesh coloured by divergency ρ, ending exactly on its entry and exit boundaries, with a cone slice](docs/screenshot-plate.png)
 
 ## What it shows
 
-- **The halo surface.** Every crystal position from which lamp light, following the chosen ray path, reaches the eye. Shown as a point cloud, coloured by the elevation h at which the crystal sees the lamp, by the divergency ρ = r/D (distance from the eye ÷ lamp distance), by path, or in one colour.
+- **The halo surface.** Every crystal position from which lamp light, following the chosen ray path, reaches the eye. With one degree of freedom it is drawn as a triangle mesh whose edges are bisected onto the exact boundaries; with two degrees of freedom each cone layer is drawn as a curve. Colour by the elevation h at which the crystal sees the lamp, by the divergency ρ = r/D (distance from the eye ÷ lamp distance), by path, or in one colour. The original window's light-cone sample points can be shown too.
 - **Boundaries.** Where the surface ends because a condition becomes critical: the light grazes the entry face, grazes an internal mirror face, or reaches the exit face exactly at the critical angle. With two degrees of freedom: seams, turn seams and cusp ridges of the caustic surface.
 - **The observer caustic.** The brightest lines in the observer's sky, where light from many crystals piles up. In space it is the outline of the surface seen from the eye. Optional: sky images of the boundaries and the asymptotic circles of unbounded surfaces. When there is no caustic, the results panel says why (none at all, behind the lamp, behind the eye …).
 - **Parallel-light arc.** The classic arc the same path gives if the lamp were a sun at the same elevation. The divergent halo always touches it.
@@ -35,6 +35,7 @@ Exports: a PNG of the current views with a title, and a CSV of every surface poi
 Coordinates: Z up, lamp L = (D cos Σ, 0, D sin Σ), eye E = (0, 0, h_eye), crystal orientation R = Rz(α)·Ry(ζ)·Rz(θ).
 
 - **One degree of freedom — light-cone method.** For every incidence elevation h at the lamp, the incoming direction is û = Rz(ψ)·(−cos h, 0, −sin h). Deviation is symmetric about the vertical, so the outgoing direction is Rz(ψ)·d(α, h). The two-focus condition (E − L lies in the plane of û and the outgoing ray) becomes P sin ψ + Q cos ψ = R, solved in closed form; the crystal then sits at P = L + t·û with t from a 2×2 solve. A second sweep (for each α and ψ, bisect for h) fills the thin bands the first one misses.
+- **Surface mesh.** A grid on the (h, α) parameter plane; every node is placed in closed form, and each of the two ψ branches gets a validity margin (entry, mirror and exit conditions, root existence, t, s > 0, truncation). Triangles that cross the margin's zero are clipped by bisection along their edges, so the mesh ends exactly on the boundary curves. Uniform point sampling cannot do this near the exit-critical boundary, where the position changes like a square root.
 - **Boundaries (engine v4).** Each boundary family pins one point of the ray chain to a fixed circle, so it is a one-parameter closed form. Corners, turns and pinches are bisected to machine precision.
 - **Two degrees of freedom.** At each h the lamp acts as a sun of elevation h; the light-point method traces the caustic (J = 0) or the chosen boundary on the orientation plane, and each point is mapped onto the cone in closed form. The surface's edges come from continuing the parallel-light endpoints along h.
 - **Observer caustic.** χ(ξ) = det(ξ, F(ξ), DF⁻¹(ŵ×F) − ŵ×ξ) = 0 is a curve that does not depend on the lamp; the lamp only pairs the azimuth on the cone and decides what is visible.
@@ -57,7 +58,7 @@ npm run build
 This writes `dist/DivergentLightHalo.html` (one file with CSS, JavaScript, the Web Worker and three.js inlined) and a copy at `docs/index.html` for GitHub Pages. `npm run watch` rebuilds on change; `npm run serve` serves it at <http://127.0.0.1:5179>.
 
 ```
-src/engine/   crystal.js (faces, paths, orientation)  cone.js (light-cone method, parallel arc, cone slice)
+src/engine/   crystal.js (faces, paths, orientation)  cone.js (light-cone method, parallel arc, cone slice)  mesh1.js (surface mesh)
               bdry4.js (boundary engine v4)  epdiv.js (two degrees of freedom)  obscaustic.js (observer caustic)
               divshell.js (divergency shell)  lp.js / ep.js / aperture.js (light-point engine, shared with Light-Point-Trace)
 src/worker.js computation worker (tasks are split across a worker pool)

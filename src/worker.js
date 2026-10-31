@@ -1,5 +1,6 @@
 // 计算 Worker: 收 { kind, args }, 回 { ok, data } (类型化数组走 transfer). 任务种类:
-//   coneH / coneS   一自由度光锥 h 扫 / ψ 扫 的一段切片
+//   coneH / coneS   一自由度光锥 h 扫 / ψ 扫 的一段切片 (原窗体的采样点)
+//   mesh1           一自由度晕面三角网格 ((h, α) 网格 + 边界二分裁剪)
 //   bdry1           一自由度物理边界 (边界引擎 v4) + 平行光弧
 //   obs1 / obs2     观测者视角发散焦散 (一 / 二自由度)
 //   layers2         二自由度光锥的一段 h 层 (焦散或选定的平行光曲线 → 锥映射)
@@ -11,6 +12,7 @@ import { setApex, baseNormalFromCompact, baseNormalTable, lpFaceFromCompact } fr
 import { LP, setIndex } from './engine/lp.js';
 import { lightConeH, lightConeSwap, parallelArc, divergentOnCone } from './engine/cone.js';
 import { lightConeBoundaries } from './engine/bdry4.js';
+import { surfaceMesh1 } from './engine/mesh1.js';
 import { lightCone2DofLayers, parallelArc2Dof, edges2Dof, resolveSurface } from './engine/epdiv.js';
 import * as OC from './engine/obscaustic.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
@@ -67,6 +69,7 @@ function chiDegenerate(c) {
 const RUN = {
   coneH: a => lightConeH(a.fp, a.el, a.dist, a.eye, a.n, a.nH, a.nA, a.maxD, a.zeta, a.theta, a.from, a.to),
   coneS: a => lightConeSwap(a.fp, a.el, a.dist, a.eye, a.n, a.nA, a.nPsi, a.maxD, a.zeta, a.theta, a.from, a.to),
+  mesh1: a => surfaceMesh1(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta, a.budget),
 
   bdry1: a => {
     const b = lightConeBoundaries(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta);
