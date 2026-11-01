@@ -108,7 +108,7 @@ export default {
   'res.nothing': ['这个取向下光路走不通, 或者晶体都在截断距离外 / 灯后方: 没有晕.', 'The path does not work for this orientation, or every crystal is beyond the truncation or behind the lamp: no halo.'],
 
   'st.err': ['出错: {e}', 'Error: {e}'], 'st.noPath': ['没有光路', 'no path'],
-  'st.main': ['计算晕面 {d}/{n}', 'computing surface {d}/{n}'],
+  'st.main': ['计算晕面 {d}/{n}', 'computing surface {d}/{n}'], 'st.dense': ['加密 h 层 {d}/{n}', 'densifying h layers {d}/{n}'],
   'st.obs': ['计算焦散…', 'computing caustic…'], 'st.shell': ['计算球壳…', 'computing shell…'], 'st.cone': ['计算锥切片…', 'computing cone slice…'],
   'st.done': ['完成 · {ms} ms', 'done · {ms} ms'],
   'gl.title': ['术语', 'Glossary'],

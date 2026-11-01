@@ -1,101 +1,10 @@
-// 观测者天空视图: 站在眼睛处看出去. 晕面上每个晶体位置 P 映成方向 (P−E)/|P−E|, 再按镜头投影到画面.
-// 镜头 (SkyProj) 与软件点栅 (Raster) 取自 LightPointTrace (与原窗体 / PreviewGLRenderer 一致):
+// 观测者天空视图: 站在眼睛处看出去. 晕面上每个晶体位置 P 映成方向 −d (出射光传播方向的反向 — 精确, 不靠 P−E 相减),
+// 再按镜头投影到画面. 两层画布: 底层 WebGL 画晕面网格与采样点 (GPU 逐顶点投影, 拖动不卡);
+// 上层 2D 画布画网格、线、标记、文字 (透明底). 镜头 (SkyProj) 与 LightPointTrace / 原窗体一致:
 //   方位 az 为配置方位角 (俯视顺时针增), az=0 朝灯; 画面右手 = 面朝视线的右手.
-// 白底 + matplotlib 风格配色. 线与标记走 Canvas 2D, 点云走整数混色点栅.
 
 const DEG = Math.PI / 180;
 const FONT = '"PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif';
-
-// ============================================================ 软件点栅
-class Raster {
-  constructor() { this.W = 0; this.H = 0; this.s = 1; this.img = null; this.buf = null; }
-  resize(ctx, W, H, s) {
-    if (W !== this.W || H !== this.H || !this.img) {
-      this.img = ctx.createImageData(W, H);
-      this.buf = new Uint32Array(this.img.data.buffer);
-      this.W = W; this.H = H;
-    }
-    this.s = s;
-  }
-  clear(c) { this.buf.fill((0xFF000000 | (c[2] << 16) | (c[1] << 8) | c[0]) >>> 0); }
-  // 定点整数混色 (sa: 0..256); x,y,size 为 CSS 像素
-  dot(x, y, size, c, a) {
-    let sa = (a * 256 + 0.5) | 0;
-    if (sa <= 0) return; if (sa > 256) sa = 256;
-    const s = this.s, W = this.W, H = this.H;
-    const sz = Math.max(1, Math.round(size * s));
-    let x0 = Math.round(x * s) - ((sz - 1) >> 1), y0 = Math.round(y * s) - ((sz - 1) >> 1);
-    let x1 = x0 + sz - 1, y1 = y0 + sz - 1;
-    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
-    if (x1 >= W) x1 = W - 1; if (y1 >= H) y1 = H - 1;
-    if (x1 < x0 || y1 < y0) return;
-    const sr = c[0] * sa, sg = c[1] * sa, sb = c[2] * sa, ia = 256 - sa, buf = this.buf;
-    for (let yy = y0; yy <= y1; yy++) {
-      const base = yy * W;
-      for (let xx = x0; xx <= x1; xx++) {
-        const d = buf[base + xx];
-        const r = (sr + (d & 255) * ia + 128) >> 8;
-        const g = (sg + ((d >> 8) & 255) * ia + 128) >> 8;
-        const b = (sb + ((d >> 16) & 255) * ia + 128) >> 8;
-        buf[base + xx] = 0xFF000000 | (b << 16) | (g << 8) | r;
-      }
-    }
-  }
-
-  // 面片图层: 三角形先写进覆盖层 (后写覆盖, 不叠加变暗), 最后按固定透明度合成到底图
-  layerBegin() {
-    const n = this.W * this.H;
-    if (!this.lcol || this.lcol.length !== n) { this.lcol = new Uint32Array(n); this.lmask = new Uint8Array(n); }
-    else this.lmask.fill(0);
-  }
-  // 三角形 (CSS 像素), c = 打包颜色 0xBBGGRR; 没盖住任何像素中心的小三角形点在重心
-  tri(x0, y0, x1, y1, x2, y2, c) {
-    const s = this.s, W = this.W, H = this.H;
-    x0 *= s; y0 *= s; x1 *= s; y1 *= s; x2 *= s; y2 *= s;
-    let minX = Math.floor(Math.min(x0, x1, x2)), maxX = Math.ceil(Math.max(x0, x1, x2));
-    let minY = Math.floor(Math.min(y0, y1, y2)), maxY = Math.ceil(Math.max(y0, y1, y2));
-    const area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
-    let hit = false;
-    if ((maxX - minX > 1 || maxY - minY > 1) && area !== 0) {
-      if (minX < 0) minX = 0; if (minY < 0) minY = 0;
-      if (maxX > W - 1) maxX = W - 1; if (maxY > H - 1) maxY = H - 1;
-      const sg = area > 0 ? 1 : -1;
-      for (let y = minY; y <= maxY; y++) {
-        const py = y + 0.5;
-        for (let x = minX; x <= maxX; x++) {
-          const px = x + 0.5;
-          if (sg * ((x1 - px) * (y2 - py) - (x2 - px) * (y1 - py)) < 0) continue;
-          if (sg * ((x2 - px) * (y0 - py) - (x0 - px) * (y2 - py)) < 0) continue;
-          if (sg * ((x0 - px) * (y1 - py) - (x1 - px) * (y0 - py)) < 0) continue;
-          const k = y * W + x; this.lcol[k] = c; this.lmask[k] = 1; hit = true;
-        }
-      }
-    }
-    if (!hit) {
-      const x = Math.floor((x0 + x1 + x2) / 3), y = Math.floor((y0 + y1 + y2) / 3);
-      if (x >= 0 && y >= 0 && x < W && y < H) { const k = y * W + x; this.lcol[k] = c; this.lmask[k] = 1; }
-    }
-  }
-  layerEnd(a, circle) {
-    const sa = Math.round(a * 256), ia = 256 - sa, buf = this.buf, lc = this.lcol, lm = this.lmask;
-    if (circle) {            // 画框圆外的覆盖清掉 (CSS 像素 → 设备像素)
-      const s = this.s, cx = circle.cx * s, cy = circle.cy * s, r2 = (circle.r * s) ** 2, W = this.W;
-      for (let k = 0; k < lm.length; k++) {
-        if (!lm[k]) continue;
-        const x = k % W + 0.5 - cx, y = (k / W | 0) + 0.5 - cy;
-        if (x * x + y * y > r2) lm[k] = 0;
-      }
-    }
-    for (let k = 0; k < lm.length; k++) {
-      if (!lm[k]) continue;
-      const d = buf[k], c = lc[k];
-      const r = ((c & 255) * sa + (d & 255) * ia + 128) >> 8;
-      const g = (((c >> 8) & 255) * sa + ((d >> 8) & 255) * ia + 128) >> 8;
-      const b = (((c >> 16) & 255) * sa + ((d >> 16) & 255) * ia + 128) >> 8;
-      buf[k] = 0xFF000000 | (b << 16) | (g << 8) | r;
-    }
-  }
-}
 
 // ============================================================ 天球镜头
 // lens: 0 直线 (透视) / 1 鱼眼等积 / 2 鱼眼等距 / 3 鱼眼体视 / 4 鱼眼正交 / 5 等距圆柱 (全景)
@@ -119,7 +28,7 @@ export class SkyProj {
     const hfLin = Math.min(this.hf, 85.0 * DEG);
     this.linFocal = 0.5 * Math.sqrt(W * W + H * H) / Math.tan(hfLin);
     this.eqScale = Math.min(W / 2.0, H) / Math.PI;
-    this.cx = W / 2; this.cy = H / 2;
+    this.cx = W / 2; this.cy = H / 2; this.W = W; this.H = H;
     this.rpx = Math.min(W, H) / 2 - 18;
   }
 
@@ -140,11 +49,11 @@ export class SkyProj {
     else if (cc < this.cosHf) return false;
     const px = Dx - cc * ax[0], py = Dy - cc * ax[1], pz = Dz - cc * ax[2];
     let pn = Math.sqrt(px * px + py * py + pz * pz);
-    if (pn < 1e-12) pn = 1;
+    const th = Math.atan2(pn, cc), hf = this.hf;        // atan2: 小角度也精确 (acos 在 1 附近丢精度)
+    if (pn < 1e-15) pn = 1;
     const rt = this.rt, up = this.up;
     const tr = (px * rt[0] + py * rt[1] + pz * rt[2]) / pn;
     const tu = (px * up[0] + py * up[1] + pz * up[2]) / pn;
-    const th = Math.acos(cc), hf = this.hf;
     let r;
     switch (lens) {
       case 0: r = this.linFocal * Math.tan(th); break;
@@ -157,33 +66,6 @@ export class SkyProj {
       default: r = rpx * th / hf;
     }
     this.x = cx + r * tr; this.y = cy - r * tu;
-    return true;
-  }
-
-  /** 同 project, 但不按视场裁 (面片跨画框时用; 之后按画框圆遮罩). 背后半球 / 正交镜头背面仍返回 false. */
-  projectLoose(Dx, Dy, Dz) {
-    const lens = this.lens;
-    if (lens === 5) return this.project(Dx, Dy, Dz);
-    const ax = this.ax;
-    let cc = Dx * ax[0] + Dy * ax[1] + Dz * ax[2];
-    if (cc > 1) cc = 1; else if (cc < -1) cc = -1;
-    if (lens === 0 && cc < 0.0087) return false;
-    if (cc < -0.999) return false;
-    const px = Dx - cc * ax[0], py = Dy - cc * ax[1], pz = Dz - cc * ax[2];
-    let pn = Math.sqrt(px * px + py * py + pz * pz);
-    if (pn < 1e-12) pn = 1;
-    const rt = this.rt, up = this.up;
-    const tr = (px * rt[0] + py * rt[1] + pz * rt[2]) / pn, tu = (px * up[0] + py * up[1] + pz * up[2]) / pn;
-    const th = Math.acos(cc), hf = this.hf, rpx = this.rpx;
-    let r;
-    switch (lens) {
-      case 0: r = this.linFocal * Math.tan(th); break;
-      case 1: r = rpx * Math.sin(th / 2) / Math.max(1e-9, Math.sin(hf / 2)); break;
-      case 3: r = rpx * Math.tan(Math.min(th, 3.1) / 2) / Math.max(1e-9, Math.tan(hf / 2)); break;
-      case 4: if (th > Math.PI / 2) return false; r = rpx * Math.sin(th) / Math.max(1e-9, Math.sin(Math.min(hf, Math.PI / 2))); break;
-      default: r = rpx * th / hf;
-    }
-    this.x = this.cx + r * tr; this.y = this.cy - r * tu;
     return true;
   }
 
@@ -232,37 +114,246 @@ export function azElOf(d) {
   return [az, Math.asin(Math.max(-1, Math.min(1, d[2]))) / DEG];
 }
 
-export const css = (c, a = 1) => a >= 1 ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+export const css = (c, a = 1) => a >= 1 ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})` : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+// ============================================================ GPU 层: 晕面网格 + 采样点
+const VS_COMMON = `
+precision highp float;
+uniform vec3 uAx, uUp, uRt;
+uniform float uHf, uLin, uRpx, uEq, uCx, uCy, uAz, uLens, uW, uH, uMirror;
+float wrapPi(float a) { return a - 6.283185307179586 * floor((a + 3.141592653589793) / 6.283185307179586); }
+vec2 proj(vec3 D, vec3 C) {
+  if (uLens > 4.5) {                       // 等距圆柱: 经度按三角形重心展开, 跨接缝的三角形不撕裂
+    float lonC = wrapPi(atan(C.y, C.x) - uAz);
+    float lon = lonC + wrapPi(atan(D.y, D.x) - uAz - lonC);
+    float lat = asin(clamp(D.z, -1.0, 1.0));
+    return vec2(uCx - lon * uEq, uCy - lat * uEq);
+  }
+  float c = dot(D, uAx);
+  vec3 pv = D - c * uAx;
+  float pn = length(pv);
+  float th = atan(pn, c);
+  if (pn < 1e-12) pn = 1.0;
+  float tr = dot(pv, uRt) / pn, tu = dot(pv, uUp) / pn, r;
+  if (uLens < 0.5) r = uLin * tan(min(th, 1.55));
+  else if (uLens < 1.5) r = uRpx * sin(th * 0.5) / max(1e-9, sin(uHf * 0.5));
+  else if (uLens < 2.5) r = uRpx * th / uHf;
+  else if (uLens < 3.5) r = uRpx * tan(min(th, 3.1) * 0.5) / max(1e-9, tan(uHf * 0.5));
+  else r = uRpx * sin(min(th, 1.5707963)) / max(1e-9, sin(min(uHf, 1.5707963)));
+  return vec2(uCx + r * tr, uCy - r * tu);
+}
+bool culled(vec3 C) {
+  if (dot(C, C) < 0.25) return true;       // 重心置零 = 该三角形在天空上太大 (见 setMeshes) 或该点无方向
+  if (uLens > 4.5) return false;
+  float c = dot(C, uAx);
+  if (uLens < 0.5) return c < 0.02;
+  if (uLens > 3.5) return c < 0.0;
+  return atan(length(C - c * uAx), c) > min(uHf + 0.35, 3.05);
+}
+vec4 toClip(vec2 px) { return vec4(2.0 * px.x / uW - 1.0, 1.0 - 2.0 * px.y / uH, 0.5, 1.0); }
+`;
+const VS_MESH = VS_COMMON + `
+attribute vec3 aDir, aCen, aCol;
+varying vec3 vCol;
+void main() {
+  vec3 D = vec3(aDir.x, aDir.y * uMirror, aDir.z), C = vec3(aCen.x, aCen.y * uMirror, aCen.z);
+  vCol = aCol;
+  if (culled(C)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  gl_Position = toClip(proj(D, C));
+}`;
+const VS_PTS = VS_COMMON + `
+attribute vec3 aDir, aCol;
+uniform float uPs;
+varying vec3 vCol;
+void main() {
+  vec3 D = vec3(aDir.x, aDir.y * uMirror, aDir.z);
+  vCol = aCol;
+  gl_PointSize = uPs;
+  if (culled(D)) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); return; }
+  gl_Position = toClip(proj(D, D));
+}`;
+const FS = `
+precision highp float;
+varying vec3 vCol;
+uniform float uAlpha, uRound, uDpr, uCx, uCy, uRpx, uH, uPt;
+void main() {
+  vec2 p = vec2(gl_FragCoord.x / uDpr, uH - gl_FragCoord.y / uDpr);
+  if (uRound > 0.5 && dot(p - vec2(uCx, uCy), p - vec2(uCx, uCy)) > uRpx * uRpx) discard;
+  if (uPt > 0.5 && dot(gl_PointCoord - 0.5, gl_PointCoord - 0.5) > 0.25) discard;
+  gl_FragColor = vec4(vCol, uAlpha);
+}`;
+
+class SkyGL {
+  constructor(canvas) {
+    this.cv = canvas;
+    const gl = canvas.getContext('webgl', { antialias: true, preserveDrawingBuffer: true, alpha: false });
+    this.gl = gl;
+    if (!gl) return;
+    const mk = (src, type) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; };
+    const prog = (vs) => {
+      const p = gl.createProgram();
+      gl.attachShader(p, mk(vs, gl.VERTEX_SHADER)); gl.attachShader(p, mk(FS, gl.FRAGMENT_SHADER));
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
+      const u = {};
+      const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+      for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); }
+      return { p, u, aDir: gl.getAttribLocation(p, 'aDir'), aCen: gl.getAttribLocation(p, 'aCen'), aCol: gl.getAttribLocation(p, 'aCol') };
+    };
+    this.pm = prog(VS_MESH); this.pp = prog(VS_PTS);
+    this.meshes = new Map();       // 数据数组 → GPU 缓冲
+    this.clouds = new Map();
+  }
+
+  _buf(data) { const gl = this.gl, b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); return b; }
+  _free(e) { for (const k of ['dir', 'cen', 'col']) if (e[k]) this.gl.deleteBuffer(e[k]); }
+
+  /** 网格: [{ dir: Float32Array (每顶点), cols: Uint8Array | null, col: [r,g,b] }] (三角形不共享顶点) */
+  setMeshes(list) {
+    if (!this.gl) return;
+    const keep = new Set();
+    for (const m of list) {
+      keep.add(m.dir);
+      const colKey = m.cols || String(m.col);
+      let e = this.meshes.get(m.dir);
+      if (e && e.colKey === colKey) continue;
+      if (!e) {
+        // 每顶点再带一份三角形重心方向: 着色器据此统一剔除 / 展开全景经度. 顶点间张角 > 25° 的三角形
+        // (逐顶点投影后直边会严重偏离真实像) 重心置零 = 剔除; 网格加密后正常不会出现
+        const D = m.dir, n = D.length / 3, C = new Float32Array(D.length), cosBig = Math.cos(25 * Math.PI / 180);
+        for (let t = 0; t < n / 3; t++) {
+          const o = 9 * t;
+          let x = D[o] + D[o + 3] + D[o + 6], y = D[o + 1] + D[o + 4] + D[o + 7], z = D[o + 2] + D[o + 5] + D[o + 8];
+          const l = Math.hypot(x, y, z) || 1; x /= l; y /= l; z /= l;
+          let ok = l > 1e-6;
+          for (let k = 0; k < 3 && ok; k++) ok = D[o + 3 * k] * x + D[o + 3 * k + 1] * y + D[o + 3 * k + 2] * z > cosBig;
+          if (!ok) x = y = z = 0;
+          for (let k = 0; k < 3; k++) { C[o + 3 * k] = x; C[o + 3 * k + 1] = y; C[o + 3 * k + 2] = z; }
+        }
+        e = { n, dir: this._buf(D), cen: this._buf(C), col: null };
+        this.meshes.set(m.dir, e);
+      } else if (e.col) this.gl.deleteBuffer(e.col);
+      const n = e.n, col = new Float32Array(3 * n);
+      if (m.cols) for (let i = 0; i < 3 * n; i++) col[i] = m.cols[i] / 255;
+      else for (let i = 0; i < n; i++) { col[3 * i] = m.col[0] / 255; col[3 * i + 1] = m.col[1] / 255; col[3 * i + 2] = m.col[2] / 255; }
+      e.col = this._buf(col); e.colKey = colKey;
+    }
+    for (const [k, e] of this.meshes) if (!keep.has(k)) { this._free(e); this.meshes.delete(k); }
+    this.meshList = list.map(m => this.meshes.get(m.dir));
+  }
+
+  /** 采样点: [{ dir: Float32Array, cols: Uint8Array | null, col }] */
+  setClouds(list) {
+    if (!this.gl) return;
+    const keep = new Set();
+    for (const c of list) {
+      keep.add(c.dir);
+      const colKey = c.cols || String(c.col);
+      let e = this.clouds.get(c.dir);
+      if (e && e.colKey === colKey) continue;
+      if (!e) { e = { n: c.dir.length / 3, dir: this._buf(c.dir), col: null }; this.clouds.set(c.dir, e); }
+      else if (e.col) this.gl.deleteBuffer(e.col);
+      const n = e.n, col = new Float32Array(3 * n);
+      if (c.cols) for (let i = 0; i < 3 * n; i++) col[i] = c.cols[i] / 255;
+      else for (let i = 0; i < n; i++) { col[3 * i] = c.col[0] / 255; col[3 * i + 1] = c.col[1] / 255; col[3 * i + 2] = c.col[2] / 255; }
+      e.col = this._buf(col); e.colKey = colKey;
+    }
+    for (const [k, e] of this.clouds) if (!keep.has(k)) { this._free(e); this.clouds.delete(k); }
+    this.cloudList = list.map(c => this.clouds.get(c.dir));
+  }
+
+  render(p, V, dpr, mirror) {
+    const gl = this.gl;
+    if (!gl) return;
+    gl.viewport(0, 0, this.cv.width, this.cv.height);
+    gl.clearColor(1, 1, 1, 1); gl.clearDepth(1);
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    const round = V.lens >= 1 && V.lens <= 4 && V.fov < 359 ? 1 : 0;
+    const setU = (pr) => {
+      const u = pr.u;
+      gl.uniform3fv(u.uAx, p.ax); gl.uniform3fv(u.uUp, p.up); gl.uniform3fv(u.uRt, p.rt);
+      gl.uniform1f(u.uHf, p.hf); gl.uniform1f(u.uLin, p.linFocal); gl.uniform1f(u.uRpx, p.rpx); gl.uniform1f(u.uEq, p.eqScale);
+      gl.uniform1f(u.uCx, p.cx); gl.uniform1f(u.uCy, p.cy); gl.uniform1f(u.uAz, p.azRad); gl.uniform1f(u.uLens, V.lens);
+      gl.uniform1f(u.uW, p.W); gl.uniform1f(u.uH, p.H); gl.uniform1f(u.uRound, round); gl.uniform1f(u.uDpr, dpr);
+    };
+    const sides = mirror ? [1, -1] : [1];
+    // 网格: 同深度 + LESS ⟹ 每个像素只上色一次 (两片重叠处不叠加变暗), 再按固定透明度混合到白底
+    if (this.meshList && this.meshList.length) {
+      const pr = this.pm;
+      gl.useProgram(pr.p); setU(pr);
+      gl.uniform1f(pr.u.uAlpha, 0.62); gl.uniform1f(pr.u.uPt, 0);
+      gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      for (const ys of sides) {
+        gl.uniform1f(pr.u.uMirror, ys);
+        for (const e of this.meshList) {
+          if (!e) continue;
+          bind(gl, pr.aDir, e.dir); bind(gl, pr.aCen, e.cen); bind(gl, pr.aCol, e.col);
+          gl.drawArrays(gl.TRIANGLES, 0, e.n);
+        }
+      }
+      gl.disable(gl.DEPTH_TEST);
+    }
+    if (this.cloudList && this.cloudList.length) {
+      const pr = this.pp;
+      gl.useProgram(pr.p); setU(pr);
+      gl.uniform1f(pr.u.uAlpha, 0.55); gl.uniform1f(pr.u.uPt, 1); gl.uniform1f(pr.u.uPs, 2.2 * dpr);
+      gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+      for (const ys of sides) {
+        gl.uniform1f(pr.u.uMirror, ys);
+        for (const e of this.cloudList) {
+          if (!e) continue;
+          bind(gl, pr.aDir, e.dir); bind(gl, pr.aCol, e.col);
+          gl.drawArrays(gl.POINTS, 0, e.n);
+        }
+      }
+    }
+    gl.disable(gl.BLEND);
+  }
+}
+function bind(gl, loc, buf) {
+  if (loc < 0) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 3, gl.FLOAT, false, 0, 0);
+}
 
 // ============================================================ 视图
 /**
- * 数据 (setScene) 由 main 组装: { eye:[x,y,z], lamp:[x,y,z], mirror:bool,
- *   clouds: [{ pts: Float32Array(3D 位置), col: [r,g,b] | null, cols: Uint8Array(rgb) | null, size, alpha }],
- *   lines:  [{ segs: [Float32Array(3D 位置)…], col, width, dash, alpha }],
- *   marks:  [{ pts: Float32Array, col, kind: 'dot'|'tri'|'star'|'ring', size }] }
+ * 数据 (setScene) 由 main 组装: { eye, lamp, mirror,
+ *   meshes: [{ dir: Float32Array (三角形顶点视方向), cols, col }], clouds: [{ dir, cols, col }],
+ *   lines: [{ segs: [{ p, d } | Float32Array(位置)…], col, segCols?, width, dash, alpha, skyOnly }],
+ *   marks: [{ pts: Float32Array (位置), dirs?: Float32Array, col, kind, size }] }
  */
 export class SkyView {
-  constructor(canvas) {
+  constructor(canvas, glCanvas) {
     this.cv = canvas; this.ctx = canvas.getContext('2d');
-    this.proj = new SkyProj(); this.ras = new Raster();
+    this.glc = glCanvas;
+    this.gpu = new SkyGL(glCanvas);
+    this.proj = new SkyProj();
     this.V = { az: 0, el: 10, fov: 180, lens: 2 };
     this.S = null;
     this.hover = null;
-    this.onView = null;       // 视角被拖动/缩放后回调 (同步到界面)
-    this.onHover = null;      // 鼠标处读数回调
+    this.onView = null;
+    this.onHover = null;
     this.dragging = false;
     this._bind();
   }
 
   setView(v) { Object.assign(this.V, v); this.V.fov = Math.min(this.V.fov, fovMax(this.V.lens)); this.draw(); }
-  setScene(S) { this.S = S; this.draw(); }
+  setScene(S) {
+    this.S = S;
+    this.gpu.setMeshes(S ? S.meshes || [] : []);
+    this.gpu.setClouds(S ? S.clouds || [] : []);
+    this.draw();
+  }
 
   _bind() {
     const cv = this.cv;
     let drag = null;
     cv.addEventListener('pointerdown', e => {
       drag = { x: e.clientX, y: e.clientY, az: this.V.az, el: this.V.el };
-      cv.setPointerCapture(e.pointerId);
+      try { cv.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件没有指针 */ }
       this.dragging = true;
     });
     cv.addEventListener('pointermove', e => {
@@ -284,11 +375,11 @@ export class SkyView {
     const end = () => { if (drag) { drag = null; this.dragging = false; this.draw(); } };
     cv.addEventListener('pointerup', end);
     cv.addEventListener('pointercancel', end);
-    cv.addEventListener('pointerleave', () => { this.hover = null; this.draw(); if (this.onHover) this.onHover(null); });
+    cv.addEventListener('pointerleave', () => { this.hover = null; this.drawOverlayOnly(); if (this.onHover) this.onHover(null); });
     cv.addEventListener('wheel', e => {
       e.preventDefault();
       const f = Math.exp(e.deltaY * 0.0012);
-      this.V.fov = Math.max(5, Math.min(fovMax(this.V.lens), this.V.fov * f));
+      this.V.fov = Math.max(2, Math.min(fovMax(this.V.lens), this.V.fov * f));
       this.draw();
       if (this.onView) this.onView(this.V);
     }, { passive: false });
@@ -298,11 +389,13 @@ export class SkyView {
     const d = this.proj.unproject(x, y);
     this.hover = d ? { x, y, d } : null;
     if (this.onHover) {
-      if (!d || !this.S) { this.onHover(null); return; }
-      const [az, el] = azElOf(d);
-      const lv = sub3(this.S.lamp, this.S.eye), ln = Math.hypot(...lv);
-      const ang = ln > 0 ? Math.acos(Math.max(-1, Math.min(1, (d[0] * lv[0] + d[1] * lv[1] + d[2] * lv[2]) / ln))) / DEG : NaN;
-      this.onHover({ az, el, ang });
+      if (!d || !this.S) { this.onHover(null); }
+      else {
+        const [az, el] = azElOf(d);
+        const lv = sub3(this.S.lamp, this.S.eye), ln = Math.hypot(...lv);
+        const ang = ln > 0 ? Math.acos(Math.max(-1, Math.min(1, (d[0] * lv[0] + d[1] * lv[1] + d[2] * lv[2]) / ln))) / DEG : NaN;
+        this.onHover({ az, el, ang });
+      }
     }
     this.drawOverlayOnly();
   }
@@ -310,7 +403,7 @@ export class SkyView {
   resize() {
     const r = this.cv.getBoundingClientRect(), dpr = Math.min(2, window.devicePixelRatio || 1);
     const W = Math.max(1, Math.round(r.width * dpr)), H = Math.max(1, Math.round(r.height * dpr));
-    if (this.cv.width !== W || this.cv.height !== H) { this.cv.width = W; this.cv.height = H; }
+    for (const c of [this.cv, this.glc]) if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
     this.cssW = r.width; this.cssH = r.height; this.dpr = dpr;
   }
 
@@ -320,11 +413,13 @@ export class SkyView {
   }
   drawNow() { if (this._raf) { cancelAnimationFrame(this._raf); this._raf = 0; } this._draw(); }
 
+  // 悬停十字只重画线层: 第一次悬停时把干净的线层存一份 (拖动 / 重画时不存, 省掉整幅 getImageData)
   drawOverlayOnly() {
-    if (!this._base) { this.draw(); return; }
+    if (this._raf || !this.cssW) { this.draw(); return; }
     const ctx = this.ctx;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.putImageData(this._base, 0, 0);
+    if (this._base) ctx.putImageData(this._base, 0, 0);
+    else this._base = ctx.getImageData(0, 0, this.cv.width, this.cv.height);
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
     this._drawHover();
   }
@@ -334,98 +429,34 @@ export class SkyView {
     const W = this.cssW, H = this.cssH, ctx = this.ctx, V = this.V, p = this.proj;
     if (!(W > 2 && H > 2)) return;
     p.set(V.az, V.el, V.fov, V.lens, W, H);
-    // 1) 点栅: 白底 + 点云
-    this.ras.resize(ctx, this.cv.width, this.cv.height, this.dpr);
-    this.ras.clear([255, 255, 255]);
     const S = this.S;
-    if (S) { this._drawMeshes(); this._drawClouds(); }
+    this.gpu.render(p, V, this.dpr, !!(S && S.mirror));
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.putImageData(this.ras.img, 0, 0);
+    ctx.clearRect(0, 0, this.cv.width, this.cv.height);
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
-    // 2) 网格 / 地平线 / 外框
     this._drawGrid();
-    // 3) 线 + 标记
     if (S) { this._drawLines(); this._drawMarks(); this._drawLampEtc(); }
     this._drawFrame();
-    this._base = ctx.getImageData(0, 0, this.cv.width, this.cv.height);
-    this._drawHover();
+    this._base = null;
+    if (this.hover && !this.dragging) { this._base = ctx.getImageData(0, 0, this.cv.width, this.cv.height); this._drawHover(); }
   }
 
-  // 晕面网格: 每个三角形三个顶点的视方向 → 画面; 颜色取三顶点平均.
-  // 跨画框的三角形照画 (不按视场裁), 合成时按画框圆遮罩; 只丢掉张角过大 (>30°) 或跨全景接缝的三角形
-  _drawMeshes() {
-    const S = this.S;
-    if (!S.meshes || !S.meshes.length) return;
-    const p = this.proj, ras = this.ras, E = S.eye;
-    const cosMax = Math.cos(30 * DEG);
-    const sides = S.mirror ? [1, -1] : [1];
-    const step = this.dragging ? 2 : 1;
-    ras.layerBegin();
-    const X = new Float64Array(3), Y = new Float64Array(3), U = new Float64Array(9);
-    for (const m of S.meshes) {
-      const P = m.pos, cols = m.cols, nT = P.length / 9, base = m.col || [70, 130, 180];
-      const packedBase = (base[2] << 16) | (base[1] << 8) | base[0];
-      for (const ys of sides)
-        for (let t = 0; t < nT; t += step) {
-          let ok = true;
-          for (let k = 0; k < 3; k++) {
-            const o = 9 * t + 3 * k;
-            const dx = P[o] - E[0], dy = ys * P[o + 1] - E[1], dz = P[o + 2] - E[2];
-            const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-            if (r < 1e-9) { ok = false; break; }
-            U[3 * k] = dx / r; U[3 * k + 1] = dy / r; U[3 * k + 2] = dz / r;
-            if (!p.projectLoose(U[3 * k], U[3 * k + 1], U[3 * k + 2])) { ok = false; break; }
-            X[k] = p.x; Y[k] = p.y;
-          }
-          if (!ok) continue;
-          if (!p.connect(U[0], U[1], U[2], U[3], U[4], U[5], cosMax) || !p.connect(U[3], U[4], U[5], U[6], U[7], U[8], cosMax)
-            || !p.connect(U[0], U[1], U[2], U[6], U[7], U[8], cosMax)) continue;
-          let c = packedBase;
-          if (cols) {
-            const o = 9 * t;
-            const r = (cols[o] + cols[o + 3] + cols[o + 6]) / 3 | 0, g = (cols[o + 1] + cols[o + 4] + cols[o + 7]) / 3 | 0, b = (cols[o + 2] + cols[o + 5] + cols[o + 8]) / 3 | 0;
-            c = (b << 16) | (g << 8) | r;
-          }
-          ras.tri(X[0], Y[0], X[1], Y[1], X[2], Y[2], c);
-        }
-    }
-    // 鱼眼 (视场 < 360°): 只合成画框圆以内的像素
-    const V = this.V, round = V.lens >= 1 && V.lens <= 4 && V.fov < 359;
-    ras.layerEnd(0.62, round ? { cx: p.cx, cy: p.cy, r: p.rpx } : null);
-  }
-
-  _drawClouds() {
-    const S = this.S, p = this.proj, ras = this.ras, E = S.eye;
-    const thin = this.dragging ? 3 : 1;      // 拖动时抽稀
-    const sides = S.mirror ? [1, -1] : [1];
-    for (const cl of S.clouds) {
-      const P = cl.pts, n = P.length / 3, cols = cl.cols;
-      const col = cl.col || [70, 130, 180], size = cl.size || 1.6, alpha = cl.alpha ?? 0.5;
-      for (const ys of sides) {
-        for (let i = 0; i < n; i += thin) {
-          const dx = P[3 * i] - E[0], dy = ys * P[3 * i + 1] - E[1], dz = P[3 * i + 2] - E[2];
-          const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-          if (r < 1e-9) continue;
-          if (!p.project(dx / r, dy / r, dz / r)) continue;
-          if (cols) ras.dot(p.x, p.y, size, [cols[3 * i], cols[3 * i + 1], cols[3 * i + 2]], alpha);
-          else ras.dot(p.x, p.y, size, col, alpha);
-        }
-      }
-    }
-  }
-
-  // 一条 3D 折线 → 画面路径 (方向跳变 / 不可见 / 等距圆柱接缝处断开)
+  // 一条折线 → 画面路径. 有精确视方向 (d) 就用它; 只有位置时退回 P−E. 方向跳变 / 不可见 / 全景接缝处断开.
   _pathOf(seg, ys) {
-    const p = this.proj, E = this.S.eye, ctx = this.ctx, n = seg.length / 3;
-    const cosMax = Math.cos(25 * DEG);
+    const p = this.proj, E = this.S.eye, ctx = this.ctx;
+    const P = seg.p || seg, Dd = seg.d || null, n = P.length / 3;
+    const cosMax = Math.cos(12 * DEG);
     let pen = false, qx = 0, qy = 0, qz = 0;
     for (let i = 0; i < n; i++) {
-      const dx = seg[3 * i] - E[0], dy = ys * seg[3 * i + 1] - E[1], dz = seg[3 * i + 2] - E[2];
-      const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (r < 1e-9) { pen = false; continue; }
-      const ux = dx / r, uy = dy / r, uz = dz / r;
-      const ok = p.project(ux, uy, uz);
-      if (!ok) { pen = false; continue; }
+      let ux, uy, uz;
+      if (Dd) { ux = Dd[3 * i]; uy = ys * Dd[3 * i + 1]; uz = Dd[3 * i + 2]; }
+      else {
+        const dx = P[3 * i] - E[0], dy = ys * P[3 * i + 1] - E[1], dz = P[3 * i + 2] - E[2];
+        const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (r < 1e-9) { pen = false; continue; }
+        ux = dx / r; uy = dy / r; uz = dz / r;
+      }
+      if (!p.project(ux, uy, uz)) { pen = false; continue; }
       if (pen && p.connect(qx, qy, qz, ux, uy, uz, cosMax)) ctx.lineTo(p.x, p.y);
       else ctx.moveTo(p.x, p.y);
       pen = true; qx = ux; qy = uy; qz = uz;
@@ -439,9 +470,9 @@ export class SkyView {
     for (const ln of S.lines) {
       ctx.lineWidth = ln.width || 1.6;
       ctx.setLineDash(ln.dash || []);
-      if (ln.segCols) {                       // 每条一种颜色 (二自由度的 h 层)
+      if (ln.segCols) {
         ln.segs.forEach((seg, k) => {
-          ctx.strokeStyle = css(ln.segCols[k].map(v => v | 0), ln.alpha ?? 1);
+          ctx.strokeStyle = css(ln.segCols[k], ln.alpha ?? 1);
           ctx.beginPath();
           for (const ys of sides) this._pathOf(seg, ys);
           ctx.stroke();
@@ -460,12 +491,18 @@ export class SkyView {
     const S = this.S, ctx = this.ctx, p = this.proj, E = S.eye;
     const sides = S.mirror ? [1, -1] : [1];
     for (const mk of S.marks) {
-      const P = mk.pts, n = P.length / 3;
+      const P = mk.pts, Dd = mk.dirs || null, n = P.length / 3;
       for (const ys of sides)
         for (let i = 0; i < n; i++) {
-          const dx = P[3 * i] - E[0], dy = ys * P[3 * i + 1] - E[1], dz = P[3 * i + 2] - E[2];
-          const r = Math.hypot(dx, dy, dz);
-          if (r < 1e-9 || !p.project(dx / r, dy / r, dz / r)) continue;
+          let ux, uy, uz;
+          if (Dd) { ux = Dd[3 * i]; uy = ys * Dd[3 * i + 1]; uz = Dd[3 * i + 2]; }
+          else {
+            const dx = P[3 * i] - E[0], dy = ys * P[3 * i + 1] - E[1], dz = P[3 * i + 2] - E[2];
+            const r = Math.hypot(dx, dy, dz);
+            if (r < 1e-9) continue;
+            ux = dx / r; uy = dy / r; uz = dz / r;
+          }
+          if (!p.project(ux, uy, uz)) continue;
           glyph(ctx, p.x, p.y, mk.kind, mk.col, mk.size || 4);
         }
     }
@@ -476,13 +513,11 @@ export class SkyView {
     const lv = sub3(S.lamp, S.eye), ln = Math.hypot(...lv);
     if (ln < 1e-9) return;
     const d = [lv[0] / ln, lv[1] / ln, lv[2] / ln];
-    // 反灯点
     if (p.project(-d[0], -d[1], -d[2])) {
       ctx.strokeStyle = 'rgba(0,0,0,.55)'; ctx.lineWidth = 1.2;
       const x = p.x, y = p.y;
       ctx.beginPath(); ctx.moveTo(x - 5, y - 5); ctx.lineTo(x + 5, y + 5); ctx.moveTo(x - 5, y + 5); ctx.lineTo(x + 5, y - 5); ctx.stroke();
     }
-    // 灯
     if (p.project(d[0], d[1], d[2])) {
       const x = p.x, y = p.y;
       ctx.fillStyle = '#f29a1a'; ctx.strokeStyle = '#8a4b00'; ctx.lineWidth = 1;
@@ -500,28 +535,23 @@ export class SkyView {
   _drawGrid() {
     const ctx = this.ctx, p = this.proj, S = this.S;
     ctx.lineWidth = 1;
-    // 仰角圈 (每 30°) 与方位线 (每 30°)
     ctx.strokeStyle = 'rgba(0,0,0,.10)';
     ctx.beginPath();
     for (const el of [-60, -30, 30, 60]) this._circleLat(el);
     for (let az = 0; az < 360; az += 30) this._meridian(az);
     ctx.stroke();
-    // 地平线
     ctx.strokeStyle = 'rgb(46,139,87)'; ctx.lineWidth = 1.5;
     ctx.beginPath(); this._circleLat(0); ctx.stroke();
-    // 方位刻度 (地平线上): 0 = 朝灯
     ctx.fillStyle = 'rgba(46,139,87,.95)'; ctx.font = `11px ${FONT}`; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
     for (let az = 0; az < 360; az += 30) {
       const a = -az * DEG;
       if (!p.project(Math.cos(a), Math.sin(a), 0)) continue;
       ctx.fillText(az === 0 ? (this.lampLabel || '0°') : `${az > 180 ? az - 360 : az}°`, p.x, p.y + 3);
     }
-    // 天顶
     if (p.project(0, 0, 1)) {
       ctx.fillStyle = 'rgba(0,0,0,.4)';
       ctx.beginPath(); ctx.arc(p.x, p.y, 2, 0, 2 * Math.PI); ctx.fill();
     }
-    // 22° 参考圈 (以灯为心, 浅灰虚线)
     if (S && this.refCircle) {
       const lv = sub3(S.lamp, S.eye), ln = Math.hypot(...lv);
       if (ln > 1e-9) {
@@ -578,8 +608,19 @@ export class SkyView {
     ctx.beginPath(); ctx.moveTo(h.x - 7, h.y); ctx.lineTo(h.x + 7, h.y); ctx.moveTo(h.x, h.y - 7); ctx.lineTo(h.x, h.y + 7); ctx.stroke();
   }
 
-  /** 导出用: 当前画面 (含线) 的离屏副本 */
-  snapshot() { this.drawNow(); return this.cv; }
+  /** 导出用: GPU 层 + 线层合成 */
+  snapshot() {
+    const hv = this.hover;
+    this.hover = null;                 // 导出图里不要悬停十字
+    this.drawNow();
+    const c = document.createElement('canvas');
+    c.width = this.cv.width; c.height = this.cv.height;
+    const g = c.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+    g.drawImage(this.glc, 0, 0); g.drawImage(this.cv, 0, 0);
+    this.hover = hv;
+    return c;
+  }
 }
 
 export function glyph(ctx, x, y, kind, col, size) {

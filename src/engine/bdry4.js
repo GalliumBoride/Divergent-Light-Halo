@@ -132,12 +132,22 @@ function evalState(cx, kind, mi, tau) {
   if (!pr.collapse && st.rootM >= -1e-12) {
     const rh = Math.max(-1, Math.min(1, pr.rhs));
     const asr = Math.asin(rh);
-    let P = conePoint(cx, U, d, asr - pr.phi); if (P) st.pA = P;
-    P = conePoint(cx, U, d, Math.PI - asr - pr.phi); if (P) st.pB = P;
+    let P = conePoint(cx, U, d, asr - pr.phi); if (P) { st.pA = P; st.dA = skyDirs(U, d, asr - pr.phi); }
+    P = conePoint(cx, U, d, Math.PI - asr - pr.phi); if (P) { st.pB = P; st.dB = skyDirs(U, d, Math.PI - asr - pr.phi); }
     st.pm = Math.max(coneMargin(cx, U, d, asr - pr.phi), coneMargin(cx, U, d, Math.PI - asr - pr.phi));
   }
   return st;
 }
+
+// 该支的两个方向: 观测者看到它的方向 −Rz(ψ)d (精确, 不靠 P−E 相减) 与从灯出发的方向 Rz(ψ)U → [sx,sy,sz, ux,uy,uz]
+function skyDirs(U, d, psi) {
+  const cp = Math.cos(psi), sp = Math.sin(psi);
+  return [-(d[0] * cp - d[1] * sp), -(d[0] * sp + d[1] * cp), -d[2], U[0] * cp - U[1] * sp, U[0] * sp + U[1] * cp, U[2]];
+}
+const angDeg = (a, b, o) => {
+  const c = a[o] * b[o] + a[o + 1] * b[o + 1] + a[o + 2] * b[o + 2];
+  return Math.acos(c > 1 ? 1 : c < -1 ? -1 : c) * 180 / Math.PI;
+};
 
 // 事件二分: f 在 [t0,t1] 变号 → 精确事件 τ*, 返回严格 f>0 一侧的 state
 function bisectEvent(evalS, f, t0, t1, f0) {
@@ -158,13 +168,21 @@ function stableSortByTau(arr) {
   return idx.map(i => arr[i]);
 }
 
-// 构造一族边界: 基网格 → 窄窗口搜索 → 事件精化 → 掩码过滤 → 拉伸密化 → 两片就近配对装配
-function buildFamily(cx, kind, mi, NT) {
+// 构造一族边界: 基网格 → 窄窗口搜索 → 事件精化 → 掩码过滤 → 拉伸密化 → 装配.
+// cs = true: 与 C# 窗体逐句一致 (对账用). 默认 (cs = false) 是修正版:
+//   (a) 基网格错开一个无理相位 — 原版 τ_i = 2πi/NT 在"好看"的灯仰角 (如 10°, 0.4° 的整数倍) 下会恰好落在
+//       灯–眼捏合的退化态上 (t = s = 0), 紧挨着的真事件被当作"与端点重合"丢掉, 板晶边界因此整段缺失;
+//   (b) 端点本身无点而事件有点时, 事件保留;
+//   (c) 密化同时看三维长度、从眼看的张角 (天空) 与从灯看的张角 — 靠近眼和灯时自动加密;
+//   (d) 装配按支的连续性 (ψ 闭式两支在根存在区间内各自连续), 不再"就近配对"换支, 只在无点处断开;
+//       每点同时给出精确视方向 (−d_div), 天空视图不用 P−E 相减.
+function buildFamily(cx, kind, mi, NT, cs = true) {
   const evalS = t => evalState(cx, kind, mi, t);
 
   // 1) 基网格
   let samples = [];
-  for (let i = 0; i <= NT; i++) samples.push(evalS(2 * Math.PI * i / NT));
+  const PH = cs ? 0 : 0.3819660112501051;
+  for (let i = 0; i <= NT; i++) samples.push(evalS(2 * Math.PI * (i + PH) / NT));
 
   // 1b) 窄窗口搜索 (v4.1)
   {
@@ -239,7 +257,11 @@ function buildFamily(cx, kind, mi, NT) {
     const kept = [];
     const better = (e, l) => { const oe = okS(e), ol = okS(l); if (oe !== ol) return oe; return e.k < l.k; };
     for (const e of order) {
-      if (Math.abs(e.tau - s0.tau) < TOL || Math.abs(e.tau - s1.tau) < TOL) continue;
+      if (Math.abs(e.tau - s0.tau) < TOL || Math.abs(e.tau - s1.tau) < TOL) {
+        // 修正版: 端点自己无点 (退化态) 而事件有点 → 事件就是真正的端点, 保留
+        const end = Math.abs(e.tau - s0.tau) < TOL ? s0 : s1;
+        if (cs || okS(end) || !okS(e)) continue;
+      }
       if (kept.length > 0 && Math.abs(e.tau - kept[kept.length - 1].tau) < TOL) {
         if (better(e, kept[kept.length - 1])) kept[kept.length - 1] = e;
         continue;
@@ -270,7 +292,14 @@ function buildFamily(cx, kind, mi, NT) {
   // 3) 拉伸密化 (真无效才断)
   const Lden = Math.max(0.15, cx.maxDist / 160), Lden2 = Lden * Lden;
   const dense = [];
-  let budget = 5000;
+  let budget = cs ? 5000 : 60000;
+  const maxDep = cs ? 11 : 18;
+  // 修正版判据: 三维长度, 或从眼看张角 > 0.3°, 或从灯看张角 > 1°
+  const big = (p0, p1, d0, d1) => {
+    if (dist2(p0, p1) > Lden2) return true;
+    if (cs || !d0 || !d1) return false;
+    return angDeg(d0, d1, 0) > 0.3 || angDeg(d0, d1, 3) > 1.0;
+  };
   for (let i = 0; i < outL.length; i++) {
     dense.push(outL[i]);
     if (i === outL.length - 1) break;
@@ -279,9 +308,9 @@ function buildFamily(cx, kind, mi, NT) {
     while (stack.length > 0 && budget > 0) {
       const [sa, sb, dep] = stack.pop();
       const a0 = vA(sa), a1 = vA(sb), b0 = vB(sa), b1 = vB(sb);
-      const needA = a0 !== null && a1 !== null && dist2(a0, a1) > Lden2;
-      const needB = b0 !== null && b1 !== null && dist2(b0, b1) > Lden2;
-      if ((!needA && !needB) || dep >= 11) continue;
+      const needA = a0 !== null && a1 !== null && big(a0, a1, sa.dA, sb.dA);
+      const needB = b0 !== null && b1 !== null && big(b0, b1, sa.dB, sb.dB);
+      if ((!needA && !needB) || dep >= maxDep) continue;
       const sm = evalS(0.5 * (sa.tau + sb.tau));
       budget--;
       seg.push(sm);
@@ -291,6 +320,25 @@ function buildFamily(cx, kind, mi, NT) {
     // C# List.Sort 是不稳定排序, 但 τ 互不相同 (二分中点), 次序唯一
     seg.sort((x, y) => x.tau - y.tau);
     dense.push(...seg);
+  }
+
+  // 4') 修正版装配: 按支连续, 无点处断开; 每条 { p: 位置, d: 视方向 }
+  if (!cs) {
+    const strips = [];
+    const jump2 = Math.max(4, (cx.maxDist / 4) ** 2);
+    for (const which of ['A', 'B']) {
+      let P = [], D = [], prev = null;
+      const flush = () => { if (P.length >= 6) strips.push({ p: Float32Array.from(P), d: Float32Array.from(D) }); P = []; D = []; };
+      for (const st of dense) {
+        const p = which === 'A' ? vA(st) : vB(st), d = which === 'A' ? st.dA : st.dB;
+        if (p === null || !d) { flush(); prev = null; continue; }
+        if (prev !== null && dist2(p, prev) > jump2) flush();
+        P.push(p[0], p[1], p[2]); D.push(d[0], d[1], d[2]);
+        prev = p;
+      }
+      flush();
+    }
+    return strips;
   }
 
   // 4) 两片就近配对 + 装配
@@ -323,9 +371,11 @@ function buildFamily(cx, kind, mi, NT) {
 
 /**
  * 光锥法物理边界主入口 (ComputeLightConeBoundaries v4): 入射掠射 → entry (红),
- * 镜面掠射 (每个中间反射面一族) → mirror (橙), 出射临界 → tir (蓝). 每条为 Float32Array (x,y,z 连排).
+ * 镜面掠射 (每个中间反射面一族) → mirror (橙), 出射临界 → tir (蓝).
+ * opts.cs = true: 与 C# 逐句一致, 每条为 Float32Array (x,y,z 连排); 默认修正版, 每条为 { p, d } (位置 + 视方向).
  */
-export function lightConeBoundaries(facePath, lampElev, lampDist, eyeHeight, refN, maxDist, zetaDeg, thetaDeg, NT = 900) {
+export function lightConeBoundaries(facePath, lampElev, lampDist, eyeHeight, refN, maxDist, zetaDeg, thetaDeg, NT = 900, opts = {}) {
+  const cs = !!opts.cs;
   const elevRad = lampElev * Math.PI / 180.0;
   const Lx = lampDist * Math.cos(elevRad), Lz = lampDist * Math.sin(elevRad);
   const cx = {
@@ -338,9 +388,22 @@ export function lightConeBoundaries(facePath, lampElev, lampDist, eyeHeight, ref
   cx.basT = orthoBasis(cx.canon[facePath[last]]);
   cx.basM = new Array(facePath.length);
   for (let mi = 1; mi < last; mi++) cx.basM[mi] = orthoBasis(cx.canon[facePath[mi]]);
-  const entry = buildFamily(cx, 0, 0, NT);
+  const entry = buildFamily(cx, 0, 0, NT, cs);
   const mirror = [];
-  for (let mi = 1; mi < last; mi++) mirror.push(...buildFamily(cx, 1, mi, NT));
-  const tir = buildFamily(cx, 2, 0, NT);
+  for (let mi = 1; mi < last; mi++) mirror.push(...buildFamily(cx, 1, mi, NT, cs));
+  const tir = buildFamily(cx, 2, 0, NT, cs);
   return { entry, mirror, tir };
+}
+
+// 测试/诊断用: 边界态求值
+export function _bdryDebug(facePath, lampElev, lampDist, eyeHeight, refN, maxDist, zetaDeg, thetaDeg) {
+  const elevRad = lampElev * Math.PI / 180.0;
+  const Lx = lampDist * Math.cos(elevRad), Lz = lampDist * Math.sin(elevRad);
+  const cx = { faces: facePath, N: refN, K: Math.sqrt(Math.max(0, refN * refN - 1)), L: [Lx, 0, Lz], Dx: Lx, Dy: 0, Dz: Lz - eyeHeight, maxDist,
+    canon: buildCanonNormals(zetaDeg, thetaDeg) };
+  const last = facePath.length - 1;
+  cx.basE = orthoBasis(cx.canon[facePath[0]]); cx.basT = orthoBasis(cx.canon[facePath[last]]);
+  cx.basM = new Array(facePath.length);
+  for (let mi = 1; mi < last; mi++) cx.basM[mi] = orthoBasis(cx.canon[facePath[mi]]);
+  return { cx, evalState: (kind, mi, tau) => evalState(cx, kind, mi, tau) };
 }

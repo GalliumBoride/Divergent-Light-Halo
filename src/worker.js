@@ -4,6 +4,7 @@
 //   bdry1           一自由度物理边界 (边界引擎 v4) + 平行光弧
 //   obs1 / obs2     观测者视角发散焦散 (一 / 二自由度)
 //   layers2         二自由度光锥的一段 h 层 (焦散或选定的平行光曲线 → 锥映射)
+//   layers2h        二自由度光锥的指定 h 层 (只要显示曲线; 有曲线的 h 区间里加密用)
 //   edges2          二自由度曲面边界线 (末端点身份 h-延拓) + 平行光弧
 //   cone1 / cone2   锥切片 (一自由度闭式 / 二自由度单层)
 //   shell1 / shell2 发散度球壳 (DivShell 闭式)
@@ -15,6 +16,7 @@ import { lightConeBoundaries } from './engine/bdry4.js';
 import { surfaceMesh1 } from './engine/mesh1.js';
 import { lightCone2DofLayers, parallelArc2Dof, edges2Dof, resolveSurface } from './engine/epdiv.js';
 import * as OC from './engine/obscaustic.js';
+import { fold2DofFine } from './engine/obsfine.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
 
 function transferOf(obj, list = []) {
@@ -40,13 +42,15 @@ const f32of = pts => {          // [[x,y,z]…] → Float32Array
   return a;
 };
 
+// 焦散段 → { p: 位置, d: 精确视方向 }
+const segPD = sg => ({ p: sg.pts3(), d: f32of(sg.d) });
 function obsPack(fold, seams, asym, note) {
   const ridge = [], ridgeInf = [], seam = [];
   for (const sg of fold || []) {
     if (sg.p.length < 2) continue;
-    (sg.truncated ? ridgeInf : ridge).push(sg.pts3());
+    (sg.truncated ? ridgeInf : ridge).push(segPD(sg));
   }
-  for (const sg of seams || []) if (sg.p.length >= 2) seam.push(sg.pts3());
+  for (const sg of seams || []) if (sg.p.length >= 2) seam.push(segPD(sg));
   return { ridge, ridgeInf, seam, asym: asym || [], note: note || '' };
 }
 
@@ -69,7 +73,7 @@ function chiDegenerate(c) {
 const RUN = {
   coneH: a => lightConeH(a.fp, a.el, a.dist, a.eye, a.n, a.nH, a.nA, a.maxD, a.zeta, a.theta, a.from, a.to),
   coneS: a => lightConeSwap(a.fp, a.el, a.dist, a.eye, a.n, a.nA, a.nPsi, a.maxD, a.zeta, a.theta, a.from, a.to),
-  mesh1: a => surfaceMesh1(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta, a.budget),
+  mesh1: a => surfaceMesh1(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta, { budget: a.budget }),
 
   bdry1: a => {
     const b = lightConeBoundaries(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta);
@@ -105,7 +109,7 @@ const RUN = {
       fixedRad: (a.lowitz ? a.theta : a.zeta) * Math.PI / 180,
       dvec, eyePos: [0, 0, a.eye], maxDist: a.maxD,
     });
-    const fold = OC.fold2Dof(c2, 0.01, 400);
+    const fold = fold2DofFine(c2, 0.0025, 4000);      // 修正版串线 (连续性匹配 + 更密), 见 engine/obsfine.js
     shift(fold, a.eye);
     const note = fold.length === 0
       ? (a.lang === 'en'
@@ -118,14 +122,20 @@ const RUN = {
   layers2: a => {
     const lp = a.fp.map(lpFaceFromCompact);
     const surf = resolveSurface(lp, a.surf);
-    return lightCone2DofLayers(lp, a.el, a.dist, a.eye, a.nH, a.nG, a.maxD, a.lowitz, a.zeta, a.theta, surf, a.from, a.to);
+    return lightCone2DofLayers(lp, a.el, a.dist, a.eye, a.nH, a.nG, a.maxD, a.lowitz, a.zeta, a.theta, surf, a.from, a.to, null, true);
+  },
+
+  layers2h: a => {
+    const lp = a.fp.map(lpFaceFromCompact);
+    const surf = resolveSurface(lp, a.surf);
+    return a.hs.map(h => ({ h, curves: lightCone2DofLayers(lp, a.el, a.dist, a.eye, 1, a.nG, a.maxD, a.lowitz, a.zeta, a.theta, surf, 0, 1, h, true)[0].curves }));
   },
 
   edges2: a => {
     const lp = a.fp.map(lpFaceFromCompact);
     const surf = resolveSurface(lp, a.surf);
-    const e = edges2Dof(lp, a.el, a.dist, a.eye, a.maxD, a.lowitz, a.zeta, a.theta, surf);
-    e.parArc = parallelArc2Dof(lp, a.el, a.eye, a.nG, a.lowitz, a.zeta, a.theta, surf);
+    const e = edges2Dof(lp, a.el, a.dist, a.eye, a.maxD, a.lowitz, a.zeta, a.theta, surf, null, true);
+    e.parArc = parallelArc2Dof(lp, a.el, a.eye, a.nG, a.lowitz, a.zeta, a.theta, surf, true);
     e.surf = surf;
     return e;
   },
@@ -137,7 +147,7 @@ const RUN = {
     const lp = a.fp.map(lpFaceFromCompact);
     const surf = resolveSurface(lp, a.surf);
     const h = Math.max(-89.99, Math.min(89.99, a.h));
-    return lightCone2DofLayers(lp, a.el, a.dist, a.eye, 1, a.nG, a.maxD, a.lowitz, a.zeta, a.theta, surf, 0, 1, h)[0];
+    return lightCone2DofLayers(lp, a.el, a.dist, a.eye, 1, a.nG, a.maxD, a.lowitz, a.zeta, a.theta, surf, 0, 1, h, true)[0];
   },
 
   shell1: a => {
@@ -159,14 +169,14 @@ const RUN = {
 };
 
 function shellPack1(res) {
-  const curves = [], dirs = [];
-  for (let k = 0; k < res.polylines.length; k++) { curves.push(f32of(res.polylines[k])); dirs.push(f32of(res.polylineDirs[k])); }
+  const curves = [];
+  for (let k = 0; k < res.polylines.length; k++) curves.push({ p: f32of(res.polylines[k]), d: f32of(res.polylineDirs[k]) });
   const ends = [], endDirs = [], folds = [], foldDirs = [];
   for (const e of res.ends) if (e.p && e.dir && e.inAlphaRange) { ends.push(e.p); endDirs.push(e.dir); }
   for (const a of res.arcs) for (let k = 0; k < a.foldP.length; k++) { folds.push(a.foldP[k]); foldDirs.push(a.foldDir[k]); }
   const cusps = res.cuspP.slice();
   return {
-    curves, dirs, kinds: curves.map(() => 0),
+    curves, kinds: curves.map(() => 0),
     ends: f32of(ends), endDirs: f32of(endDirs), folds: f32of(folds), foldDirs: f32of(foldDirs),
     cusps: f32of(cusps), ok: res.ok, note: res.ok ? '' : res.note,
     nArcs: curves.length, nEnds: ends.length, nFolds: folds.length,
@@ -174,15 +184,15 @@ function shellPack1(res) {
 }
 
 function shellPack2(res, wantC) {
-  const curves = [], dirs = [], kinds = [];
+  const curves = [], kinds = [];
   let nCau = 0, nFen = 0;
   for (const cu of res.curves) {
-    curves.push(f32of(cu.p)); dirs.push(f32of(cu.dir));
+    curves.push({ p: f32of(cu.p), d: f32of(cu.dir) });
     kinds.push(cu.kind === 0 ? 5 : cu.kind);      // 5 = 二自由度焦散; 1..4 = 边界像 (掠入 / 出射临界 / 接缝 / 蓝边)
     if (cu.kind === 0) nCau++; else nFen++;
   }
   return {
-    curves, dirs, kinds,
+    curves, kinds,
     ends: f32of(res.endP), endDirs: f32of(res.endDir), folds: new Float32Array(0), foldDirs: new Float32Array(0),
     cusps: f32of(res.cuspP), ok: !res.note, note: res.note || '', wantC,
     nArcs: curves.length, nCau, nFen, nEnds: res.endP.length,
