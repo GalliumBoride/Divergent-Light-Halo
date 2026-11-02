@@ -44,6 +44,10 @@ export default {
     zh: ['尖点脊线 (二自由度)', '<p>平行光焦散在天上的尖点 (折叠的折叠) 随 h 走出来的轨迹, 是焦散曲面自身的一条棱.</p>'],
     en: ['Cusp ridge (two degrees of freedom)', '<p>The track of the parallel-light caustic’s cusps (a fold of the fold) as h changes; an edge of the caustic surface itself.</p>'],
   },
+  bRim: {
+    zh: ['晕面外缘 (二自由度)', '<p>把相邻光锥层的层曲线端点连成的线, 也就是画出来的晕面实际的边. 上面几种边界线来自平行光曲线的末端点 (碰到别的边界、转折、尖点) 随 h 的延拓, 但晕面还会在别处收口: 有的末端点映到灯后或眼后 (看不见), 有的曲线挨着光路走不通的区域结束. 这条线把这些都包括在内; 与精确边界重合的地方被精确边界盖住.</p>'],
+    en: ['Surface rim (two degrees of freedom)', '<p>The ends of the layer curves on neighbouring light-cone layers, joined up: the actual edge of the drawn surface. The boundary lines above come from continuing the parallel-light curve’s end points (meeting another boundary, turning, cusps) along h, but the surface can also close off elsewhere: some end points map behind the lamp or behind the eye (invisible), and some curves stop next to orientations where the ray path fails. This line covers all of them; where it coincides with an exact boundary, the exact one is drawn on top.</p>'],
+  },
   caustic: {
     zh: ['发散焦散 (观测者)', '<p>观测者天上最亮的那些线: 很多晶体的光挤到同一个方向. 在空间里它是晕面从眼睛看过去的<b>轮廓</b> (曲面在这里转过身).</p><p>直接解, 不经过点云: 先追一条与灯无关的普适曲线 χ(ξ) = 0, 再用锥上闭式配对方位角并裁掉看不见的部分. 实线 = 有界段, 虚线 = 一直延伸到截断距离的段. 若没有, 结果里会说明原因 (真的没有 / 在灯后方 / 在眼后方 …).</p>'],
     en: ['Divergent caustic (observer)', '<p>The brightest lines in the observer’s sky, where light from many crystals piles up in one direction. In space it is the <b>outline</b> of the halo surface as seen from the eye (where the surface turns away).</p><p>Solved directly, not from the cloud: trace a lamp-independent universal curve χ(ξ) = 0, then pair the azimuth on the cone in closed form and cut what cannot be seen. Solid = bounded part, dashed = parts running out to the truncation distance. If there is none, the results panel says why (really none / behind the lamp / behind the eye …).</p>'],

@@ -22,7 +22,7 @@ const C = {
   seam: [44, 160, 44], turn: [140, 86, 75], cusp: [227, 0, 227], caustic: [255, 127, 14],
   cSeam: [107, 142, 35], asym: [110, 110, 110], parArc: [184, 134, 11], ref: [120, 120, 120],
   cone: [214, 39, 40], shell: [0, 128, 96], shellC: [230, 120, 0], blueEdge: [23, 160, 190],
-  end: [20, 20, 20], fold: [255, 127, 14], cuspM: [227, 0, 227],
+  end: [20, 20, 20], fold: [255, 127, 14], cuspM: [227, 0, 227], rim: [70, 70, 70],
 };
 const PATHCOL = [[214, 39, 40], [31, 119, 180], [44, 160, 44], [148, 103, 189], [255, 127, 14], [140, 86, 75], [23, 190, 207], [188, 189, 34]];
 const VIRIDIS = [[68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142], [38, 130, 142], [31, 158, 137], [53, 183, 121], [109, 205, 89], [180, 222, 44], [253, 231, 37]];
@@ -37,7 +37,7 @@ const DEFAULTS = {
   elev: 10, dist: 15, eye: 0,
   paths: '3-5', mode: 'parry', zeta: -90, theta: 0, colZeta: -90, lowTheta: 0, surf2: 'caustic',
   n: 1.31, apexUp: 56, apexLo: 56, q: 0, maxDist: 80, pyr: false,
-  lay: { surf: true, pts: false, colorBy: 'h', bEntry: true, bMirror: true, bTir: true, bSeam: true, bTurn: true, bCusp: true,
+  lay: { surf: true, pts: false, colorBy: 'h', bEntry: true, bMirror: true, bTir: true, bSeam: true, bTurn: true, bCusp: true, bRim: true,
          caustic: false, cSeam: false, cAsym: true, parArc: true, ref22: false, foci: true, ground: true, mirror: true },
   cone: { on: false, h: 22, alpha: 30 },
   shell: { on: false, kappa: -0.301, r: 7.5, master: 'kappa', sphere: true, alpha: 12 },
@@ -396,6 +396,65 @@ function lampElevFromEye() {
   return Math.atan2(L[2] - E[2], Math.hypot(L[0] - E[0], L[1] - E[1])) / DEG;
 }
 
+// 二自由度晕面的外缘: 把相邻 h 层的层曲线端点连起来. 精确边界引擎只认得平行光曲线的末端点身份 (曲线∩边界、
+//   转折、尖点), 而晕面还会在别处收口 —— 那些末端点映到灯后 / 眼后看不见, 或者曲线挨着链失效区结束 (如 Lowitz 4-1).
+//   层曲线本身已二分到真正的端点 (见 epdiv 修正版), 端点随 h 连成的线就是实际画出来的晕面的边.
+//   不算端点的: 灯 / 眼上的捏合点; 同层两段首尾相接处 (锥面折叠或取向坐标接缝, 曲线在这里光滑穿过, 不是边).
+function layerRims(P) {
+  const ver = P.lver || 0;
+  if (P.rims && P.rims.v === ver) return P.rims.segs;
+  const { L, E } = scene(), D = baseline();
+  const all = [];
+  P.layers.forEach((l, ih) => { if (l && l.curves.length) all.push({ h: layerH(P, ih), curves: l.curves }); });
+  for (const l of P.dense) if (l.curves.length) all.push(l);
+  all.sort((a, b) => a.h - b.h);
+  const near = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+  const ends = all.map(l => {
+    const raw = [];
+    for (const c of l.curves) {
+      const p = c.p, d = c.d, n = p.length / 3;
+      if (n < 2 || !d) continue;
+      for (const i of [0, n - 1]) raw.push({ x: p[3 * i], y: p[3 * i + 1], z: p[3 * i + 2], dx: d[3 * i], dy: d[3 * i + 1], dz: d[3 * i + 2] });
+    }
+    const tol = 2e-4 * D, Lp = { x: L[0], y: L[1], z: L[2] }, Ep = { x: E[0], y: E[1], z: E[2] };
+    return raw.filter((q, i) => near(q, Lp) > 1e-3 * D && near(q, Ep) > 1e-3 * D && !raw.some((r, j) => j !== i && near(q, r) < tol));
+  });
+  // 逐层贪心配对: 还开着的链尾 (最多空过 2 层) 与新一层的端点, 按距离从近到远配, 两边都没配过且在上限内才连
+  const chains = [];
+  let open = [];
+  ends.forEach((layer, k) => {
+    const pairs = [];
+    for (let ci = 0; ci < open.length; ci++) {
+      const c = open[ci], q = c.pts[c.pts.length - 1];
+      const dh = Math.abs(all[k].h - all[c.k].h);
+      const r = Math.hypot(q.x - L[0], q.y - L[1], q.z - L[2]);
+      const cap = Math.max(0.1 * D, 0.3 * r) * Math.min(1.5, dh / 0.5);
+      layer.forEach((e, j) => { const dd = near(q, e); if (dd < cap) pairs.push([dd, ci, j]); });
+    }
+    pairs.sort((x, y) => x[0] - y[0]);
+    const usedC = new Uint8Array(open.length), usedE = new Uint8Array(layer.length);
+    for (const [, ci, j] of pairs) {
+      if (usedC[ci] || usedE[j]) continue;
+      usedC[ci] = usedE[j] = 1;
+      open[ci].pts.push(layer[j]); open[ci].k = k;
+    }
+    const next = [];
+    open.forEach((c, ci) => { if (usedC[ci] || k - c.k < 3) next.push(c); else chains.push(c); });
+    layer.forEach((e, j) => { if (!usedE[j]) next.push({ k, pts: [e] }); });
+    open = next;
+  });
+  chains.push(...open);
+  const segs = [];
+  for (const c of chains) {
+    if (c.pts.length < 2) continue;
+    const p3 = [], d3 = [];
+    for (const q of c.pts) { p3.push(q.x, q.y, q.z); d3.push(q.dx, q.dy, q.dz); }
+    segs.push({ p: Float32Array.from(p3), d: Float32Array.from(d3) });
+  }
+  P.rims = { v: ver, segs };
+  return segs;
+}
+
 function buildDL() {
   const { L, E } = scene();
   const dl = { eye: E, lamp: L, mirror: S.lay.mirror, meshes: [], clouds: [], lines: [], marks: [], cone: null, shell: null };
@@ -444,6 +503,7 @@ function buildDL() {
       if (lay.bTir) line(P.bdry.tir, C.tir, 2);
       if (lay.parArc) line(P.bdry.parArc, C.parArc, 1.6, { dash: [6, 4], skyOnly: true });
     }
+    if (P.dof === 2 && lay.bRim) line(layerRims(P), C.rim, 1.6);
     if (P.edges) {
       if (lay.bEntry) line(P.edges.entry, C.entry, 2);
       if (lay.bTir) line(P.edges.tir, C.tir, 2);
@@ -618,6 +678,7 @@ const LAYERS = [
   { id: 'bSeam', col: C.seam, term: 'bSeam', dof: 2 },
   { id: 'bTurn', col: C.turn, term: 'bTurn', dof: 2 },
   { id: 'bCusp', col: C.cusp, term: 'bCusp', dof: 2 },
+  { id: 'bRim', col: C.rim, term: 'bRim', dof: 2 },
   { g: 'lg.caustic' },
   { id: 'caustic', col: C.caustic, w: 3.2, term: 'caustic' },
   { id: 'cSeam', col: C.cSeam, term: 'cSeam', dof: 1, sub: 'caustic' },
@@ -635,6 +696,7 @@ function layerCount(id) {
   const add = a => { if (a) n += a.length; };
   for (const P of R.paths) {
     if (P.bdry) { if (id === 'bEntry') add(P.bdry.entry); if (id === 'bMirror') add(P.bdry.mirror); if (id === 'bTir') add(P.bdry.tir); if (id === 'parArc') add(P.bdry.parArc); }
+    if (P.dof === 2 && id === 'bRim') add(layerRims(P));
     if (P.edges) { if (id === 'bEntry') add(P.edges.entry); if (id === 'bTir') add(P.edges.tir); if (id === 'bSeam') add(P.edges.seam); if (id === 'bTurn') add(P.edges.turn); if (id === 'bCusp') add(P.edges.cusp); if (id === 'parArc') add(P.edges.parArc); }
   }
   if (RO && S.lay.caustic) for (const o of RO.paths) if (o) { if (id === 'caustic') { add(o.ridge); add(o.ridgeInf); } if (id === 'cSeam') add(o.seam); if (id === 'cAsym') add(o.asym); }
@@ -644,7 +706,7 @@ function layerCount(id) {
     for (const P of R.paths) { if (P.mesh) k += P.mesh.nTri; for (const l of P.layers) if (l) c += l.curves.length; for (const l of P.dense) c += l.curves.length; }
     return k ? fmtN(k) + ' △' : c ? String(c) : '';
   }
-  if (['bEntry', 'bMirror', 'bTir', 'bSeam', 'bTurn', 'bCusp', 'caustic', 'cSeam', 'cAsym', 'parArc'].includes(id)) return String(n);
+  if (['bEntry', 'bMirror', 'bTir', 'bSeam', 'bTurn', 'bCusp', 'bRim', 'caustic', 'cSeam', 'cAsym', 'parArc'].includes(id)) return String(n);
   return '';
 }
 let layersBuilt = '';

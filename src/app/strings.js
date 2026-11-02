@@ -76,7 +76,7 @@ export default {
   'color.h': ['按灯处仰角 h', 'by cone elevation h'], 'color.rho': ['按发散度 ρ', 'by divergency ρ'],
   'color.mono': ['单色', 'single colour'], 'color.path': ['按光路', 'by path'],
   'lay.bEntry': ['入射掠射', 'Entry grazing'], 'lay.bMirror': ['镜面掠射', 'Mirror grazing'], 'lay.bTir': ['出射临界', 'Exit critical'],
-  'lay.bSeam': ['接缝', 'Seam'], 'lay.bTurn': ['转折缝', 'Turn seam'], 'lay.bCusp': ['尖点脊线', 'Cusp ridge'],
+  'lay.bSeam': ['接缝', 'Seam'], 'lay.bTurn': ['转折缝', 'Turn seam'], 'lay.bCusp': ['尖点脊线', 'Cusp ridge'], 'lay.bRim': ['晕面外缘', 'Surface rim'],
   'lay.caustic': ['发散焦散 (观测者)', 'Divergent caustic (observer)'], 'lay.cSeam': ['边界的天空像', 'Sky images of boundaries'],
   'lay.cAsym': ['渐近圆', 'Asymptotic circles'],
   'lay.parArc': ['平行光弧 (把灯当太阳)', 'Parallel-light arc (lamp as sun)'], 'lay.ref22': ['22° 参考圈', '22° reference circle'],
