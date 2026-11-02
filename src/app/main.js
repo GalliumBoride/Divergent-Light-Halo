@@ -125,7 +125,7 @@ function runMain() {
   cs.forEach((code, ip) => {
     const fp = parsePath(code);
     const base = { ...common(), fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta, lowitz: !!o.lowitz };
-    const P = { code, fp, dof: o.dof, h: [], s: [], layers: [], dense: [], nH: 0, mesh: null, bdry: null, edges: null, cloud: null, t0: performance.now(), ms: 0, left: 0 };
+    const P = { code, fp, dof: o.dof, h: [], s: [], layers: [], dense: [], nH: 0, mesh: null, bdry: null, edges: null, rims2: undefined, cloud: null, t0: performance.now(), ms: 0, left: 0 };
     R.paths.push(P);
     if (o.dof === 1) {
       const nH = [320, 640, 1280][q], nA = [360, 720, 1440][q], nAS = [360, 720, 1440][q], nPs = [720, 1440, 2880][q];
@@ -137,6 +137,7 @@ function runMain() {
       const nH = [72, 120, 180][q], nG = [101, 141, 181][q];
       P.nH = nH;
       tasks.push({ kind: 'edges2', args: { ...base, surf: S.surf2, nG } }); route.push([ip, 'edges']);
+      tasks.push({ kind: 'rims2', args: { ...base, surf: S.surf2, nG } }); route.push([ip, 'rims']);
       for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'layers2', args: { ...base, surf: S.surf2, nH, nG, from: a, to: b } }); route.push([ip, 'layers', a]); }
     }
   });
@@ -150,11 +151,12 @@ function runMain() {
     const [ip, part, at] = route[i], P = R.paths[ip];
     if (part === 'bdry') P.bdry = d;
     else if (part === 'edges') P.edges = d;
+    else if (part === 'rims') P.rims2 = d || null;
     else if (part === 'mesh') { P.mesh = d; P.meshCol = null; }
     else if (part === 'h') d.forEach((a, k) => { P.h[at + k] = a; });
     else if (part === 's') d.forEach((a, k) => { P.s[at + k] = a; });
     else if (part === 'layers') { d.forEach((a, k) => { P.layers[at + k] = a; }); P.lver = (P.lver || 0) + 1; }
-    if (part !== 'bdry' && part !== 'edges' && part !== 'mesh') P.cloud = null;
+    if (part !== 'bdry' && part !== 'edges' && part !== 'mesh' && part !== 'rims') P.cloud = null;
     if (--P.left === 0) P.ms = performance.now() - P.t0;
     R.done++;
     scheduleRefresh();
@@ -400,6 +402,13 @@ function lampElevFromEye() {
 //   转折、尖点), 而晕面还会在别处收口 —— 那些末端点映到灯后 / 眼后看不见, 或者曲线挨着链失效区结束 (如 Lowitz 4-1).
 //   层曲线本身已二分到真正的端点 (见 epdiv 修正版), 端点随 h 连成的线就是实际画出来的晕面的边.
 //   不算端点的: 灯 / 眼上的捏合点; 同层两段首尾相接处 (锥面折叠或取向坐标接缝, 曲线在这里光滑穿过, 不是边).
+// 焦散面: 用引擎沿 h 精确延拓的外缘 (rims2); 还没算完时先不画 (避免先出一版层端点连线再跳变).
+// 选的是某条边界面: 用层端点连线 (这类面的层端点已二分到精确端点, 连起来就在边界上).
+function rimsOf(P) {
+  if (P.rims2) return P.rims2;
+  if (P.rims2 === undefined && S.surf2 === 'caustic') return [];
+  return layerRims(P);
+}
 function layerRims(P) {
   const ver = (P.lver || 0) + (P.edges ? 0.5 : 0);
   if (P.rims && P.rims.v === ver) return P.rims.segs;
@@ -521,7 +530,7 @@ function buildDL() {
       if (lay.bTir) line(P.bdry.tir, C.tir, 2);
       if (lay.parArc) line(P.bdry.parArc, C.parArc, 1.6, { dash: [6, 4], skyOnly: true });
     }
-    if (P.dof === 2 && lay.bRim) line(layerRims(P), C.rim, 1.6);
+    if (P.dof === 2 && lay.bRim) line(rimsOf(P), C.rim, 1.6);
     if (P.edges) {
       if (lay.bEntry) line(P.edges.entry, C.entry, 2);
       if (lay.bTir) line(P.edges.tir, C.tir, 2);
@@ -714,7 +723,7 @@ function layerCount(id) {
   const add = a => { if (a) n += a.length; };
   for (const P of R.paths) {
     if (P.bdry) { if (id === 'bEntry') add(P.bdry.entry); if (id === 'bMirror') add(P.bdry.mirror); if (id === 'bTir') add(P.bdry.tir); if (id === 'parArc') add(P.bdry.parArc); }
-    if (P.dof === 2 && id === 'bRim') add(layerRims(P));
+    if (P.dof === 2 && id === 'bRim') add(rimsOf(P));
     if (P.edges) { if (id === 'bEntry') add(P.edges.entry); if (id === 'bTir') add(P.edges.tir); if (id === 'bSeam') add(P.edges.seam); if (id === 'bTurn') add(P.edges.turn); if (id === 'bCusp') add(P.edges.cusp); if (id === 'parArc') add(P.edges.parArc); }
   }
   if (RO && S.lay.caustic) for (const o of RO.paths) if (o) { if (id === 'caustic') { add(o.ridge); add(o.ridgeInf); } if (id === 'cSeam') add(o.seam); if (id === 'cAsym') add(o.asym); }

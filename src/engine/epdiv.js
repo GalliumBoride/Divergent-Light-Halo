@@ -828,40 +828,67 @@ function jHat(m, fx, P) {
 // 焦散段端点抛光: 端点 = 焦散 (Ĵ=0) 与当前最紧的有效约束 (入射 g0 / 出射临界 / 中间反射) 的交点.
 //   二分只能把点放在一条弦上, 弦偏离零线, √ 区又把偏差放大 → 各层端点忽前忽后 (外缘呈锯齿).
 //   这里用两个方程 (Ĵ, 约束余量) 的 Newton (差分雅可比, 步长受限) 直接解交点; 不收敛就退回原点.
-function polishEnd(x, P, m, fx) {
+// 约束余量: [入射 g0, 出射 (−√K − qE), 各中间反射 (−qs)], 全 ≥ 0 才有效
+function marginsAt(u, v, P, m, fx) {
+  const c = Chain3(u, v, m, fx, P);
+  const out = [c.g0, -SqK - c.qE];
+  for (const q of c.qs || []) out.push(-q);
+  return out;
+}
+// 解 Ĵ = 0 且 第 k 个余量 = 0 (焦散与有效区边的交点), 从 x0 出发; 失败返回 null. 用当前 LP 太阳.
+function edgeNewton(x0, k, P, m, fx, maxMove = 0.05) {
   const Jh = jHat(m, fx, P);
-  const margins = (u, v) => {
-    const c = Chain3(u, v, m, fx, P);
-    const out = [c.g0, -SqK - c.qE];
-    for (const q of c.qs || []) out.push(-q);
-    return out;
-  };
-  const m0 = margins(x[0], x[1]);
-  if (!m0.every(Number.isFinite)) return x;
-  let k = 0;
-  for (let i = 1; i < m0.length; i++) if (m0[i] < m0[k]) k = i;
-  if (m0[k] > 0.05) return x;                          // 离任何约束都远: 不是有效区边上的端点
-  const F = (u, v) => [Jh(u, v), margins(u, v)[k] - 1e-12];
-  let u = x[0], v = x[1];
-  for (let it = 0; it < 25; it++) {
+  // 目标余量 1e-6 而不是 0: 焦散在出射临界边旁几乎是贴着边走的, 正好在边上的交点病态; 余量 1e-6 处交点良态,
+  //   离真正的边只差约 1/1000 的距离 (20 m 处 2 cm)
+  const F = (u, v) => [Jh(u, v), marginsAt(u, v, P, m, fx)[k] - 1e-6];
+  let u = x0[0], v = x0[1];
+  // 起点可能已在有效区外 (h 一变, 边界就挪过来了; 那边 Ĵ 无定义): 先沿该余量的梯度把它推回到余量 2e-6 处 (余量两边都有定义)
+  for (let it = 0; it < 20; it++) {
+    const mk = marginsAt(u, v, P, m, fx)[k];
+    if (!Number.isFinite(mk)) return null;
+    if (mk >= 1e-6 && Number.isFinite(Jh(u, v))) break;
+    const e = 1e-7, gu = (marginsAt(u + e, v, P, m, fx)[k] - mk) / e, gv = (marginsAt(u, v + e, P, m, fx)[k] - mk) / e, g2 = gu * gu + gv * gv;
+    if (!(g2 > 0) || !Number.isFinite(g2)) return null;
+    const t = (2e-6 - mk) / g2;
+    u += t * gu; v += t * gv;
+  }
+  for (let it = 0; it < 30; it++) {
     const f = F(u, v);
-    if (!f.every(Number.isFinite)) return x;
+    if (!f.every(Number.isFinite)) return null;
     if (Math.abs(f[0]) < 1e-10 && Math.abs(f[1]) < 1e-12) break;
     // 差分: 贴着边界, 向外一侧可能已无定义, 就改用向内一侧
     const diff = (du, dv) => { for (const e of [1e-7, -1e-7]) { const g = F(u + du * e, v + dv * e); if (g.every(Number.isFinite)) return [(g[0] - f[0]) / e, (g[1] - f[1]) / e]; } return null; };
     const gu = diff(1, 0), gv = diff(0, 1);
-    if (!gu || !gv) return x;
+    if (!gu || !gv) return null;
     const a = gu[0], b = gv[0], c = gu[1], d = gv[1];
     const det = a * d - b * c;
-    if (!(Math.abs(det) > 1e-300)) return x;
+    if (!(Math.abs(det) > 1e-300)) return null;
     let du = -(d * f[0] - b * f[1]) / det, dv = -(-c * f[0] + a * f[1]) / det;
     const st = Math.hypot(du, dv);
     if (st > 0.02) { du *= 0.02 / st; dv *= 0.02 / st; }
+    // 回溯: 一步跨出有效区边 (那边 Ĵ 无定义) 就减半, 直到落回来
+    let ok = false;
+    for (let bt = 0; bt < 40 && !ok; bt++) {
+      const g = F(u + du, v + dv);
+      if (g.every(Number.isFinite) && g[1] > -0.9e-6) ok = true; else { du *= 0.5; dv *= 0.5; }
+    }
+    if (!ok) return null;
     u += du; v += dv;
   }
   const f = F(u, v);
-  if (!(Math.abs(f[0]) < 1e-6 && Math.abs(f[1]) < 1e-9) || Math.hypot(u - x[0], v - x[1]) > 0.05) return x;
-  return validAt(P, m, fx, u, v, 1e-7) ? [u, v] : x;
+  if (!(Math.abs(f[0]) < 1e-6 && Math.abs(f[1]) < 1e-8) || Math.hypot(u - x0[0], v - x0[1]) > maxMove) return null;
+  return validAt(P, m, fx, u, v, 1e-7) ? [u, v] : null;
+}
+
+// 焦散段端点抛光: 端点 = 焦散 (Ĵ=0) 与当前最紧的有效约束的交点. 二分只能把点放在一条弦上,
+//   弦偏离零线, √ 区又把偏差放大 → 各层端点忽前忽后. 直接解交点; 不收敛就退回原点.
+function polishEnd(x, P, m, fx) {
+  const m0 = marginsAt(x[0], x[1], P, m, fx);
+  if (!m0.every(Number.isFinite)) return x;
+  let k = 0;
+  for (let i = 1; i < m0.length; i++) if (m0[i] < m0[k]) k = i;
+  if (m0[k] > 0.05) return x;                          // 离任何约束都远: 不是有效区边上的端点
+  return edgeNewton(x, k, P, m, fx) || x;
 }
 
 // 修正版 (显示): 网格追线在有效区边上有时走到头又原路折回 (同一段零线走两遍, 首尾相接成"闭环"), 两个真端点都丢了.
@@ -1153,3 +1180,93 @@ export function _debugCausticRuns(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg
     return { raw, ext, fin, info, m, fx, P };
   } finally { setSun(keep); }
 }
+
+
+/**
+ * 二自由度焦散面的外缘 (精确): 外缘点 = 焦散 (Ĵ=0) 与有效区边 (最紧的约束余量 = 0) 的交点. 它在 (h, 取向) 里是一条曲线,
+ * 像末端点轨迹一样沿 h 延拓 (每步以上一步为种子做 2×2 Newton, 失败处把 h 步长减半找到轨迹的尽头), 再按锥闭式两支映射成
+ * 三维折线 (中点 h 处重解, 加密、端点二分、折叠插点, 与边界线同一套). 种子来自每 2° 一层的修正版焦散段端点.
+ * HaloEP 末端点引擎能认出的 (焦散∩某边界) 与这里重合; 它认不出的 (出射临界旁 J 发散、链失效区旁收口) 这里也有.
+ * 返回 [{ p, d }].
+ */
+export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist, zetaFree, fixedZetaDeg, fixedThetaDeg, nGrid, cancelled = null) {
+  const { m, fx, P } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
+  const se = lampElev * Math.PI / 180;
+  const L = [lampDist * Math.cos(se), 0, lampDist * Math.sin(se)], E = [0, 0, eyeHeight];
+  const oldTH = LP.TH * 180 / Math.PI;
+  const tracks = [];
+  const TWO = 2 * Math.PI;
+  const wdist = (a, b) => Math.hypot(a[0] - b[0] - TWO * Math.round((a[0] - b[0]) / TWO), a[1] - b[1] - TWO * Math.round((a[1] - b[1]) / TWO));
+  const out = [];
+  try {
+    const corr = midCorrector(P, m, fx, true);
+    const solveAt = (h, x0, k, mv) => { setSun(h); return edgeNewton(x0, k, P, m, fx, mv); };
+    const onTrack = (h, x, k) => tracks.some(tk => tk.k === k && tk.hs.some((hh, i) => Math.abs(hh - h) < 1.01 && wdist(tk.xs[i], x) < 0.03));
+    // 从种子沿 h 走; 失败就把步长减半再试, 直到 1e-3° (轨迹尽头)
+    const extend = (tk, sgn) => {
+      let h = tk.hs[tk.hs.length - 1], x = tk.xs[tk.xs.length - 1], prev = tk.xs.length > 1 ? tk.xs[tk.xs.length - 2] : null, dh = 0.25;
+      for (let n = 0; n < 4000 && Math.abs(h) < 89.9; n++) {
+        if (cancelled && cancelled()) return;
+        const h2 = Math.max(-89.9, Math.min(89.9, h + sgn * dh));
+        const guess = prev ? [2 * x[0] - prev[0], 2 * x[1] - prev[1]] : x;
+        const x2 = solveAt(h2, guess, tk.k, 0.05) || solveAt(h2, x, tk.k, 0.05);
+        if (!x2 || wdist(x2, x) > 0.06) {
+          if (dh < 1e-3) return;
+          dh *= 0.5; prev = null; continue;
+        }
+        tk.hs.push(h2); tk.xs.push(x2); prev = x; x = x2; h = h2;
+        if (dh < 0.25) dh = Math.min(0.25, dh * 2);
+      }
+    };
+    for (let hs = -88; hs <= 88; hs += 2) {
+      if (cancelled && cancelled()) break;
+      setSun(hs);
+      const runs = trimRunsStrict(extendRunsJ(splitRetrace(sliceRuns2Dof(P, m, fx, Math.min(nGrid, 71))), P, m, fx), P, m, fx, corr);   // 种子只要大致位置, 粗网格即可
+      for (const run of runs) for (const x of [run[0], run[run.length - 1]]) {
+        setSun(hs);
+        const mg = marginsAt(x[0], x[1], P, m, fx);
+        if (!mg.every(Number.isFinite)) continue;
+        let k = 0;
+        for (let i = 1; i < mg.length; i++) if (mg[i] < mg[k]) k = i;
+        if (mg[k] > 1e-2) continue;                                     // 不在有效区边上 (段在别处结束)
+        const x0 = edgeNewton(x, k, P, m, fx);
+        if (!x0 || onTrack(hs, x0, k)) continue;
+        const tk = { k, hs: [hs], xs: [x0] };
+        extend(tk, 1);
+        tk.hs.reverse(); tk.xs.reverse();
+        extend(tk, -1);
+        tk.hs.reverse(); tk.xs.reverse();
+        if (tk.hs.length >= 3) tracks.push(tk);
+      }
+    }
+    if (causticRims2Dof.debug) causticRims2Dof.debug.push(...tracks.map(tk => ({ k: tk.k, h0: tk.hs[0], h1: tk.hs[tk.hs.length - 1], n: tk.hs.length, x0: tk.xs[0], x1: tk.xs[tk.xs.length - 1] })));
+    // 投影: 两支, 中点在中间 h 重解, 与边界线同一套加密
+    const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
+    for (const tk of tracks) {
+      const samples = tk.hs.map((h, i) => ({ h, x: tk.xs[i] }));
+      const mid = (a, b) => {
+        const h = 0.5 * (a.h + b.h);
+        const x = solveAt(h, [0.5 * (a.x[0] + b.x[0]), 0.5 * (a.x[1] + b.x[1])], tk.k, 0.05);
+        return x ? { h, x } : null;
+      };
+      const cache = new Map();
+      const sky = s0 => {
+        setSun(s0.h);
+        const ch = Chain3(s0.x[0], s0.x[1], m, fx, P);
+        const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
+        return Dn > 1e-12 ? [ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn] : null;
+      };
+      const branches = s0 => {
+        let v = cache.get(s0);
+        if (v === undefined) { const D = sky(s0); v = D ? coneBranchesFull(D, s0.h * Math.PI / 180, L, E, maxDist) : [null, null]; cache.set(s0, v); }
+        return v;
+      };
+      const foldAt = s0 => { const D = sky(s0); return D ? coneFold(D, s0.h * Math.PI / 180, L, E) : null; };
+      const smp = insertFolds(samples, foldAt, mid, 24);
+      for (let b = 0; b < 2; b++) out.push(...refineBranch(smp, s0 => branches(s0)[b], mid, Lden, 9, 24));
+    }
+  } finally { setSun(oldTH); }
+  return out;
+}
+
+export const _dbg = { edgeNewton, marginsAt, jHat };
