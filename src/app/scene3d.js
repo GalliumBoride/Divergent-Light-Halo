@@ -113,6 +113,8 @@ export class Scene3D {
         color: col3(col).getHex(), linewidth: width, worldUnits: false,
         dashed: !!o.dashed, dashSize: o.dashSize || 0.6, gapSize: o.gapSize || 0.45,
         transparent: (o.alpha ?? 1) < 1, opacity: o.alpha ?? 1,
+        // 镜像副本用 scale.y = −1, three 会把它的三角形当成反面; 粗线是屏幕空间四边形, 方向不随镜像翻转 → 必须双面, 否则另一半的线全被剔掉
+        side: THREE.DoubleSide,
       });
       if (o.vc) m.vertexColors = true;
       m.resolution.set(this.W || 1, this.H || 1);
@@ -233,21 +235,29 @@ export class Scene3D {
     return new THREE.Points(g, this._mat('P' + JSON.stringify([o.size, o.opacity, cl.cols ? 0 : cl.col]), () => new THREE.PointsMaterial(o)));
   }
 
-  // 晕面网格: 顶点色 × 烘焙的双面明暗 (MeshBasic, 不依赖灯光单位); 略往后推, 压在面上的线不被挡
+  // 晕面网格: 顶点色 × 烘焙的双面明暗 (MeshBasic, 不依赖灯光单位). 不透明 (半透明时重叠的两层按三角形次序混合, 一片斑驳);
+  // 明暗用引擎给的每顶点平滑法向; 光源都在 xz 平面 (另加 |n_y| 项), 镜像副本与原件明暗完全一样, 两者重合处看不出打架.
+  // 网格略往后推 (polygonOffset), 压在面上的边界 / 焦散线不被挡.
   _mesh(m) {
     const P = m.pos, nV = P.length / 3;
     if (!nV) return null;
+    const N = m.nrm || null;
     const col = new Float32Array(3 * nV), base = m.col || [70, 130, 180];
-    const l1 = [-0.35, -0.55, 0.76], l2 = [0.6, 0.3, 0.3];
+    const l1 = [-0.45, 0, 0.89], l2 = [0.8, 0, 0.6];
+    const shade = (nx, ny, nz) => 0.42 + 0.33 * Math.abs(nx * l1[0] + nz * l1[2]) + 0.13 * Math.abs(nx * l2[0] + nz * l2[2]) + 0.12 * Math.abs(ny);
     for (let t = 0; t < nV / 3; t++) {
       const o = 9 * t;
-      const ux = P[o + 3] - P[o], uy = P[o + 4] - P[o + 1], uz = P[o + 5] - P[o + 2];
-      const vx = P[o + 6] - P[o], vy = P[o + 7] - P[o + 1], vz = P[o + 8] - P[o + 2];
-      let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-      const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
-      const sh = 0.5 + 0.38 * Math.abs(nx * l1[0] + ny * l1[1] + nz * l1[2]) + 0.12 * Math.abs(nx * l2[0] + ny * l2[1] + nz * l2[2]);
+      let fs = 0;
+      if (!N) {
+        const ux = P[o + 3] - P[o], uy = P[o + 4] - P[o + 1], uz = P[o + 5] - P[o + 2];
+        const vx = P[o + 6] - P[o], vy = P[o + 7] - P[o + 1], vz = P[o + 8] - P[o + 2];
+        let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+        const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+        fs = shade(nx, ny, nz);
+      }
       for (let k = 0; k < 3; k++) {
         const v = 3 * t + k;
+        const sh = N ? shade(N[3 * v], N[3 * v + 1], N[3 * v + 2]) : fs;
         const r = m.cols ? m.cols[3 * v] : base[0], g = m.cols ? m.cols[3 * v + 1] : base[1], b = m.cols ? m.cols[3 * v + 2] : base[2];
         col[3 * v] = SRGB2LIN[r] * sh; col[3 * v + 1] = SRGB2LIN[g] * sh; col[3 * v + 2] = SRGB2LIN[b] * sh;
       }
@@ -255,7 +265,7 @@ export class Scene3D {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(P, 3));
     g.setAttribute('color', new THREE.BufferAttribute(col, 3));
-    return new THREE.Mesh(g, this._mat('mesh', () => new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.9,
+    return new THREE.Mesh(g, this._mat('mesh', () => new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide,
       polygonOffset: true, polygonOffsetFactor: 1.5, polygonOffsetUnits: 2 })));
   }
 

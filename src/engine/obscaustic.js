@@ -445,7 +445,7 @@ export function densify(curve, f, maxStep) {
   return outp;
 }
 
-function projectTransverse(p, nu, f, delta) {
+export function projectTransverse(p, nu, f, delta) {
   const o = { ok: false };
   const f0 = f(p, o);
   if (!o.ok || isNaN_(f0)) return p;

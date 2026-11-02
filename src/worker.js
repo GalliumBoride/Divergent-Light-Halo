@@ -16,7 +16,7 @@ import { lightConeBoundaries } from './engine/bdry4.js';
 import { surfaceMesh1 } from './engine/mesh1.js';
 import { lightCone2DofLayers, parallelArc2Dof, edges2Dof, resolveSurface } from './engine/epdiv.js';
 import * as OC from './engine/obscaustic.js';
-import { fold2DofFine } from './engine/obsfine.js';
+import { fold2DofFine, fold1DofFine, seam1DofFine } from './engine/obsfine.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
 
 function transferOf(obj, list = []) {
@@ -90,9 +90,9 @@ const RUN = {
     if (chiDegenerate(c)) return obsPack([], [], null, a.lang === 'en'
       ? 'χ ≡ 0 for this path and orientation (the sky map commutes with the sweep): degenerate, no fold caustic.'
       : '这条光路在此取向下 χ ≡ 0 (天球映射与扫描转轴对易): 退化, 没有折叠焦散.');
-    const fold = OC.fold1Dof(c, 0.008);
+    const fold = fold1DofFine(c, 0.008);                  // 段端二分到精确终点 (两支在汇合处接上), 见 engine/obsfine.js
     let seams = null;
-    if (a.seams) { seams = []; for (const w of OC.seamNames(c)) seams.push(...OC.seam1Dof(c, w, 0.008)); }
+    if (a.seams) { seams = []; for (const w of OC.seamNames(c)) seams.push(...seam1DofFine(c, w, 0.008)); }
     const asym = a.asym ? OC.retroCircles(c, Math.max(50.0, a.maxD * 2.5)) : null;
     shift(fold, a.eye);
     if (seams) shift(seams, a.eye);

@@ -406,7 +406,7 @@ function buildDL() {
   if (R) R.paths.forEach((P, ip) => {
     const pcol = lay.colorBy === 'path' ? PATHCOL[ip % PATHCOL.length] : C.pts;
     if (lay.surf && P.mesh && P.mesh.pos.length)
-      dl.meshes.push({ pos: P.mesh.pos, dir: P.mesh.dir, cols: meshColors(P, lay.colorBy, rng), col: pcol });
+      dl.meshes.push({ pos: P.mesh.pos, dir: P.mesh.dir, nrm: P.mesh.nrm, cols: meshColors(P, lay.colorBy, rng), col: pcol });
     if (lay.surf && P.dof === 2) {
       // 二自由度: 每个 h 层是一条 (或几条) 平行光曲线经锥映射 → 按层着色的线 (数据与配色不变就复用同一组对象)
       const lk = [lay.colorBy, rng ? rng.join(',') : '', P.lver || 0, pcol].join('|');

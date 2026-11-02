@@ -241,7 +241,7 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
   //   参数化在两处奇异: 灯处捏合 (t→0) 附近与近水平入射 (晕面伸向远处) — 那里 (h, α) 走一小步, 晶体位置能跳几十米.
   //   张量积网格照顾不到这种细条, 于是对每个裁剪后的多边形检查: 边长 > Lbig 或天空张角 > Abig 就四分 (最多 6 层),
   //   直到都够小. 递归到底仍奇大的才当作真正的不连续丢掉 (旧版是一律丢, 留下破洞).
-  const pos = [], dirv = [], hv = [];
+  const pos = [], dirv = [], hv = [], tb = [];      // tb: 每个三角形属于哪一支
   const tmp = new Float64Array(REC);
   let nDrop = 0, nSub = 0, evalLeft = 1500000;
   const Lbig = 8 * L3 * relax, cosAbig = Math.cos(Math.min(Math.PI / 3, 8 * Aang * relax));
@@ -298,6 +298,7 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
       const A = pts[0], B = pts[k], C = pts[k + 1];
       if (d2(A, B) > lim2 || d2(B, C) > lim2 || d2(A, C) > lim2) { nDrop++; continue; }
       pos.push(A[0], A[1], A[2], B[0], B[1], B[2], C[0], C[1], C[2]);
+      tb.push(b);
       dirv.push(A[3], A[4], A[5], B[3], B[4], B[5], C[3], C[4], C[5]);
       hv.push(A[6], B[6], C[6]);
     }
@@ -327,9 +328,36 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
     }
   });
   return {
-    pos: Float32Array.from(pos), dir: Float32Array.from(dirv), h: Float32Array.from(hv),
+    pos: Float32Array.from(pos), dir: Float32Array.from(dirv), h: Float32Array.from(hv), nrm: vertexNormals(pos, tb),
     nTri: hv.length / 3, ms: Date.now() - t0, nh: NH, na: as.reduce((s, a) => s + a.length, 0), nDrop, nSub,
   };
+}
+
+// 每顶点法向 (3D 视图平滑明暗用): 同一支里位置相同 (1 µm 网格) 的顶点焊在一起, 累加面积加权的面法向.
+//   同一支的三角形在参数平面里都是逆时针 (格子两三角形、裁剪扇形、四分子三角形都保持方向), 映到三维后朝向一致,
+//   所以法向可以带符号累加; 两支分开焊 (在转折处它们朝向相反, 混在一起会抵消).
+function vertexNormals(pos, tb) {
+  const nT = tb.length, out = new Float32Array(9 * nT);
+  const ids = new Map(), acc = [], vid = new Int32Array(3 * nT);
+  const q = v => Math.round(v * 1e6);
+  for (let t = 0; t < nT; t++) {
+    const o = 9 * t;
+    const ux = pos[o + 3] - pos[o], uy = pos[o + 4] - pos[o + 1], uz = pos[o + 5] - pos[o + 2];
+    const vx = pos[o + 6] - pos[o], vy = pos[o + 7] - pos[o + 1], vz = pos[o + 8] - pos[o + 2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    for (let k = 0; k < 3; k++) {
+      const key = tb[t] + ',' + q(pos[o + 3 * k]) + ',' + q(pos[o + 3 * k + 1]) + ',' + q(pos[o + 3 * k + 2]);
+      let id = ids.get(key);
+      if (id === undefined) { id = acc.length / 3; ids.set(key, id); acc.push(0, 0, 0); }
+      acc[3 * id] += nx; acc[3 * id + 1] += ny; acc[3 * id + 2] += nz;
+      vid[3 * t + k] = id;
+    }
+  }
+  for (let v = 0; v < vid.length; v++) {
+    const i = 3 * vid[v], x = acc[i], y = acc[i + 1], z = acc[i + 2], l = Math.hypot(x, y, z) || 1;
+    out[3 * v] = x / l; out[3 * v + 1] = y / l; out[3 * v + 2] = z / l;
+  }
+  return out;
 }
 
 function linspace(a, b, n) {
