@@ -162,6 +162,38 @@ function projectTracks(tracks, m, fixedAng, path, L, E, maxDist) {
 
 // ------------------------------------------------------------------ 修正版 (显示用): 加密 + 端点二分 + 精确视方向
 // 锥闭式, 每支给 { P, s: 观测者视方向 (= Rz(ψ)·D̂, 精确), u: 从灯出发的方向 }; 锥影时 null
+// 锥闭式的折叠量 |C/R| − 1: > 0 时两支都不存在, = 0 处两支重合 (锥面上的折叠)
+function coneFold(Dsky, hRad, L, E) {
+  const DDv = sub(L, E), d = scl(Dsky, -1.0), i0 = [-Math.cos(hRad), 0.0, -Math.sin(hRad)], vv = cross(i0, d);
+  const A_ = DDv[1] * vv[0] - DDv[0] * vv[1], B_ = DDv[0] * vv[0] + DDv[1] * vv[1], C_ = -DDv[2] * vv[2];
+  const Rm = Math.sqrt(A_ * A_ + B_ * B_);
+  return Rm < 1e-300 ? (Math.abs(C_) > 0 ? 1 : -1) : Math.abs(C_) / Rm - 1;
+}
+// 样本序列里, 相邻两点一个在折叠外 (两支都没有) 一个在内: 二分到折叠处插入一个点 (两支在此重合).
+//   折叠附近一支的位置随参数呈 √ 变化, 可以在一个样本间隔里从折叠点一路走回灯 —— 那一支在两个样本上都无效,
+//   不插这个点就整段漏掉 (层曲线在折叠处断开, 晕面边缘看起来接不上).
+function insertFolds(samples, foldAt, mid, iters = 40) {
+  const out = [];
+  let pf = null;
+  for (let i = 0; i < samples.length; i++) {
+    const x = samples[i], f = foldAt(x);
+    if (i > 0 && pf !== null && f !== null && (pf > 0) !== (f > 0)) {
+      let lo = f > 0 ? samples[i - 1] : x, hi = f > 0 ? x : samples[i - 1];      // lo: 折叠内 (有解), hi: 折叠外
+      for (let it = 0; it < iters; it++) {
+        const m = mid(lo, hi);
+        if (m === null) break;
+        const fm = foldAt(m);
+        if (fm === null) break;
+        if (fm > 0) hi = m; else lo = m;
+      }
+      if (lo !== samples[i - 1] && lo !== x) out.push(lo);
+    }
+    out.push(x);
+    pf = f;
+  }
+  return out;
+}
+
 function coneBranchesFull(Dsky, hRad, L, E, maxDist) {
   const DDv = sub(L, E);
   const d = scl(Dsky, -1.0);
@@ -195,7 +227,7 @@ function tooFar(a, b, Lden) {
 // 一条参数化曲线 (参数 x: 标量或数组, 任意) 的一支 → 加密好的折线们. 通用于 h-层曲线与 h-延拓轨迹.
 //   samples: 参数序列; mapAt(x) → 该支状态或 null; mid(xa, xb) → 中间参数 (可含校正) 或 null.
 //   有效 ↔ 无效 的转折处二分 (iters 次) 找精确端点. 返回 [{ p, d }].
-function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 16) {
+function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40) {
   const out = [];
   let P = [], D = [];
   const push = st => { P.push(st.P[0], st.P[1], st.P[2]); D.push(st.s[0], st.s[1], st.s[2]); };
@@ -250,6 +282,7 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
   setSun(10);
   const refScene = new Scene(pc, FamC.make(m, fixedAng), pctx);
   const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
+  const hSing = Math.atan2(L[2] - E[2], Math.hypot(L[0] - E[0], L[1] - E[1])) * 180 / Math.PI;
   for (const tk of tracks) {
     tk.pts3 = [];
     // 参数 = { h, sol }; 解失败 → null
@@ -262,7 +295,22 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
       }
       return skyOfW(lightScene(refScene, FamC.make(m, fixedAng)), sol, tk.eps);
     };
-    const samples = tk.hs.map((h, i) => ({ h, sol: tk.sols[i] }));
+    // 灯仰角 (从眼看) 附近锥映射的有效性变得极快 (晶体贴到灯或眼上), 有效窗口可能比 0.5° 的 h 步还窄, 两端都无效就整段漏掉:
+    // 距它 1° 以内的 h 间隔再插 8 个样本 (以邻点为种子重解)
+    const samples = [];
+    for (let i = 0; i < tk.hs.length; i++) {
+      samples.push({ h: tk.hs[i], sol: tk.sols[i] });
+      if (i + 1 < tk.hs.length && tk.slv) {
+        const ha = tk.hs[i], hb = tk.hs[i + 1];
+        if (Math.min(Math.abs(ha - hSing), Math.abs(hb - hSing)) < 1.0 || (ha - hSing) * (hb - hSing) < 0) {
+          let seed = tk.sols[i];
+          for (let k = 1; k < 8; k++) {
+            const hk = ha + (hb - ha) * k / 8, sk = tk.slv(hk, seed);
+            if (sk) { samples.push({ h: hk, sol: sk }); seed = sk; }
+          }
+        }
+      }
+    }
     const mid = (a, b) => {
       const h = 0.5 * (a.h + b.h);
       const sol = tk.slv ? tk.slv(h, a.sol) : null;
@@ -278,7 +326,10 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
       }
       return v;
     };
-    for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(samples, x => branches(x)[b], mid, Lden));
+    const foldAt = x => { const D = skyAt(x.h, x.sol); return D ? coneFold(D, x.h * Math.PI / 180, L, E) : null; };
+    // 轨迹上每个中点都要重解一次末端点 (Newton), 二分 24 次已是 0.5° 步长的 2⁻²⁴
+    const smp = insertFolds(samples, foldAt, mid, 24);
+    for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], mid, Lden, 9, 24));
   }
 }
 
@@ -455,7 +506,10 @@ export function resolveSurface(path, id) {
 
 // 每 h 层的篱笆曲面等参线 (闭式取样 → 有效段 → (sc,sw) 运行); 用当前 LP 太阳. 参考场景按 key 缓存.
 let _frKey = null, _frScene = null;
-export function fenceRuns(path, m, fixedAng, surfId) {
+// fine = true (显示用): 段端不停在最后一个有效样本上, 而在样本间沿篱笆二分到精确终点 —
+//   终点要么是与别的篱笆相交 (落在 h-延拓的边界线上), 要么是可达带边缘 (ε=±1 两段在此汇合, 两段端点重合);
+//   该处取向随参数呈 √ 变化, 停在样本上会差出零点几米到两米. 另把周期坐标展开成连续的, 加密时中点不会跨接缝.
+export function fenceRuns(path, m, fixedAng, surfId, fine = false) {
   const runs = [];
   const key = path.join('-') + '|' + m + '|' + fixedAng.toFixed(6) + '|' + LP.partial + '|' + LP.upperApexDeg + '|' + LP.lowerApexDeg;
   if (_frKey !== key || _frScene === null) {
@@ -471,6 +525,7 @@ export function fenceRuns(path, m, fixedAng, surfId) {
   const sc = lightScene(_frScene, fam);
   const fen = fenceById(sc.P, surfId);
   if (fen === null) return runs;
+  if (fine) return fenceRunsFine(fam, sc, fen, runs);
   for (const comp of fenceSamples(sc, fen, 700)) {
     for (let e = 0; e < 2; e++) {
       const eps = e === 0 ? 1 : -1;
@@ -492,6 +547,46 @@ export function fenceRuns(path, m, fixedAng, surfId) {
         cur.push([scv, swv]);
       }
       if (cur !== null && cur.length >= 2) runs.push(cur);
+    }
+  }
+  return runs;
+}
+
+function fenceRunsFine(fam, sc, fen, runs) {
+  const uvAt = (w, eps) => {
+    if (!(fam.gram(w) >= -1e-9 && sc.minMargin(w) >= -1e-7)) return null;
+    const E = fam.lift(w, eps);
+    return E === null ? null : fam.uvOf(E[0], E[1], E[2]);
+  };
+  // a 有效, b 无效: 沿弦 (再归一化到单位球, 偏离篱笆是二阶小量) 二分 40 次 → 最后一个有效点
+  const edge = (wa, wb, eps) => {
+    let lo = wa, hi = wb, uv = uvAt(wa, eps);
+    for (let it = 0; it < 40; it++) {
+      const mm = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])], n = nrm(mm);
+      const wm = n > 1e-15 ? scl(mm, 1 / n) : mm;
+      const u = uvAt(wm, eps);
+      if (u) { lo = wm; uv = u; } else hi = wm;
+    }
+    return uv;
+  };
+  const TWO = 2 * Math.PI;
+  const unwrap = run => {
+    for (let i = 1; i < run.length; i++)
+      for (let k = 0; k < 2; k++) run[i][k] -= TWO * Math.round((run[i][k] - run[i - 1][k]) / TWO);
+    return run;
+  };
+  for (const comp of fenceSamples(sc, fen, 700)) {
+    for (let e = 0; e < 2; e++) {
+      const eps = e === 0 ? 1 : -1;
+      let cur = null, pw = null, puv = null;
+      for (const w of comp) {
+        const uv = uvAt(w, eps);
+        if (uv && !puv && pw) cur = [edge(w, pw, eps)];
+        if (!uv && puv) { cur.push(edge(pw, w, eps)); if (cur.length >= 2) runs.push(unwrap(cur)); cur = null; }
+        if (uv) { if (!cur) cur = []; cur.push(uv); }
+        pw = w; puv = uv;
+      }
+      if (cur && cur.length >= 2) runs.push(unwrap(cur));
     }
   }
   return runs;
@@ -687,7 +782,9 @@ function coneMapRuns(runs, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, 
 
 
 // 修正版: 取向平面曲线 → 两支各自加密 (中点校正回 J=0), 有效↔无效转折处二分; 每条带精确视方向 { p, d }
-function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves) {
+// checkValid = false: 段已按篱笆自己的有效性 (可达带 + 其余约束, w 空间) 精确裁好; 再用取向空间的宽容差判一次会在
+//   段内别处切断 (出射临界篱笆本身就压在出射约束的边上), 段端偏离真正的边界
+function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, checkValid = true) {
   const hRad = hDeg * Math.PI / 180;
   const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
   for (const run of runs) {
@@ -696,7 +793,7 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves) {
       let v = cache.get(x);
       if (v === undefined) {
         v = [null, null];
-        if (validAt(P, m, fx, x[0], x[1], 1e-4)) {
+        if (!checkValid || validAt(P, m, fx, x[0], x[1], 1e-4)) {
           const ch = Chain3(x[0], x[1], m, fx, P);
           const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
           if (Dn > 1e-12) v = coneBranchesFull([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E, maxDist);
@@ -706,8 +803,108 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves) {
       return v;
     };
     const mid = (a, b) => corr(a, b);
-    for (let b = 0; b < 2; b++) outCurves.push(...refineBranch(run, x => branches(x)[b], mid, Lden));
+    const foldAt = x => {
+      if (checkValid && !validAt(P, m, fx, x[0], x[1], 1e-4)) return null;
+      const ch = Chain3(x[0], x[1], m, fx, P);
+      const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
+      return Dn > 1e-12 ? coneFold([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E) : null;
+    };
+    const smp = insertFolds(run, foldAt, mid);
+    for (let b = 0; b < 2; b++) outCurves.push(...refineBranch(smp, x => branches(x)[b], mid, Lden));
   }
+}
+
+// 修正版 (显示): 焦散段断头延拓. 网格追零线 (marching squares) 进不了有 NaN 角的格子 (链在那边失效),
+//   零线在有效区的边上还差最多一格就停了 —— 三维里能差出几米, 层曲线够不着边界线.
+//   从段端沿零线切向走小步 (预测) + 沿 ∇J 的 Newton 拉回 J=0 (校正), 直到链失效, 再交给 trimRunsStrict 二分到精确端点.
+function extendRunsJ(runs, P, m, fx, step = 0.004, maxSteps = 120) {
+  const J = (u, v) => jana3(u, v, m, fx, P);
+  const ok = x => validAt(P, m, fx, x[0], x[1], 1e-4);
+  const corr = x => {
+    let u = x[0], v = x[1];
+    for (let it = 0; it < 8; it++) {
+      const J0 = J(u, v);
+      if (!Number.isFinite(J0)) return null;
+      const e = 1e-6;
+      const gx = (J(u + e, v) - J(u - e, v)) / (2 * e), gy = (J(u, v + e) - J(u, v - e)) / (2 * e);
+      const g2 = gx * gx + gy * gy;
+      if (!(g2 > 0) || !Number.isFinite(g2)) return null;
+      const du = -J0 * gx / g2, dv = -J0 * gy / g2;
+      if (Math.hypot(du, dv) > 3 * step) return null;
+      u += du; v += dv;
+      if (Math.hypot(du, dv) < 1e-12) break;
+    }
+    return Math.abs(J(u, v)) < 1e-8 ? [u, v] : null;
+  };
+  // 所有段的点放进 (周期折回的) 网格哈希: 延拓碰到已有的段 (接缝处被切开的同一条零线, 或闭合回自己) 就停
+  const TWO = 2 * Math.PI, cell = 2 * step, wrap = a => a - TWO * Math.floor(a / TWO);
+  const hk = (u, v) => Math.floor(wrap(u) / cell) + ',' + Math.floor(wrap(v) / cell);
+  const grid = new Map();
+  runs.forEach((run, ri) => run.forEach((x, i) => {
+    const k = hk(x[0], x[1]);
+    let a = grid.get(k); if (!a) grid.set(k, a = []);
+    a.push(ri, i);
+  }));
+  const hits = (q, ri, iEnd, n) => {
+    const cu = Math.floor(wrap(q[0]) / cell), cv = Math.floor(wrap(q[1]) / cell), nc = Math.ceil(TWO / cell);
+    for (let du = -1; du <= 1; du++) for (let dv = -1; dv <= 1; dv++) {
+      const a = grid.get(((cu + du + nc) % nc) + ',' + ((cv + dv + nc) % nc));
+      if (!a) continue;
+      for (let j = 0; j < a.length; j += 2) {
+        if (a[j] === ri && Math.abs(a[j + 1] - iEnd) < Math.min(12, n - 1)) continue;   // 自己端点附近的点不算
+        const x = runs[a[j]][a[j + 1]];
+        const du2 = Math.abs(wrap(x[0] - q[0] + Math.PI) - Math.PI), dv2 = Math.abs(wrap(x[1] - q[1] + Math.PI) - Math.PI);
+        if (Math.hypot(du2, dv2) < 1.5 * step) return true;
+      }
+    }
+    return false;
+  };
+  const grow = (run, ri, atEnd) => {
+    const n = run.length, iEnd = atEnd ? n - 1 : 0;
+    let a = run[iEnd], b = atEnd ? run[n - 2] : run[1];
+    if (!validAt(P, m, fx, a[0], a[1], 1e-9)) return [];         // 段端本就落在有效性边上 (已二分过), 不是断头
+    const added = [];
+    for (let k = 0; k < maxSteps; k++) {
+      let dx = a[0] - b[0], dy = a[1] - b[1];
+      const dl = Math.hypot(dx, dy);
+      if (!(dl > 0)) break;
+      dx /= dl; dy /= dl;
+      const q = corr([a[0] + step * dx, a[1] + step * dy]);
+      if (!q || !ok(q)) { if (q) added.push(q); break; }       // 失效点留着, 让 trimRunsStrict 在它与上一个有效点间二分
+      if (hits(q, ri, iEnd, n)) break;
+      added.push(q); b = a; a = q;
+    }
+    return added;
+  };
+  return runs.map((run, ri) => {
+    if (run.length < 2) return run;
+    const tail = grow(run, ri, true), head = grow(run, ri, false);
+    return head.reverse().concat(run, tail);
+  });
+}
+
+// 修正版 (显示) 的焦散段端: 原版用宽容差 (1e-4) 判有效, 防止数值噪声把段打断, 但段端因此冲出真正边界
+//   (边界附近位置随参数呈 √ 变化, 1e-4 的余量对应约 1% 的距离, 20 m 处 0.2 m, 层曲线就越过边界线).
+//   这里只修段端: 两端严格无效的点剪掉, 再在最后一个严格有效点与它之间二分 (中点用 corr 拉回曲线) 到精确边界.
+function trimRunsStrict(runs, P, m, fx, corr) {
+  const ok = x => validAt(P, m, fx, x[0], x[1], 1e-9);
+  const edge = (a, b) => {            // a 有效, b 无效
+    let lo = a, hi = b;
+    for (let it = 0; it < 40; it++) { const mm = corr(lo, hi); if (ok(mm)) lo = mm; else hi = mm; }
+    return lo;
+  };
+  const out = [];
+  for (const run of runs) {
+    let i0 = 0, i1 = run.length - 1;
+    while (i0 <= i1 && !ok(run[i0])) i0++;
+    while (i1 >= i0 && !ok(run[i1])) i1--;
+    if (i1 < i0) continue;
+    const r = run.slice(i0, i1 + 1);
+    if (i0 > 0) r.unshift(edge(run[i0], run[i0 - 1]));
+    if (i1 < run.length - 1) r.push(edge(run[i1], run[i1 + 1]));
+    if (r.length >= 2) out.push(r);
+  }
+  return out;
 }
 
 // 中点校正: 焦散 = 沿 ∇J 的 Newton 回到 J=0 (步长受限, 跑远了就用线性中点); 篱笆曲线 = 线性中点 (取样本身很密)
@@ -766,8 +963,9 @@ export function lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, 
       const verts = [], curves = [];
       coneMapRuns(caus, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, curves);
       if (fine) {                                   // 修正版曲线 (显示); 采样点仍是原窗体的
-        const fc = [];
-        coneMapRunsFine(caus, hDeg, m, fx, P, L, [0, 0, eyeHeight], maxDist, midCorrector(P, m, fx, surfId === 'caustic'), fc);
+        const fc = [], corr = midCorrector(P, m, fx, surfId === 'caustic');
+        const fr = surfId === 'caustic' ? trimRunsStrict(extendRunsJ(caus, P, m, fx), P, m, fx, corr) : fenceRuns(lpFaces, m, fx, surfId, true);
+        coneMapRunsFine(fr, hDeg, m, fx, P, L, [0, 0, eyeHeight], maxDist, corr, fc, surfId === 'caustic');
         layers.push({ curves: fc, verts: Float32Array.from(verts) });
       } else layers.push({ curves, verts: Float32Array.from(verts) });
     }
@@ -782,9 +980,10 @@ export function parallelArc2Dof(lpFaces, lampElev, eyeHeight, nGrid, zetaFree, f
   const pArc = [];
   try {
     setSun(lampElev);
-    const runs = surfId === 'caustic' ? sliceRuns2Dof(P, m, fx, nGrid) : fenceRuns(lpFaces, m, fx, surfId);
+    let runs = surfId === 'caustic' ? sliceRuns2Dof(P, m, fx, nGrid) : fenceRuns(lpFaces, m, fx, surfId, fine);
     if (fine) {
       const corr = midCorrector(P, m, fx, surfId === 'caustic');
+      if (surfId === 'caustic') runs = trimRunsStrict(extendRunsJ(runs, P, m, fx), P, m, fx, corr);
       for (const run of runs) {
         const mapAt = x => {
           if (!validAt(P, m, fx, x[0], x[1], 1e-4)) return null;
@@ -845,4 +1044,4 @@ function samePiece(a, b) {
   return true;
 }
 
-export { allFams, famEval3 };
+export { allFams, famEval3, coneBranchesFull as _coneBranchesFull };
