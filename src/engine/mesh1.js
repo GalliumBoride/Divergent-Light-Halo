@@ -153,9 +153,22 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
     }
   }
   const empty = { pos: new Float32Array(0), dir: new Float32Array(0), h: new Float32Array(0), nTri: 0, ms: Date.now() - t0, nh: 0, na: 0 };
-  const hInt = intervals(hOcc, 3, false), aInt = intervals(aOcc, 3, true);
-  if (!hInt.length || !aInt.length) return empty;
+  const hInt = intervals(hOcc, 3, false);
+  if (!hInt.length) return empty;
   const h0 = Math.max(-89.99, -90 + 180 * hInt[0][0] / HC), h1 = Math.min(89.99, -90 + 180 * (hInt[hInt.length - 1][1] + 1) / HC);
+  // α 占用在 [h0, h1] 内再用细 h 扫一遍: 板晶这类整张面只占零点几度 h 的情形, 粗网格 0.25° 的 h 行只碰到一两行,
+  // 其它 h 上 α 更宽的部分会漏掉, 网格在 α 上被截出一条直边 (那一片晕面就没了)
+  const HF = 96;
+  for (let ia = 0; ia < AC; ia++) {
+    if (aOcc[ia]) continue;
+    setAlpha(cx, 2 * Math.PI * ia / AC);
+    for (let k = 0; k < HF; k++) {
+      evalNode(cx, (h0 + (h1 - h0) * (k + 0.5) / HF) * DEG, rec);
+      if (rec[0] > 0 || rec[1] > 0) { aOcc[ia] = 1; break; }
+    }
+  }
+  const aInt = intervals(aOcc, 3, true);
+  if (!aInt.length) return empty;
   const aSpans = aInt.map(([i0, i1]) => [360 * i0 / AC, 360 * Math.min(i1 + 1, i0 + AC) / AC]);
   const aTot = aSpans.reduce((s, [a, b]) => s + (b - a), 0);
 
@@ -237,20 +250,23 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
     if (scale > 1) break;
   }
 
-  // ---- 3) 三角化 + 裁剪; 太大的三角形在参数空间里递归四分
+  // ---- 3) 三角化 + 裁剪; 太长的边在参数空间里对分 (协调细分, 不留 T 形接头)
   //   参数化在两处奇异: 灯处捏合 (t→0) 附近与近水平入射 (晕面伸向远处) — 那里 (h, α) 走一小步, 晶体位置能跳几十米.
-  //   张量积网格照顾不到这种细条, 于是对每个裁剪后的多边形检查: 边长 > Lbig 或天空张角 > Abig 就四分 (最多 6 层),
-  //   直到都够小. 递归到底仍奇大的才当作真正的不连续丢掉 (旧版是一律丢, 留下破洞).
-  const pos = [], dirv = [], hv = [], tb = [];      // tb: 每个三角形属于哪一支
+  //   张量积网格照顾不到这种细条, 于是按【边】决定要不要对分: 一条边 (两端都有点: 两端距离; 一端有点: 有点端到精确
+  //   边界交点的距离) 三维长度 > Lbig 或天空张角 > Abig 就在参数中点切开. 判定只看这条边本身并记在表里,
+  //   共用这条边的两个三角形拿到同一个结论、同一个中点 → 网格严丝合缝 (按三角形四分会在相邻三角形之间留下
+  //   T 形接头, 中点在真曲面上而邻居的边是直的, 不透明渲染时露出白色细缝). 每条边带"代数", 切出来的边代数 +1,
+  //   最多 7 代. 切到底仍奇大的三角形才当作真正的不连续丢掉.
+  const pos = [], dirv = [], hv = [], vids = [];    // vids: 每个顶点的身份 (2·点号 + 支), 焊接法向用
   const tmp = new Float64Array(REC);
-  let nDrop = 0, nSub = 0, evalLeft = 1500000;
+  let nDrop = 0, nSub = 0, evalLeft = 1500000, nid = 0;
+  const MAXGEN = 7;
   const Lbig = 8 * L3 * relax, cosAbig = Math.cos(Math.min(Math.PI / 3, 8 * Aang * relax));
   const lim2 = (0.5 * cx.maxDist) ** 2;
-  // 通用顶点 { h, a, r: 节点记录 }
-  const node = (h, a) => { setAlpha(cx, a); const r = new Float64Array(REC); evalNode(cx, h, r); evalLeft--; return { h, a, r }; };
-  const vert = (v, b) => { const r = v.r, o = 2 + 3 * b, q = 8 + 3 * b; return [r[o], r[o + 1], r[o + 2], r[q], r[q + 1], r[q + 2], v.h / DEG]; };
-  // 二分: 从有点端 A (M>0) 到无点端 B, 返回边上最后一个有点的参数处的 [P(3), dir(3), h°]
-  //   规范方向 (总是从有点端出发): 相邻三角形算出同一点, 网格不开缝
+  // 通用顶点 { id, h, a, r: 节点记录, sub: 是否细分新点 }
+  const node = (h, a) => { setAlpha(cx, a); const r = new Float64Array(REC); evalNode(cx, h, r); evalLeft--; return { id: nid++, h, a, r, sub: true }; };
+  const vert = (v, b) => { const r = v.r, o = 2 + 3 * b, q = 8 + 3 * b; const x = [r[o], r[o + 1], r[o + 2], r[q], r[q + 1], r[q + 2], v.h / DEG, v.sub ? 2 : 0]; x.id = v.id; return x; };
+  // 二分: 从有点端 A (M>0) 到无点端 B, 返回边上最后一个有点的参数处的 [P(3), dir(3), h°, 1]
   const crossing = (b, A, B) => {
     let lo = 0, hi = 1;
     for (let it = 0; it < 34; it++) {
@@ -264,53 +280,108 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
     const hh = A.h + (B.h - A.h) * lo;
     evalNode(cx, hh, tmp);
     const o = 2 + 3 * b, q = 8 + 3 * b;
-    return [tmp[o], tmp[o + 1], tmp[o + 2], tmp[q], tmp[q + 1], tmp[q + 2], hh / DEG];
+    return [tmp[o], tmp[o + 1], tmp[o + 2], tmp[q], tmp[q + 1], tmp[q + 2], hh / DEG, 1];
   };
-  // 三角形按 M_b > 0 裁剪 (Sutherland–Hodgman), 跨零边二分 → 多边形顶点
-  const clipPoly = (T, b) => {
+  // 边表: 挂在 id 较小的端点上 (每支一串, 每个点只有几条边, 线性查找最快);
+  //   值 = { gen, split, mid, x (边界交点, 有点端→无点端) }
+  const edgeOf = (u, v, b, gen = 0) => {
+    let lo = u, hi = v;
+    if (v.id < u.id) { lo = v; hi = u; }
+    const key = b ? 'e1' : 'e0';
+    let list = lo[key];
+    if (!list) list = lo[key] = [];
+    for (let i = 0; i < list.length; i += 2) if (list[i] === hi.id) return list[i + 1];
+    const e = { gen, split: undefined, mid: null, x: null };
+    list.push(hi.id, e);
+    return e;
+  };
+  const crossOf = (e, u, v, b) => {
+    if (!e.x) { e.x = u.r[b] > 0 ? crossing(b, u, v) : crossing(b, v, u); e.x.id = nid++; }
+    return e.x;
+  };
+  const Lbig2 = Lbig * Lbig;
+  // 记录 R (偏移 o 位置, q 方向) 与点 X ([P, dir]) / 记录 S 之间是否"太远"
+  const farRX = (R, o, q, X) => (R[o] - X[0]) ** 2 + (R[o + 1] - X[1]) ** 2 + (R[o + 2] - X[2]) ** 2 > Lbig2
+    || R[q] * X[3] + R[q + 1] * X[4] + R[q + 2] * X[5] < cosAbig;
+  const farRR = (R, S, o, q) => (R[o] - S[o]) ** 2 + (R[o + 1] - S[o + 1]) ** 2 + (R[o + 2] - S[o + 2]) ** 2 > Lbig2
+    || R[q] * S[q] + R[q + 1] * S[q + 1] + R[q + 2] * S[q + 2] < cosAbig;
+  const wantSplit = (e, u, v, b) => {
+    if (e.split === undefined) {
+      const iu = u.r[b] > 0, iv = v.r[b] > 0, o = 2 + 3 * b, q = 8 + 3 * b;
+      let s = false;
+      if (e.gen < MAXGEN && evalLeft > 0 && (iu || iv)) {
+        if (iu && iv) s = farRR(u.r, v.r, o, q);
+        else s = farRX(iu ? u.r : v.r, o, q, crossOf(e, u, v, b));
+      }
+      e.split = s;
+      if (s) { e.mid = node(0.5 * (u.h + v.h), 0.5 * (u.a + v.a)); nSub++; }
+    }
+    return e.split;
+  };
+  // 叶子三角形: 按 M_b > 0 裁剪 (交点取边表里的, 与邻居同一点), 扇形三角化
+  const leaf = (T, b) => {
     const pts = [];
     for (let k = 0; k < 3; k++) {
       const p = T[k], q = T[(k + 1) % 3], ip = p.r[b] > 0, iq = q.r[b] > 0;
       if (ip) pts.push(vert(p, b));
-      if (ip !== iq) pts.push(ip ? crossing(b, p, q) : crossing(b, q, p));
+      if (ip !== iq) pts.push(crossOf(edgeOf(p, q, b), p, q, b));
     }
-    return pts;
-  };
-  const tooBig = pts => {
-    for (let k = 0; k < pts.length; k++) {
-      const A = pts[k], B = pts[(k + 1) % pts.length];
-      if (d2(A, B) > Lbig * Lbig || A[3] * B[3] + A[4] * B[4] + A[5] * B[5] < cosAbig) return true;
-    }
-    return false;
-  };
-  const emit = (T, b, dep) => {
-    const pts = clipPoly(T, b);
-    if (pts.length < 3) return;
-    if (dep < 6 && evalLeft > 0 && tooBig(pts)) {
-      nSub++;
-      const m = (u, v) => node(0.5 * (u.h + v.h), 0.5 * (u.a + v.a));
-      const m01 = m(T[0], T[1]), m12 = m(T[1], T[2]), m20 = m(T[2], T[0]);
-      emit([T[0], m01, m20], b, dep + 1); emit([m01, T[1], m12], b, dep + 1);
-      emit([m20, m12, T[2]], b, dep + 1); emit([m01, m12, m20], b, dep + 1);
-      return;
-    }
-    for (let k = 1; k + 1 < pts.length; k++) {           // 扇形三角化
+    for (let k = 1; k + 1 < pts.length; k++) {
       const A = pts[0], B = pts[k], C = pts[k + 1];
-      if (d2(A, B) > lim2 || d2(B, C) > lim2 || d2(A, C) > lim2) { nDrop++; continue; }
+      if (d2(A, B) > lim2 || d2(B, C) > lim2 || d2(A, C) > lim2) { nDrop++; continue; }   // 切到底仍奇长: 真不连续 (或灯处 t: 0→截断 的退化细线), 丢弃
       pos.push(A[0], A[1], A[2], B[0], B[1], B[2], C[0], C[1], C[2]);
-      tb.push(b);
+      vids.push(2 * A.id + b, 2 * B.id + b, 2 * C.id + b);
       dirv.push(A[3], A[4], A[5], B[3], B[4], B[5], C[3], C[4], C[5]);
       hv.push(A[6], B[6], C[6]);
+      if (opts.debug) opts.debug.push(A[7], B[7], C[7]);
     }
   };
+  // 三角形 (逆时针): 先问三条边切不切, 再按切法分成 2 / 3 / 4 个 (保持逆时针), 内部新边代数 = 最大边代数 + 1
+  const tri = (T, b) => {
+    const e0 = edgeOf(T[0], T[1], b), e1 = edgeOf(T[1], T[2], b), e2 = edgeOf(T[2], T[0], b);
+    const s0 = wantSplit(e0, T[0], T[1], b), s1 = wantSplit(e1, T[1], T[2], b), s2 = wantSplit(e2, T[2], T[0], b);
+    if (!s0 && !s1 && !s2) { leaf(T, b); return; }
+    const E = [e0, e1, e2], S = [s0, s1, s2], ns = s0 + s1 + s2;
+    const g1 = 1 + Math.max(E[0].gen, E[1].gen, E[2].gen);
+    const child = (u, v, gen) => { const e = edgeOf(u, v, b, gen); if (e.gen < gen && e.split === undefined) e.gen = gen; };
+    // 被切的边: 两半继承代数 +1
+    for (let k = 0; k < 3; k++) if (S[k]) { const m = E[k].mid; child(T[k], m, E[k].gen + 1); child(m, T[(k + 1) % 3], E[k].gen + 1); }
+    if (ns === 3) {
+      const m01 = E[0].mid, m12 = E[1].mid, m20 = E[2].mid;
+      child(m01, m20, g1); child(m01, m12, g1); child(m12, m20, g1);
+      tri([T[0], m01, m20], b); tri([m01, T[1], m12], b); tri([m20, m12, T[2]], b); tri([m01, m12, m20], b);
+      return;
+    }
+    // 旋转到标准位置: 1 刀时切的是 (A,B); 2 刀时不切的是 (C,A)
+    let r = 0;
+    if (ns === 1) r = S.indexOf(true); else r = (S.indexOf(false) + 1) % 3;
+    const A = T[r], B = T[(r + 1) % 3], C = T[(r + 2) % 3];
+    const eAB = E[r], eBC = E[(r + 1) % 3];
+    if (ns === 1) {
+      const m = eAB.mid;
+      child(m, C, g1);
+      tri([A, m, C], b); tri([m, B, C], b);
+      return;
+    }
+    // 两刀: AB 与 BC 被切, CA 不切 → 角上 [mAB, B, mBC] + 四边形 [A, mAB, mBC, C] 沿较短对角线分开
+    const mAB = eAB.mid, mBC = eBC.mid;
+    child(mAB, mBC, g1);
+    tri([mAB, B, mBC], b);
+    const o = 2 + 3 * b;
+    const okD = (u, v) => u.r[b] > 0 && v.r[b] > 0;
+    const useAmBC = okD(A, mBC) && okD(mAB, C) ? dist3(A.r, o, mBC.r, o) <= dist3(mAB.r, o, C.r, o) : true;
+    if (useAmBC) { child(A, mBC, g1); tri([A, mAB, mBC], b); tri([A, mBC, C], b); }
+    else { child(mAB, C, g1); tri([A, mAB, C], b); tri([mAB, mBC, C], b); }
+  };
   const NH = hs.length;
-  grid.forEach((g, si) => {
-    const A = as[si];
-    const V = g.map((col, j) => {
-      const arr = new Array(NH);
-      for (let i = 0; i < NH; i++) arr[i] = { h: hs[i], a: A[j], r: col.subarray(REC * i, REC * i + REC) };
-      return arr;
-    });
+  const Vs = grid.map((g, si) => g.map((col, j) => {
+    const arr = new Array(NH);
+    for (let i = 0; i < NH; i++) arr[i] = { id: nid++, h: hs[i], a: as[si][j], r: col.subarray(REC * i, REC * i + REC) };
+    return arr;
+  }));
+  triangulate();
+  function triangulate() { grid.forEach((g, si) => {
+    const V = Vs[si];
     for (let j = 0; j + 1 < g.length; j++) {
       for (let i = 0; i + 1 < NH; i++) {
         // 格子四角: 0 (i, j) 1 (i+1, j) 2 (i+1, j+1) 3 (i, j+1)
@@ -321,40 +392,32 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
           // 对角线取三维更短的一条 (四角都有效时), 三角形更匀称
           let diag02 = true;
           if (in0 && in1 && in2 && in3) { const o = 2 + 3 * b; diag02 = dist3(Q[0].r, o, Q[2].r, o) <= dist3(Q[1].r, o, Q[3].r, o); }
-          if (diag02) { emit([Q[0], Q[1], Q[2]], b, 0); emit([Q[0], Q[2], Q[3]], b, 0); }
-          else { emit([Q[0], Q[1], Q[3]], b, 0); emit([Q[1], Q[2], Q[3]], b, 0); }
+          if (diag02) { tri([Q[0], Q[1], Q[2]], b); tri([Q[0], Q[2], Q[3]], b); }
+          else { tri([Q[0], Q[1], Q[3]], b); tri([Q[1], Q[2], Q[3]], b); }
         }
       }
     }
-  });
+  }); }
   return {
-    pos: Float32Array.from(pos), dir: Float32Array.from(dirv), h: Float32Array.from(hv), nrm: vertexNormals(pos, tb),
+    pos: Float32Array.from(pos), dir: Float32Array.from(dirv), h: Float32Array.from(hv), nrm: vertexNormals(pos, vids, nid),
     nTri: hv.length / 3, ms: Date.now() - t0, nh: NH, na: as.reduce((s, a) => s + a.length, 0), nDrop, nSub,
   };
 }
 
-// 每顶点法向 (3D 视图平滑明暗用): 同一支里位置相同 (1 µm 网格) 的顶点焊在一起, 累加面积加权的面法向.
-//   同一支的三角形在参数平面里都是逆时针 (格子两三角形、裁剪扇形、四分子三角形都保持方向), 映到三维后朝向一致,
-//   所以法向可以带符号累加; 两支分开焊 (在转折处它们朝向相反, 混在一起会抵消).
-function vertexNormals(pos, tb) {
-  const nT = tb.length, out = new Float32Array(9 * nT);
-  const ids = new Map(), acc = [], vid = new Int32Array(3 * nT);
-  const q = v => Math.round(v * 1e6);
-  for (let t = 0; t < nT; t++) {
+// 每顶点法向 (3D 视图平滑明暗用): 同一个顶点 (同一支) 在各三角形里是同一个身份, 累加面积加权的面法向.
+//   同一支的三角形在参数平面里都是逆时针 (格子两三角形、裁剪扇形、对分子三角形都保持方向), 映到三维后朝向一致,
+//   所以法向可以带符号累加; 两支分开 (在转折处它们朝向相反, 混在一起会抵消).
+function vertexNormals(pos, vids, nid) {
+  const nV = vids.length, out = new Float32Array(3 * nV), acc = new Float64Array(6 * nid);
+  for (let t = 0; 3 * t < nV; t++) {
     const o = 9 * t;
     const ux = pos[o + 3] - pos[o], uy = pos[o + 4] - pos[o + 1], uz = pos[o + 5] - pos[o + 2];
     const vx = pos[o + 6] - pos[o], vy = pos[o + 7] - pos[o + 1], vz = pos[o + 8] - pos[o + 2];
     const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    for (let k = 0; k < 3; k++) {
-      const key = tb[t] + ',' + q(pos[o + 3 * k]) + ',' + q(pos[o + 3 * k + 1]) + ',' + q(pos[o + 3 * k + 2]);
-      let id = ids.get(key);
-      if (id === undefined) { id = acc.length / 3; ids.set(key, id); acc.push(0, 0, 0); }
-      acc[3 * id] += nx; acc[3 * id + 1] += ny; acc[3 * id + 2] += nz;
-      vid[3 * t + k] = id;
-    }
+    for (let k = 0; k < 3; k++) { const i = 3 * vids[3 * t + k]; acc[i] += nx; acc[i + 1] += ny; acc[i + 2] += nz; }
   }
-  for (let v = 0; v < vid.length; v++) {
-    const i = 3 * vid[v], x = acc[i], y = acc[i + 1], z = acc[i + 2], l = Math.hypot(x, y, z) || 1;
+  for (let v = 0; v < nV; v++) {
+    const i = 3 * vids[v], x = acc[i], y = acc[i + 1], z = acc[i + 2], l = Math.hypot(x, y, z) || 1;
     out[3 * v] = x / l; out[3 * v + 1] = y / l; out[3 * v + 2] = z / l;
   }
   return out;
