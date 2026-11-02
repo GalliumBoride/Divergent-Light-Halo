@@ -175,8 +175,36 @@ function runMain() {
   });
 }
 
-// 二自由度: 原窗体的 h 层在 −90°..90° 上等分, 真正有曲线的往往只占一小段 (柱晶 3-5 约 60°, 72 层里只 26 层).
-// 第一轮算完后, 在有曲线的 h 区间里再补一批层 (只要显示曲线, 不进采样点), 曲线族密到能看出曲面.
+// 两层曲线 (各若干条折线) 在三维里相隔多远: A 上取样点到 B 上最近点的距离, 取 75% 分位 (层在灯旁汇聚、在远处散开,
+//   取偏高的分位才反映稀疏的那一侧). 两个方向: how = 'mean' 取平均 (分配补层用), 'min' 取小者 (判断是否太挤用 —
+//   一层多出一小段时反方向的距离很大, 取大者会把"挤"掩盖掉)
+function layerGap(A, B, how = 'mean') {
+  const pts = (L, cap) => {
+    let n = 0; for (const c of L.curves) n += (c.p || c).length / 3;
+    const st = Math.max(1, Math.ceil(n / cap)), out = [];
+    let k = 0;
+    for (const c of L.curves) { const p = c.p || c; for (let i = 0; i < p.length; i += 3, k++) if (k % st === 0) out.push(p[i], p[i + 1], p[i + 2]); }
+    return out;
+  };
+  const one = (a, b) => {
+    if (!a.length || !b.length) return 0;
+    const ds = [];
+    for (let i = 0; i < a.length; i += 3) {
+      let m = Infinity;
+      for (let j = 0; j < b.length; j += 3) { const dx = a[i] - b[j], dy = a[i + 1] - b[j + 1], dz = a[i + 2] - b[j + 2], d = dx * dx + dy * dy + dz * dz; if (d < m) m = d; }
+      ds.push(Math.sqrt(m));
+    }
+    ds.sort((x, y) => x - y);
+    return ds[Math.floor(0.75 * (ds.length - 1))];
+  };
+  const a = pts(A, 150), b = pts(B, 1500), a2 = pts(B, 150), b2 = pts(A, 1500), g1 = one(a, b), g2 = one(a2, b2);
+  return how === 'min' ? Math.min(g1, g2) : 0.5 * (g1 + g2);
+}
+
+// 二自由度: 原窗体的 h 层在 −90°..90° 上等分, 真正有曲线的往往只占一小段, 而且等 h 间隔的层在三维里疏密悬殊
+//   (h → ±90° 处光锥退化成竖线, 相邻层几乎重合; 近水平处层在远处散得很开). 第一轮算完后按【三维间距等分布】补层:
+//   每个原间隔的间距 g_k 由相邻两层的曲线量出 (layerGap), 补的层数 ∝ g_k (de Boor 等分布), 稀的地方多补, 挤的地方不补.
+//   曲线出现 / 消失的间隔 (只有一侧有曲线) 按邻近间隔的间距补, 把收口处夹紧.
 function runDense(myR) {
   if (myR.dof !== 2) return;
   const o = orient(), tasks = [], route = [];
@@ -186,12 +214,19 @@ function runDense(myR) {
     P.layers.forEach((l, ih) => { if (l && l.curves.length) { if (i0 < 0) i0 = ih; i1 = ih; } });
     if (i0 < 0) return;
     const step = 180 / Math.max(1, P.nH - 1);
-    const hA = layerH(P, Math.max(0, i0 - 1)), hB = layerH(P, Math.min(P.nH - 1, i1 + 1));
-    const nLay = Math.round((hB - hA) / step);
-    const per = Math.max(1, Math.ceil([150, 240, 360][S.q] / Math.max(1, nLay)) - 1);    // 每个原间隔里补几层
+    const kA = Math.max(0, i0 - 1), kB = Math.min(P.nH - 1, i1 + 1);
+    const has = k => !!(P.layers[k] && P.layers[k].curves.length);
+    const g = [];
+    for (let k = kA; k < kB; k++) g.push(has(k) && has(k + 1) ? layerGap(P.layers[k], P.layers[k + 1]) : -1);
+    const known = g.filter(x => x > 0), gMed = known.length ? known.sort((x, y) => x - y)[Math.floor(known.length / 2)] : 1;
+    for (let k = 0; k < g.length; k++) if (g[k] < 0) g[k] = gMed;            // 出现 / 消失的间隔
+    const total = [150, 240, 360][S.q], gSum = g.reduce((x, y) => x + y, 0) || 1;
     const hs = [];
-    for (let k = 0; k < nLay; k++)
-      for (let j = 1; j <= per; j++) hs.push(clamp(hA + step * (k + j / (per + 1)), -89.99, 89.99));
+    g.forEach((gk, k) => {
+      const n = Math.min(60, Math.round(total * gk / gSum));
+      const h0 = layerH(P, kA + k);
+      for (let j = 1; j <= n; j++) hs.push(clamp(h0 + step * j / (n + 1), -89.99, 89.99));
+    });
     const base = { ...common(), fp: P.fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta,
       lowitz: !!o.lowitz, surf: S.surf2, nG: [101, 141, 181][S.q] };
     const n = Math.max(1, Math.ceil(hs.length / K));
@@ -493,16 +528,33 @@ function buildDL() {
     const pcol = lay.colorBy === 'path' ? PATHCOL[ip % PATHCOL.length] : C.pts;
     if (lay.surf && P.mesh && P.mesh.pos.length)
       dl.meshes.push({ pos: P.mesh.pos, dir: P.mesh.dir, nrm: P.mesh.nrm, cols: meshColors(P, lay.colorBy, rng), col: pcol });
+    // 平面退化 (灯眼等高的板晶柱面光路): 晕面整块躺在灯眼所在的水平面里, 天空里全在地平线上 — 画成地平线上的弧
+    if (lay.surf && P.mesh && P.mesh.sky) line(P.mesh.sky, pcol, 3, { skyOnly: true });
+    const ob = P.mesh && P.mesh.outline;            // 平面退化时的边界线 (边界引擎在这里也退化, 用网格的精确区间端点)
+    if (ob) { if (lay.bEntry) line(ob.entry, C.entry, 2); if (lay.bMirror) line(ob.mirror, C.mirror, 2); if (lay.bTir) line(ob.tir, C.tir, 2); }
     if (lay.surf && P.dof === 2) {
       // 二自由度: 每个 h 层是一条 (或几条) 平行光曲线经锥映射 → 按层着色的线 (数据与配色不变就复用同一组对象)
-      const lk = [lay.colorBy, rng ? rng.join(',') : '', P.lver || 0, pcol].join('|');
+      const lk = [lay.colorBy, rng ? rng.join(',') : '', P.lver || 0, pcol, busy.dense ? 1 : 0].join('|');
       if (!P.layerLines || P.layerLines.key !== lk) {
         const segs = [], segCols = [], D = baseline(), span = rng ? Math.max(1e-9, rng[1] - rng[0]) : 1;
         const all = [];
         P.layers.forEach((l, ih) => { if (l) all.push({ h: layerH(P, ih), curves: l.curves }); });
         all.push(...P.dense);
         all.sort((a, b) => a.h - b.h);
-        all.forEach(l => {
+        // 全部算完后去掉挤在一起的层 (与上一条留下的层相距不到中位间距的 0.3 倍), 疏密更匀
+        let show = all;
+        if (!busy.dense && all.length > 8) {
+          const nz = all.filter(l => l.curves.length), gaps = [];
+          for (let k = 0; k + 1 < nz.length; k++) gaps.push(layerGap(nz[k], nz[k + 1], 'min'));
+          const med = gaps.slice().sort((x, y) => x - y)[Math.floor(gaps.length / 2)] || 0;
+          show = [];
+          let last = null;
+          nz.forEach((l, k) => {
+            if (last && k + 1 < nz.length && layerGap(last, l, 'min') < 0.3 * med) return;
+            show.push(l); last = l;
+          });
+        }
+        show.forEach(l => {
           const h = l.h;
           for (const c of l.curves) {
             let col = pcol;
@@ -723,6 +775,8 @@ function layerCount(id) {
   const add = a => { if (a) n += a.length; };
   for (const P of R.paths) {
     if (P.bdry) { if (id === 'bEntry') add(P.bdry.entry); if (id === 'bMirror') add(P.bdry.mirror); if (id === 'bTir') add(P.bdry.tir); if (id === 'parArc') add(P.bdry.parArc); }
+    const ob = P.mesh && P.mesh.outline;
+    if (ob) { if (id === 'bEntry') add(ob.entry); if (id === 'bMirror') add(ob.mirror); if (id === 'bTir') add(ob.tir); }
     if (P.dof === 2 && id === 'bRim') add(rimsOf(P));
     if (P.edges) { if (id === 'bEntry') add(P.edges.entry); if (id === 'bTir') add(P.edges.tir); if (id === 'bSeam') add(P.edges.seam); if (id === 'bTurn') add(P.edges.turn); if (id === 'bCusp') add(P.edges.cusp); if (id === 'parArc') add(P.edges.parArc); }
   }
