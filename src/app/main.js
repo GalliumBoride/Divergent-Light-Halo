@@ -401,7 +401,7 @@ function lampElevFromEye() {
 //   层曲线本身已二分到真正的端点 (见 epdiv 修正版), 端点随 h 连成的线就是实际画出来的晕面的边.
 //   不算端点的: 灯 / 眼上的捏合点; 同层两段首尾相接处 (锥面折叠或取向坐标接缝, 曲线在这里光滑穿过, 不是边).
 function layerRims(P) {
-  const ver = P.lver || 0;
+  const ver = (P.lver || 0) + (P.edges ? 0.5 : 0);
   if (P.rims && P.rims.v === ver) return P.rims.segs;
   const { L, E } = scene(), D = baseline();
   const all = [];
@@ -409,6 +409,23 @@ function layerRims(P) {
   for (const l of P.dense) if (l.curves.length) all.push(l);
   all.sort((a, b) => a.h - b.h);
   const near = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+  // 精确边界线的点 (加密过, 间距 ~0.1 m) 放进网格哈希: 落在精确边界上的端点不再画外缘 (避免两条线贴着走成"双层边")
+  const cell = Math.max(0.25, 0.02 * D), hash = new Map();
+  const hk = (x, y, z) => Math.floor(x / cell) + ',' + Math.floor(y / cell) + ',' + Math.floor(z / cell);
+  if (P.edges) for (const k of ['entry', 'tir', 'seam', 'turn', 'cusp']) for (const sg of P.edges[k] || []) {
+    const p = sg.p || sg;
+    for (let i = 0; i < p.length; i += 3) { const key = hk(p[i], p[i + 1], p[i + 2]); let a = hash.get(key); if (!a) hash.set(key, a = []); a.push(p[i], p[i + 1], p[i + 2]); }
+  }
+  const onExact = q => {
+    if (!hash.size) return false;
+    const tolE = Math.max(0.1, 0.02 * Math.hypot(q.x - L[0], q.y - L[1], q.z - L[2]));
+    const cx = Math.floor(q.x / cell), cy = Math.floor(q.y / cell), cz = Math.floor(q.z / cell), R = Math.ceil(tolE / cell);
+    for (let i = -R; i <= R; i++) for (let j = -R; j <= R; j++) for (let k = -R; k <= R; k++) {
+      const a = hash.get((cx + i) + ',' + (cy + j) + ',' + (cz + k));
+      if (a) for (let t = 0; t < a.length; t += 3) if (Math.hypot(a[t] - q.x, a[t + 1] - q.y, a[t + 2] - q.z) < tolE) return true;
+    }
+    return false;
+  };
   const ends = all.map(l => {
     const raw = [];
     for (const c of l.curves) {
@@ -417,7 +434,8 @@ function layerRims(P) {
       for (const i of [0, n - 1]) raw.push({ x: p[3 * i], y: p[3 * i + 1], z: p[3 * i + 2], dx: d[3 * i], dy: d[3 * i + 1], dz: d[3 * i + 2] });
     }
     const tol = 2e-4 * D, Lp = { x: L[0], y: L[1], z: L[2] }, Ep = { x: E[0], y: E[1], z: E[2] };
-    return raw.filter((q, i) => near(q, Lp) > 1e-3 * D && near(q, Ep) > 1e-3 * D && !raw.some((r, j) => j !== i && near(q, r) < tol));
+    return raw.filter((q, i) => near(q, Lp) > 1e-3 * D && near(q, Ep) > 1e-3 * D && !raw.some((r, j) => j !== i && near(q, r) < tol)
+      && !onExact(q));
   });
   // 逐层贪心配对: 还开着的链尾 (最多空过 2 层) 与新一层的端点, 按距离从近到远配, 两边都没配过且在上限内才连
   const chains = [];
