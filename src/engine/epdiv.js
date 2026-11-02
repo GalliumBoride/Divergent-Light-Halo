@@ -209,9 +209,10 @@ function coneBranchesFull(Dsky, hRad, L, E, maxDist) {
     const cp = Math.cos(psi), sp = Math.sin(psi);
     const u = [cp * i0[0] - sp * i0[1], sp * i0[0] + cp * i0[1], i0[2]];
     const dd = [cp * d[0] - sp * d[1], sp * d[0] + cp * d[1], d[2]];
-    const c = dot(u, dd), den = 1 - c * c;
+    // 交点分母用 |û×d|² (= 1 − c², 但接近平行时没有相消误差), 分子也写成叉积, 见 mesh1.js evalNode
+    const w = cross(u, dd), den = dot(w, w);
     if (den < 1e-12) continue;
-    const tR = (c * dot(dd, DDv) - dot(u, DDv)) / den, sR = (c * dot(u, DDv) - dot(dd, DDv)) / den;
+    const tR = -dot(cross(DDv, dd), w) / den, sR = dot(cross(DDv, u), w) / den;
     if (tR < 1e-9 || sR < 1e-9 || tR > maxDist) continue;
     out[b] = { P: [L[0] + tR * u[0], L[1] + tR * u[1], L[2] + tR * u[2]], s: [-dd[0], -dd[1], -dd[2]], u };
   }
@@ -231,7 +232,9 @@ function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40) {
   const out = [];
   let P = [], D = [];
   const push = st => { P.push(st.P[0], st.P[1], st.P[2]); D.push(st.s[0], st.s[1], st.s[2]); };
-  const flush = () => { if (P.length >= 6) out.push({ p: Float32Array.from(P), d: Float32Array.from(D) }); P = []; D = []; };
+  // 整条落在一个点上的不要: 退化纤维 (一圈取向的天空方向都一样, J 沿它恒为 0) 映成一个点, 是点状焦散, 画不成线
+  const extent = () => { let e = 0; for (let i = 3; i < P.length; i += 3) e = Math.max(e, Math.abs(P[i] - P[0]) + Math.abs(P[i + 1] - P[1]) + Math.abs(P[i + 2] - P[2])); return e; };
+  const flush = () => { if (P.length >= 6 && extent() > 1e-6) out.push({ p: Float32Array.from(P), d: Float32Array.from(D) }); P = []; D = []; };
   // 有效 xa 与无效 xb 之间的转折点: 返回最后一个有效的 { x, s }
   const edge = (xa, sa, xb) => {
     let lo = xa, slo = sa, hi = xb;
@@ -913,198 +916,188 @@ function polishEnd(x, P, m, fx) {
   return edgeExact(x, k, P, m, fx) || x;
 }
 
-// 修正版 (显示): 网格追线在有效区边上有时走到头又原路折回 (同一段零线走两遍, 首尾相接成"闭环"), 两个真端点都丢了.
-//   在急转 (> 150°) 处切开, 再丢掉逐点贴着另一段倒着走的重复段.
-//   折回不一定留在同一段里: 去程与回程常被有效性剪成两段 (A→边, 边→A), 各自都不闭合, 只看单段的闭合折回会漏掉 —
-//   漏掉的后果是两段在 A 处首尾相接, 延拓一出门就"碰到已有的段"而停, 层曲线停在 A (离真正的边界差零点几米到一米),
-//   相邻层有的停有的不停, 放大看参差不齐. 所以对所有段: 先在急转处 (> 150°) 切开, 再按长度从长到短,
-//   丢掉被已保留的段整段覆盖 (逐点距离 < tol) 的那些; 同一段里留下的相邻小段再接回去.
-function splitRetrace(runs) {
-  const TWO = 2 * Math.PI, wd = a => a - TWO * Math.round(a / TWO);   // 周期坐标的差
-  const tol = 0.01;                                   // 折回的那一趟与去程相距不到一格 (网格 3.6°) 的零头
-  const covered = (pc, by) => pc.every(x => { for (let j = 0; j + 1 < by.length; j++) {
-    const a = by[j], ax = wd(x[0] - a[0]), ay = wd(x[1] - a[1]), dx = wd(by[j + 1][0] - a[0]), dy = wd(by[j + 1][1] - a[1]), l2 = dx * dx + dy * dy;
-    const t = l2 > 0 ? Math.max(0, Math.min(1, (ax * dx + ay * dy) / l2)) : 0;
-    if (Math.hypot(ax - t * dx, ay - t * dy) < tol) return true; } return false; });
-  const arc = r => { let s = 0; for (let i = 1; i < r.length; i++) s += Math.hypot(wd(r[i][0] - r[i - 1][0]), wd(r[i][1] - r[i - 1][1])); return s; };
-  // 先理顺次序: 一格里两个交点的先后有时排反 (…→3→4→5→6 里 4 跑到 5 前头), 成一个"之"字 — 4、5 两处都急转,
-  //   中间那一步短, 之后照原方向继续. 这不是折回 (折回只转一次, 之后一直往回走), 在这里切开会把一条线断成两截:
-  //   把这两个点换回来.
-  const sharp = (r, i) => {
-    const ax = r[i][0] - r[i - 1][0], ay = r[i][1] - r[i - 1][1], bx = r[i + 1][0] - r[i][0], by = r[i + 1][1] - r[i][1];
-    const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
-    return la > 1e-12 && lb > 1e-12 && (ax * bx + ay * by) < -0.866 * la * lb;
-  };
-  const unzig = run => {
-    const r = run.slice();
-    for (let i = 1; i + 2 < r.length; i++)
-      if (sharp(r, i) && sharp(r, i + 1) && Math.hypot(r[i + 1][0] - r[i][0], r[i + 1][1] - r[i][1]) < 0.1) {
-        const t = r[i]; r[i] = r[i + 1]; r[i + 1] = t; i++;
-      }
-    return r;
-  };
-  runs = runs.map(unzig);
-  // 每段切成小段 (记下原段号与次序). 切点: 急转 (原路折回), 以及"走回自己走过的地方" — 零线上有鞍点 (X 形交叉) 时,
-  //   网格追线在那一格每次选的走法不一样, 会把一个闭环绕两三圈才从交叉处拐出去 (各圈交点略有不同, 判不出闭合);
-  //   起点只是闭环上随便一点, 延拓一出门就碰到后几圈, 层曲线停在半空. 在每次绕回处切开, 重复的圈由下面的覆盖判定丢掉.
-  const pieces = [];
-  runs.forEach((run, ri) => {
-    const cuts = [0];
-    const hash = new Map(), cell = tol, key = (a, b) => Math.floor(a / cell) + ',' + Math.floor(b / cell);
-    const nearEarlier = i => {
-      const x = run[i], cu = Math.floor(x[0] / cell), cv = Math.floor(x[1] / cell);
-      for (let du = -1; du <= 1; du++) for (let dv = -1; dv <= 1; dv++) {
-        for (const j of hash.get((cu + du) + ',' + (cv + dv)) || [])
-          if (i - j > 12 && Math.hypot(run[j][0] - x[0], run[j][1] - x[1]) < tol) return true;
-      }
-      return false;
-    };
-    let wasNear = false;
-    for (let i = 1; i + 1 < run.length; i++) {
-      const ax = run[i][0] - run[i - 1][0], ay = run[i][1] - run[i - 1][1], bx = run[i + 1][0] - run[i][0], by = run[i + 1][1] - run[i][1];
-      const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
-      const near = i + 2 < run.length && nearEarlier(i);
-      if (la > 1e-12 && lb > 1e-12 && (ax * bx + ay * by) < -0.866 * la * lb) cuts.push(i);
-      else if (near && !wasNear) cuts.push(i);
-      wasNear = near;
-      const k = key(run[i - 1][0], run[i - 1][1]);
-      let a = hash.get(k); if (!a) hash.set(k, a = []); a.push(i - 1);
-    }
-    cuts.push(run.length - 1);
-    for (let k = 0; k + 1 < cuts.length; k++) {
-      const pc = run.slice(cuts[k], cuts[k + 1] + 1);
-      if (pc.length >= 2) pieces.push({ ri, k, pc, len: arc(pc), keep: false });
-    }
-  });
-  const order = pieces.slice().sort((a, b) => b.len - a.len), kept = [];
-  for (const p of order) if (!kept.some(q => covered(p.pc, q.pc))) { p.keep = true; kept.push(p); }
-  const out = [];
-  runs.forEach((run, ri) => {
-    const mine = pieces.filter(p => p.ri === ri);
-    if (mine.every(p => p.keep)) { if (run.length >= 2) out.push(run); return; }   // 没有重复: 原样 (含正常的闭合零线)
-    let cur = null, lastK = -2;
-    for (const p of mine) {
-      if (!p.keep) { if (cur) out.push(cur); cur = null; continue; }
-      if (cur && p.k === lastK + 1) cur = cur.concat(p.pc.slice(1)); else { if (cur) out.push(cur); cur = p.pc.slice(); }
-      lastK = p.k;
-    }
-    if (cur) out.push(cur);
-  });
-  return out;
-}
+// 修正版 (显示) 的焦散追线: 数值延拓 (预测–校正), 不再拼网格追线的结果.
+//   Ĵ = 0 在取向平面里是光滑曲线 (鞍点处是两条光滑曲线交叉). 网格追线 (marching squares) 在这种曲线上会出各种毛病:
+//   原路折回、一个圈绕两三遍、一格里两个交点排反成"之"字、进不了有 NaN 角的格子 —— 层曲线因此停在半空, 参差不齐.
+//   这里网格只用来找种子 (格边上 J 变号处); 每条线从种子出发: 沿切线 (⊥∇Ĵ) 走一步 → 沿 ∇Ĵ 的 Newton 拉回 Ĵ = 0,
+//   步长按转角自适应 (转角 > 12° 或校正量过大就减半, 走顺了再放大). 于是:
+//     · 到 X 形交叉处沿切线直接穿过 (两条线各走各的);
+//     · 出了有效区: 在最后一个有效点与出界点之间二分 (中点拉回零线) 到边上, 再解精确交点 (polishEnd);
+//     · 碰到 Ĵ 的 0/0 奇点 (几条焦散汇于一点, 常映到灯): Newton 不收敛, 步长缩到 2e-6 仍不行就停在那里;
+//     · 走回起点 = 闭合.
+//   已追过的线上的种子跳过. 坐标沿线连续展开 (周期轴不折回).
+function traceCausticFine(P, m, fx, nGrid) {
+  const ax = axesMeta(m);
+  const X0 = ax.x0 * Math.PI / 180, X1 = ax.x1 * Math.PI / 180, Y0 = ax.y0 * Math.PI / 180, Y1 = ax.y1 * Math.PI / 180;
+  const perX = ax.perX, perY = ax.perY;
+  const dX = (X1 - X0) / (nGrid - 1), dY = (Y1 - Y0) / (nGrid - 1);
+  const SCs = new Float64Array(nGrid), SWs = new Float64Array(nGrid);
+  for (let i = 0; i < nGrid; i++) {
+    SCs[i] = perX ? X0 + dX * (0.1371 + i) : X0 + 1e-4 + (X1 - X0 - 2e-4) * i / (nGrid - 1);
+    SWs[i] = perY ? Y0 + dY * (0.1371 + i) : Y0 + 1e-4 + (Y1 - Y0 - 2e-4) * i / (nGrid - 1);
+  }
+  const Fg = new Float64Array(nGrid * nGrid);
+  for (let iw = 0; iw < nGrid; iw++)
+    for (let isc = 0; isc < nGrid; isc++) Fg[iw * nGrid + isc] = jana3(SCs[isc], SWs[iw], m, fx, P);
 
-// 修正版 (显示): 焦散段断头延拓. 网格追零线 (marching squares) 进不了有 NaN 角的格子 (链在那边失效),
-//   零线在有效区的边上还差最多一格就停了 —— 三维里能差出几米, 层曲线够不着边界线.
-//   从段端沿零线切向走小步 (预测) + 沿 ∇J 的 Newton 拉回 J=0 (校正), 直到链失效, 再交给 trimRunsStrict 二分到精确端点.
-function extendRunsJ(runs, P, m, fx, step = 0.004, maxSteps = 120) {
   const J = jHat(m, fx, P);
-  // 出射余量 < 1e-6 就算到了出射临界边: 有的光路 J 在这条边上并不发散, Ĵ = J·√余量 在整条边上都是 0,
-  //   Newton 会被拉到边上, 延拓沿着出射临界边滑出去 (一圈回到起点, 成了一段假焦散)
-  const ok = x => validAt(P, m, fx, x[0], x[1], 1e-4) && -SqK - Chain3(x[0], x[1], m, fx, P).qE > 1e-6;
-  const corr = x => {
-    let u = x[0], v = x[1];
-    for (let it = 0; it < 8; it++) {
-      const J0 = J(u, v);
-      if (!Number.isFinite(J0)) return null;
-      const e = 1e-6;
-      const gx = (J(u + e, v) - J(u - e, v)) / (2 * e), gy = (J(u, v + e) - J(u, v - e)) / (2 * e);
-      const g2 = gx * gx + gy * gy;
-      if (!(g2 > 0) || !Number.isFinite(g2)) return null;
-      const du = -J0 * gx / g2, dv = -J0 * gy / g2;
-      if (Math.hypot(du, dv) > 3 * step) return null;
-      u += du; v += dv;
-      if (Math.hypot(du, dv) < 1e-12) break;
-    }
-    return Math.abs(J(u, v)) < 1e-8 ? [u, v] : null;
+  const TWO = 2 * Math.PI, wd = a => a - TWO * Math.round(a / TWO);
+  // 有效: 严格; 出射余量 < 1e-6 当作到边 (有的光路 J 在出射临界边上不发散, Ĵ 沿整条边为 0, 不能让线顺着边滑)
+  const ok = x => validAt(P, m, fx, x[0], x[1], 0) && -SqK - Chain3(x[0], x[1], m, fx, P).qE > 1e-6;
+  const grad = (u, v) => {
+    const e = 1e-7;
+    let gx = (J(u + e, v) - J(u - e, v)) / (2 * e), gy = (J(u, v + e) - J(u, v - e)) / (2 * e);
+    if (!Number.isFinite(gx)) { const j0 = J(u, v); gx = (J(u + e, v) - j0) / e; if (!Number.isFinite(gx)) gx = (j0 - J(u - e, v)) / e; }
+    if (!Number.isFinite(gy)) { const j0 = J(u, v); gy = (J(u, v + e) - j0) / e; if (!Number.isFinite(gy)) gy = (j0 - J(u, v - e)) / e; }
+    return [gx, gy];
   };
-  // 所有段的点放进 (周期折回的) 网格哈希: 延拓碰到已有的段 (接缝处被切开的同一条零线, 或闭合回自己) 就停
-  const TWO = 2 * Math.PI, cell = 2 * step, wrap = a => a - TWO * Math.floor(a / TWO);
-  const hk = (u, v) => Math.floor(wrap(u) / cell) + ',' + Math.floor(wrap(v) / cell);
-  const grid = new Map();
-  runs.forEach((run, ri) => run.forEach((x, i) => {
-    const k = hk(x[0], x[1]);
-    let a = grid.get(k); if (!a) grid.set(k, a = []);
-    a.push(ri, i);
-  }));
-  const hits = (q, ri, iEnd, n) => {
-    const cu = Math.floor(wrap(q[0]) / cell), cv = Math.floor(wrap(q[1]) / cell), nc = Math.ceil(TWO / cell);
-    for (let du = -1; du <= 1; du++) for (let dv = -1; dv <= 1; dv++) {
-      const a = grid.get(((cu + du + nc) % nc) + ',' + ((cv + dv + nc) % nc));
-      if (!a) continue;
-      for (let j = 0; j < a.length; j += 2) {
-        if (a[j] === ri && Math.abs(a[j + 1] - iEnd) < Math.min(12, n - 1)) continue;   // 自己端点附近的点不算
-        const x = runs[a[j]][a[j + 1]];
-        const du2 = Math.abs(wrap(x[0] - q[0] + Math.PI) - Math.PI), dv2 = Math.abs(wrap(x[1] - q[1] + Math.PI) - Math.PI);
-        if (Math.hypot(du2, dv2) < 1.5 * step) {
-          // 碰到的点按 q 所在的周期副本给出 (坐标连续), 延拓线就接到它上面
-          return [q[0] + (wrap(x[0] - q[0] + Math.PI) - Math.PI), q[1] + (wrap(x[1] - q[1] + Math.PI) - Math.PI)];
-        }
-      }
+  // 校正: 从 x 沿 ∇Ĵ 的 Newton 回到 Ĵ = 0; 总位移超过 lim 或不收敛 → null
+  const correct = (x, lim) => {
+    let u = x[0], v = x[1];
+    for (let it = 0; it < 12; it++) {
+      const j0 = J(u, v);
+      if (!Number.isFinite(j0)) return null;
+      const [gx, gy] = grad(u, v), g2 = gx * gx + gy * gy;
+      if (!(g2 > 0) || !Number.isFinite(g2)) return null;
+      const du = -j0 * gx / g2, dv = -j0 * gy / g2;
+      u += du; v += dv;
+      if (Math.hypot(u - x[0], v - x[1]) > lim) return null;
+      if (Math.hypot(du, dv) < 1e-13) break;
+    }
+    const j1 = J(u, v);
+    return Number.isFinite(j1) && Math.abs(j1) < 1e-9 ? [u, v] : null;
+  };
+  const tangent = (x, ref) => {
+    const [gx, gy] = grad(x[0], x[1]), l = Math.hypot(gx, gy);
+    if (!(l > 0)) return null;
+    let t = [-gy / l, gx / l];
+    if (t[0] * ref[0] + t[1] * ref[1] < 0) t = [-t[0], -t[1]];
+    return t;
+  };
+  // 已追的线: 线段按 (折回到一个周期内的) 格子哈希
+  const cell = 0.02, nc = Math.ceil(TWO / cell), wrap = a => a - TWO * Math.floor(a / TWO);
+  const hash = new Map();
+  const hk = (cu, cv) => ((cu % nc) + nc) % nc + ',' + ((cv % nc) + nc) % nc;
+  const addRun = run => { for (let i = 0; i + 1 < run.length; i++) {
+    const a = run[i], cu = Math.floor(wrap(a[0]) / cell), cv = Math.floor(wrap(a[1]) / cell), k = hk(cu, cv);
+    let l = hash.get(k); if (!l) hash.set(k, l = []); l.push([a, run[i + 1]]); } };
+  const nearTraced = (x, tol) => {
+    const cu = Math.floor(wrap(x[0]) / cell), cv = Math.floor(wrap(x[1]) / cell);
+    for (let du = -2; du <= 2; du++) for (let dv = -2; dv <= 2; dv++) for (const [a, b] of hash.get(hk(cu + du, cv + dv)) || []) {
+      const px = wd(x[0] - a[0]), py = wd(x[1] - a[1]), sx = b[0] - a[0], sy = b[1] - a[1], l2 = sx * sx + sy * sy;
+      const t = l2 > 0 ? Math.max(0, Math.min(1, (px * sx + py * sy) / l2)) : 0;
+      if (Math.hypot(px - t * sx, py - t * sy) < tol) return true;
+    }
+    return false;
+  };
+  const HMAX = 0.02, HMIN = 2e-6, COS_T = Math.cos(12 * Math.PI / 180), COS_E = Math.cos(4 * Math.PI / 180);
+  // 从 x0 沿 d0 走到头: 返回 { pts (不含 x0), closed }
+  // 跨过奇点: 梯度为零的点 (两条零线交叉, 或 Ĵ 的 0/0 点) 上 Newton 失效, 步长缩到底也过不去. 沿切线以上一步的
+  //   2 / 4 / 8 倍试跳, 校正后方向一致 (< 20°) 就算跨过去了, 沿原来那条线接着走 (文献里的 "try and resume").
+  //   跳到有效区外 = 奇点在边界上, 就停在这里.
+  const COS_J = Math.cos(20 * Math.PI / 180);
+  const hop = (x, dir, hLast) => {
+    for (const f of [2, 4, 8]) {
+      const hj = f * Math.max(hLast, 1e-3), y = correct([x[0] + hj * dir[0], x[1] + hj * dir[1]], 0.4 * hj);
+      if (!y) continue;
+      const sx = y[0] - x[0], sy = y[1] - x[1], sl = Math.hypot(sx, sy);
+      if (!(sl > 0.5 * hj) || sx * dir[0] + sy * dir[1] < COS_J * sl) continue;
+      const t = tangent(y, [sx, sy]);
+      if (t && t[0] * dir[0] + t[1] * dir[1] > COS_J) return ok(y) ? { y, t } : null;
     }
     return null;
   };
-  const grow = (run, ri, atEnd) => {
-    const n = run.length, iEnd = atEnd ? n - 1 : 0;
-    let a = run[iEnd], b = null;
-    // 方向取自往回第一个与端点不重合的点 (网格追线有时把端点重复写两次, 方向为零就不会延拓)
-    for (let k = 1; k < n && !b; k++) { const c = atEnd ? run[n - 1 - k] : run[k]; if (Math.hypot(c[0] - a[0], c[1] - a[1]) > 1e-9) b = c; }
-    if (!b) return [];
-    if (!validAt(P, m, fx, a[0], a[1], 1e-9)) return [];         // 段端本就落在有效性边上 (已二分过), 不是断头
-    const added = [];
-    for (let k = 0; k < maxSteps; k++) {
-      let dx = a[0] - b[0], dy = a[1] - b[1];
-      const dl = Math.hypot(dx, dy);
-      if (!(dl > 0)) break;
-      dx /= dl; dy /= dl;
-      const pr = [a[0] + step * dx, a[1] + step * dy];
-      const q = corr(pr);
-      if (!q || !ok(q)) {
-        // 下一步出了有效区 (或 Ĵ 在那边无定义): 在最后一个有效点与它之间二分到有效区边上 —
-        //   边界附近位置随余量呈 √ 变化, 停在整步上会差出约 2% 的距离
-        let lo = a, hi = q || pr;
-        for (let it = 0; it < 40; it++) {
-          const mm = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])], mc = corr(mm);
-          if (mc && ok(mc) && Math.hypot(mc[0] - mm[0], mc[1] - mm[1]) < Math.hypot(hi[0] - lo[0], hi[1] - lo[1])) lo = mc;
-          else if (ok(mm)) lo = mm; else hi = mm;
+  const march = (x0, d0) => {
+    const pts = [];
+    let x = x0, dir = d0, h = 0.005, run = 0, hLast = 0.005, hops = 0;
+    for (let n = 0; n < 6000; n++) {
+      const y = correct([x[0] + h * dir[0], x[1] + h * dir[1]], 0.6 * h);
+      const sx = y ? y[0] - x[0] : 0, sy = y ? y[1] - x[1] : 0, sl = Math.hypot(sx, sy);
+      if (!y || !(sl > 0.3 * h) || sx * dir[0] + sy * dir[1] < COS_T * sl) {
+        if ((h *= 0.5) < HMIN) {                                    // 奇点
+          const j = hops < 20 ? hop(x, dir, hLast) : null;
+          if (!j) return { pts, closed: false };
+          hops++; pts.push(j.y); x = j.y; dir = j.t; h = hLast;
         }
-        if (lo !== a) added.push(polishEnd(lo, P, m, fx));
-        break;
+        continue;
       }
-      const hit = hits(q, ri, iEnd, n);
-      if (hit) { added.push(hit); break; }                 // 碰到已有的段: 接上去 (零线在这里闭合或与别段相连), 不留悬空的端
-      added.push(q); b = a; a = q;
+      hLast = h;
+      if (!ok(y)) {                                                 // 出有效区: 二分到边上, 再解精确交点
+        let lo = x, hi = y;
+        for (let it = 0; it < 40; it++) {
+          const mm = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])], span = Math.hypot(hi[0] - lo[0], hi[1] - lo[1]);
+          const mc = correct(mm, span) || mm;
+          if (ok(mc)) lo = mc; else hi = mc;
+        }
+        if (lo !== x) pts.push(polishEnd(lo, P, m, fx));
+        return { pts, closed: false };
+      }
+      run += sl;
+      // 闭合: 这一步的线段掠过起点
+      if (run > 4 * HMAX) {
+        const px = wd(x0[0] - x[0]), py = wd(x0[1] - x[1]), t = Math.max(0, Math.min(1, (px * sx + py * sy) / (sl * sl)));
+        if (Math.hypot(px - t * sx, py - t * sy) < 1e-4 * Math.max(1, sl / 1e-3)) { pts.push([x[0] + px, x[1] + py]); return { pts, closed: true }; }
+      }
+      pts.push(y);
+      const t = tangent(y, [sx, sy]);
+      if (!t) return { pts, closed: false };
+      if (sx * dir[0] + sy * dir[1] > COS_E * sl && t[0] * dir[0] + t[1] * dir[1] > COS_E) h = Math.min(HMAX, 1.5 * h);
+      x = y; dir = t;
     }
-    return added;
+    return { pts, closed: false };
   };
-  return runs.map((run, ri) => {
-    if (run.length < 2) return run;
-    const tail = grow(run, ri, true), head = grow(run, ri, false);
-    return head.reverse().concat(run, tail);
-  });
-}
-
-// 修正版 (显示) 的焦散段端: 原版用宽容差 (1e-4) 判有效, 防止数值噪声把段打断, 但段端因此冲出真正边界
-//   (边界附近位置随参数呈 √ 变化, 1e-4 的余量对应约 1% 的距离, 20 m 处 0.2 m, 层曲线就越过边界线).
-//   这里只修段端: 两端严格无效的点剪掉, 再在最后一个严格有效点与它之间二分 (中点用 corr 拉回曲线) 到精确边界.
-function trimRunsStrict(runs, P, m, fx, corr) {
-  const ok = x => validAt(P, m, fx, x[0], x[1], 1e-9);
-  const edge = (a, b) => {            // a 有效, b 无效
-    let lo = a, hi = b;
-    for (let it = 0; it < 40; it++) { const mm = corr(lo, hi); if (ok(mm)) lo = mm; else hi = mm; }
-    return lo;
+  const runs = [];
+  const trace = s0 => {
+    const t0 = tangent(s0, [1, 0]);
+    if (!t0) return;
+    const f = march(s0, t0);
+    let run;
+    if (f.closed) run = [s0, ...f.pts];
+    else {
+      const b = march(s0, [-t0[0], -t0[1]]);
+      run = b.pts.reverse().concat([s0], f.pts);
+    }
+    if (run.length >= 2) { runs.push(run); addRun(run); }
   };
-  const out = [];
-  for (const run of runs) {
-    let i0 = 0, i1 = run.length - 1;
-    while (i0 <= i1 && !ok(run[i0])) i0++;
-    while (i1 >= i0 && !ok(run[i1])) i1--;
-    if (i1 < i0) continue;
-    const r = run.slice(i0, i1 + 1);
-    if (i0 > 0) r.unshift(polishEnd(edge(run[i0], run[i0 - 1]), P, m, fx));
-    if (i1 < run.length - 1) r.push(polishEnd(edge(run[i1], run[i1 + 1]), P, m, fx));
-    if (r.length >= 2) out.push(r);
-  }
-  return out;
+  // 种子: 格边上 J 变号处 (二分到边上的根, 再拉回 Ĵ = 0)
+  const seedOn = (ua, va, fa, ub, vb, fb) => {
+    if (!(fa * fb < 0)) return;
+    let lo = 0, hi = 1, flo = fa;
+    for (let it = 0; it < 40; it++) {
+      const md = 0.5 * (lo + hi), fv = jana3(ua + (ub - ua) * md, va + (vb - va) * md, m, fx, P);
+      if (!Number.isFinite(fv)) return;
+      if (flo * fv <= 0) hi = md; else { lo = md; flo = fv; }
+    }
+    const x = [ua + (ub - ua) * lo, va + (vb - va) * lo];
+    if (!ok(x) || nearTraced(x, 2e-3)) return;
+    const y = correct(x, 0.01);
+    if (y && ok(y) && !nearTraced(y, 2e-3)) trace(y);
+  };
+  for (let iw = 0; iw < nGrid; iw++)
+    for (let isc = 0; isc < nGrid; isc++) {
+      const f0 = Fg[iw * nGrid + isc];
+      if (!Number.isFinite(f0)) continue;
+      if (isc + 1 < nGrid) seedOn(SCs[isc], SWs[iw], f0, SCs[isc + 1], SWs[iw], Fg[iw * nGrid + isc + 1]);
+      if (iw + 1 < nGrid) seedOn(SCs[isc], SWs[iw], f0, SCs[isc], SWs[iw + 1], Fg[(iw + 1) * nGrid + isc]);
+    }
+  // 比一格还小的闭环 (有效区在 h 的极值附近收缩时, 焦散缩成一个小圈, 格边上不变号): 从 |J| 的局部极小出发,
+  //   Newton 能在一格之内走到 Ĵ = 0 就以它为种子
+  for (let iw = 1; iw + 1 < nGrid; iw++)
+    for (let isc = 1; isc + 1 < nGrid; isc++) {
+      const f0 = Fg[iw * nGrid + isc];
+      if (!Number.isFinite(f0)) continue;
+      let minimal = true, spread = 0;
+      for (let a = -1; a <= 1 && minimal; a++) for (let c = -1; c <= 1; c++) {
+        if (!a && !c) continue;
+        const f = Fg[(iw + a) * nGrid + isc + c];
+        if (!Number.isFinite(f) || f * f0 <= 0 || Math.abs(f) <= Math.abs(f0)) { minimal = false; break; }
+        spread = Math.max(spread, Math.abs(f - f0));
+      }
+      if (!minimal || Math.abs(f0) > spread) continue;
+      const x = [SCs[isc], SWs[iw]], y = correct(x, 1.5 * Math.max(dX, dY));
+      if (y && ok(y) && !nearTraced(y, 2e-3)) trace(y);
+    }
+  return runs;
 }
 
 // 中点校正: 焦散 = 沿 ∇J 的 Newton 回到 J=0 (步长受限, 跑远了就用线性中点); 篱笆曲线 = 线性中点 (取样本身很密)
@@ -1164,7 +1157,7 @@ export function lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, 
       coneMapRuns(caus, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, curves);
       if (fine) {                                   // 修正版曲线 (显示); 采样点仍是原窗体的
         const fc = [], corr = midCorrector(P, m, fx, surfId === 'caustic');
-        const fr = surfId === 'caustic' ? trimRunsStrict(extendRunsJ(splitRetrace(caus), P, m, fx), P, m, fx, corr) : fenceRuns(lpFaces, m, fx, surfId, true);
+        const fr = surfId === 'caustic' ? traceCausticFine(P, m, fx, nGrid) : fenceRuns(lpFaces, m, fx, surfId, true);
         coneMapRunsFine(fr, hDeg, m, fx, P, L, [0, 0, eyeHeight], maxDist, corr, fc, surfId === 'caustic');
         layers.push({ curves: fc, verts: Float32Array.from(verts) });
       } else layers.push({ curves, verts: Float32Array.from(verts) });
@@ -1183,7 +1176,7 @@ export function parallelArc2Dof(lpFaces, lampElev, eyeHeight, nGrid, zetaFree, f
     let runs = surfId === 'caustic' ? sliceRuns2Dof(P, m, fx, nGrid) : fenceRuns(lpFaces, m, fx, surfId, fine);
     if (fine) {
       const corr = midCorrector(P, m, fx, surfId === 'caustic');
-      if (surfId === 'caustic') runs = trimRunsStrict(extendRunsJ(splitRetrace(runs), P, m, fx), P, m, fx, corr);
+      if (surfId === 'caustic') runs = traceCausticFine(P, m, fx, nGrid);
       for (const run of runs) {
         const mapAt = x => {
           if (!validAt(P, m, fx, x[0], x[1], 1e-4)) return null;
@@ -1253,8 +1246,7 @@ export function _debugCausticRuns(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg
   setSun(hDeg);
   try {
     const raw = sliceRuns2Dof(P, m, fx, nGrid);
-    const ext = extendRunsJ(splitRetrace(raw), P, m, fx);
-    const fin = trimRunsStrict(ext, P, m, fx, midCorrector(P, m, fx, true));
+    const fin = traceCausticFine(P, m, fx, nGrid), ext = fin;
     const info = x => { const c = Chain3(x[0], x[1], m, fx, P); return { x, g0: c.g0, mE: -SqK - c.qE, qs: Array.from(c.qs || []), J: jana3(x[0], x[1], m, fx, P) }; };
     return { raw, ext, fin, info, m, fx, P };
   } finally { setSun(keep); }
@@ -1300,7 +1292,7 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
     for (let hs = -88; hs <= 88; hs += 2) {
       if (cancelled && cancelled()) break;
       setSun(hs);
-      const runs = trimRunsStrict(extendRunsJ(splitRetrace(sliceRuns2Dof(P, m, fx, Math.min(nGrid, 71))), P, m, fx), P, m, fx, corr);   // 种子只要大致位置, 粗网格即可
+      const runs = traceCausticFine(P, m, fx, Math.min(nGrid, 71));   // 种子只要大致位置, 粗网格即可
       for (const run of runs) for (const x of [run[0], run[run.length - 1]]) {
         setSun(hs);
         const mg = marginsAt(x[0], x[1], P, m, fx);
