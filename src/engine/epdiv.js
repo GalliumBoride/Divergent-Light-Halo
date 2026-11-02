@@ -915,30 +915,81 @@ function polishEnd(x, P, m, fx) {
 
 // 修正版 (显示): 网格追线在有效区边上有时走到头又原路折回 (同一段零线走两遍, 首尾相接成"闭环"), 两个真端点都丢了.
 //   在急转 (> 150°) 处切开, 再丢掉逐点贴着另一段倒着走的重复段.
+//   折回不一定留在同一段里: 去程与回程常被有效性剪成两段 (A→边, 边→A), 各自都不闭合, 只看单段的闭合折回会漏掉 —
+//   漏掉的后果是两段在 A 处首尾相接, 延拓一出门就"碰到已有的段"而停, 层曲线停在 A (离真正的边界差零点几米到一米),
+//   相邻层有的停有的不停, 放大看参差不齐. 所以对所有段: 先在急转处 (> 150°) 切开, 再按长度从长到短,
+//   丢掉被已保留的段整段覆盖 (逐点距离 < tol) 的那些; 同一段里留下的相邻小段再接回去.
 function splitRetrace(runs) {
-  const out = [];
-  for (const run of runs) {
+  const TWO = 2 * Math.PI, wd = a => a - TWO * Math.round(a / TWO);   // 周期坐标的差
+  const tol = 0.01;                                   // 折回的那一趟与去程相距不到一格 (网格 3.6°) 的零头
+  const covered = (pc, by) => pc.every(x => { for (let j = 0; j + 1 < by.length; j++) {
+    const a = by[j], ax = wd(x[0] - a[0]), ay = wd(x[1] - a[1]), dx = wd(by[j + 1][0] - a[0]), dy = wd(by[j + 1][1] - a[1]), l2 = dx * dx + dy * dy;
+    const t = l2 > 0 ? Math.max(0, Math.min(1, (ax * dx + ay * dy) / l2)) : 0;
+    if (Math.hypot(ax - t * dx, ay - t * dy) < tol) return true; } return false; });
+  const arc = r => { let s = 0; for (let i = 1; i < r.length; i++) s += Math.hypot(wd(r[i][0] - r[i - 1][0]), wd(r[i][1] - r[i - 1][1])); return s; };
+  // 先理顺次序: 一格里两个交点的先后有时排反 (…→3→4→5→6 里 4 跑到 5 前头), 成一个"之"字 — 4、5 两处都急转,
+  //   中间那一步短, 之后照原方向继续. 这不是折回 (折回只转一次, 之后一直往回走), 在这里切开会把一条线断成两截:
+  //   把这两个点换回来.
+  const sharp = (r, i) => {
+    const ax = r[i][0] - r[i - 1][0], ay = r[i][1] - r[i - 1][1], bx = r[i + 1][0] - r[i][0], by = r[i + 1][1] - r[i][1];
+    const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+    return la > 1e-12 && lb > 1e-12 && (ax * bx + ay * by) < -0.866 * la * lb;
+  };
+  const unzig = run => {
+    const r = run.slice();
+    for (let i = 1; i + 2 < r.length; i++)
+      if (sharp(r, i) && sharp(r, i + 1) && Math.hypot(r[i + 1][0] - r[i][0], r[i + 1][1] - r[i][1]) < 0.1) {
+        const t = r[i]; r[i] = r[i + 1]; r[i + 1] = t; i++;
+      }
+    return r;
+  };
+  runs = runs.map(unzig);
+  // 每段切成小段 (记下原段号与次序). 切点: 急转 (原路折回), 以及"走回自己走过的地方" — 零线上有鞍点 (X 形交叉) 时,
+  //   网格追线在那一格每次选的走法不一样, 会把一个闭环绕两三圈才从交叉处拐出去 (各圈交点略有不同, 判不出闭合);
+  //   起点只是闭环上随便一点, 延拓一出门就碰到后几圈, 层曲线停在半空. 在每次绕回处切开, 重复的圈由下面的覆盖判定丢掉.
+  const pieces = [];
+  runs.forEach((run, ri) => {
     const cuts = [0];
+    const hash = new Map(), cell = tol, key = (a, b) => Math.floor(a / cell) + ',' + Math.floor(b / cell);
+    const nearEarlier = i => {
+      const x = run[i], cu = Math.floor(x[0] / cell), cv = Math.floor(x[1] / cell);
+      for (let du = -1; du <= 1; du++) for (let dv = -1; dv <= 1; dv++) {
+        for (const j of hash.get((cu + du) + ',' + (cv + dv)) || [])
+          if (i - j > 12 && Math.hypot(run[j][0] - x[0], run[j][1] - x[1]) < tol) return true;
+      }
+      return false;
+    };
+    let wasNear = false;
     for (let i = 1; i + 1 < run.length; i++) {
       const ax = run[i][0] - run[i - 1][0], ay = run[i][1] - run[i - 1][1], bx = run[i + 1][0] - run[i][0], by = run[i + 1][1] - run[i][1];
       const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+      const near = i + 2 < run.length && nearEarlier(i);
       if (la > 1e-12 && lb > 1e-12 && (ax * bx + ay * by) < -0.866 * la * lb) cuts.push(i);
+      else if (near && !wasNear) cuts.push(i);
+      wasNear = near;
+      const k = key(run[i - 1][0], run[i - 1][1]);
+      let a = hash.get(k); if (!a) hash.set(k, a = []); a.push(i - 1);
     }
-    const closed = run.length > 3 && Math.hypot(run[0][0] - run[run.length - 1][0], run[0][1] - run[run.length - 1][1]) < 1e-9;
-    if (cuts.length === 1 || !closed) { out.push(run); continue; }
     cuts.push(run.length - 1);
-    const pieces = [];
-    for (let k = 0; k + 1 < cuts.length; k++) pieces.push(run.slice(cuts[k], cuts[k + 1] + 1));
-    const tol = 0.01;                                   // 折回的那一趟与去程相距不到一格 (网格 3.6°) 的零头
-    const covered = (pc, by) => pc.every(x => by.some(y => Math.hypot(x[0] - y[0], x[1] - y[1]) < tol)) ||
-      pc.every(x => { for (let j = 0; j + 1 < by.length; j++) { const a = by[j], b = by[j + 1], dx = b[0] - a[0], dy = b[1] - a[1], l2 = dx * dx + dy * dy;
-        const t = l2 > 0 ? Math.max(0, Math.min(1, ((x[0] - a[0]) * dx + (x[1] - a[1]) * dy) / l2)) : 0;
-        if (Math.hypot(x[0] - a[0] - t * dx, x[1] - a[1] - t * dy) < tol) return true; } return false; });
-    const keep = [];
-    for (const pc of pieces) if (pc.length >= 2 && !keep.some(k => covered(pc, k))) keep.push(pc);
-    // 只有确实丢掉了重复段 (原路折回) 才切; 否则是正常的闭合零线, 原样保留
-    if (keep.length < pieces.filter(pc => pc.length >= 2).length) out.push(...keep); else out.push(run);
-  }
+    for (let k = 0; k + 1 < cuts.length; k++) {
+      const pc = run.slice(cuts[k], cuts[k + 1] + 1);
+      if (pc.length >= 2) pieces.push({ ri, k, pc, len: arc(pc), keep: false });
+    }
+  });
+  const order = pieces.slice().sort((a, b) => b.len - a.len), kept = [];
+  for (const p of order) if (!kept.some(q => covered(p.pc, q.pc))) { p.keep = true; kept.push(p); }
+  const out = [];
+  runs.forEach((run, ri) => {
+    const mine = pieces.filter(p => p.ri === ri);
+    if (mine.every(p => p.keep)) { if (run.length >= 2) out.push(run); return; }   // 没有重复: 原样 (含正常的闭合零线)
+    let cur = null, lastK = -2;
+    for (const p of mine) {
+      if (!p.keep) { if (cur) out.push(cur); cur = null; continue; }
+      if (cur && p.k === lastK + 1) cur = cur.concat(p.pc.slice(1)); else { if (cur) out.push(cur); cur = p.pc.slice(); }
+      lastK = p.k;
+    }
+    if (cur) out.push(cur);
+  });
   return out;
 }
 
@@ -947,7 +998,9 @@ function splitRetrace(runs) {
 //   从段端沿零线切向走小步 (预测) + 沿 ∇J 的 Newton 拉回 J=0 (校正), 直到链失效, 再交给 trimRunsStrict 二分到精确端点.
 function extendRunsJ(runs, P, m, fx, step = 0.004, maxSteps = 120) {
   const J = jHat(m, fx, P);
-  const ok = x => validAt(P, m, fx, x[0], x[1], 1e-4);
+  // 出射余量 < 1e-6 就算到了出射临界边: 有的光路 J 在这条边上并不发散, Ĵ = J·√余量 在整条边上都是 0,
+  //   Newton 会被拉到边上, 延拓沿着出射临界边滑出去 (一圈回到起点, 成了一段假焦散)
+  const ok = x => validAt(P, m, fx, x[0], x[1], 1e-4) && -SqK - Chain3(x[0], x[1], m, fx, P).qE > 1e-6;
   const corr = x => {
     let u = x[0], v = x[1];
     for (let it = 0; it < 8; it++) {
