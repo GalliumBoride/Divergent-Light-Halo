@@ -836,28 +836,30 @@ function marginsAt(u, v, P, m, fx) {
   return out;
 }
 // 解 Ĵ = 0 且 第 k 个余量 = 0 (焦散与有效区边的交点), 从 x0 出发; 失败返回 null. 用当前 LP 太阳.
-function edgeNewton(x0, k, P, m, fx, maxMove = 0.05) {
+function edgeNewton(x0, k, P, m, fx, maxMove = 0.05, target = 1e-6) {
   const Jh = jHat(m, fx, P);
   // 目标余量 1e-6 而不是 0: 焦散在出射临界边旁几乎是贴着边走的, 正好在边上的交点病态; 余量 1e-6 处交点良态,
   //   离真正的边只差约 1/1000 的距离 (20 m 处 2 cm)
-  const F = (u, v) => [Jh(u, v), marginsAt(u, v, P, m, fx)[k] - 1e-6];
+  const F = (u, v) => [Jh(u, v), marginsAt(u, v, P, m, fx)[k] - target];
   let u = x0[0], v = x0[1];
   // 起点可能已在有效区外 (h 一变, 边界就挪过来了; 那边 Ĵ 无定义): 先沿该余量的梯度把它推回到余量 2e-6 处 (余量两边都有定义)
   for (let it = 0; it < 20; it++) {
     const mk = marginsAt(u, v, P, m, fx)[k];
     if (!Number.isFinite(mk)) return null;
-    if (mk >= 1e-6 && Number.isFinite(Jh(u, v))) break;
+    if (mk >= target && Number.isFinite(Jh(u, v))) break;
     const e = 1e-7, gu = (marginsAt(u + e, v, P, m, fx)[k] - mk) / e, gv = (marginsAt(u, v + e, P, m, fx)[k] - mk) / e, g2 = gu * gu + gv * gv;
     if (!(g2 > 0) || !Number.isFinite(g2)) return null;
-    const t = (2e-6 - mk) / g2;
+    const t = (2 * target - mk) / g2;
     u += t * gu; v += t * gv;
   }
-  for (let it = 0; it < 30; it++) {
+  // 差分步长: 出射临界边旁 Ĵ 随余量呈 √ 变化, 步长得远小于目标余量, 否则雅可比估不准 (Newton 退化成线性收敛甚至不收敛)
+  const eps = k === 1 ? Math.max(1e-11, Math.min(1e-7, 2e-3 * target)) : 1e-7;
+  for (let it = 0; it < 40; it++) {
     const f = F(u, v);
     if (!f.every(Number.isFinite)) return null;
-    if (Math.abs(f[0]) < 1e-10 && Math.abs(f[1]) < 1e-12) break;
+    if (Math.abs(f[0]) < 1e-10 && Math.abs(f[1]) < 1e-3 * target) break;
     // 差分: 贴着边界, 向外一侧可能已无定义, 就改用向内一侧
-    const diff = (du, dv) => { for (const e of [1e-7, -1e-7]) { const g = F(u + du * e, v + dv * e); if (g.every(Number.isFinite)) return [(g[0] - f[0]) / e, (g[1] - f[1]) / e]; } return null; };
+    const diff = (du, dv) => { for (const e of [eps, -eps]) { const g = F(u + du * e, v + dv * e); if (g.every(Number.isFinite)) return [(g[0] - f[0]) / e, (g[1] - f[1]) / e]; } return null; };
     const gu = diff(1, 0), gv = diff(0, 1);
     if (!gu || !gv) return null;
     const a = gu[0], b = gv[0], c = gu[1], d = gv[1];
@@ -870,14 +872,34 @@ function edgeNewton(x0, k, P, m, fx, maxMove = 0.05) {
     let ok = false;
     for (let bt = 0; bt < 40 && !ok; bt++) {
       const g = F(u + du, v + dv);
-      if (g.every(Number.isFinite) && g[1] > -0.9e-6) ok = true; else { du *= 0.5; dv *= 0.5; }
+      if (g.every(Number.isFinite) && g[1] > -0.9 * target) ok = true; else { du *= 0.5; dv *= 0.5; }
     }
     if (!ok) return null;
     u += du; v += dv;
   }
   const f = F(u, v);
-  if (!(Math.abs(f[0]) < 1e-6 && Math.abs(f[1]) < 1e-8) || Math.hypot(u - x0[0], v - x0[1]) > maxMove) return null;
+  if (!(Math.abs(f[0]) < 1e-6 && Math.abs(f[1]) < 1e-2 * target) || Math.hypot(u - x0[0], v - x0[1]) > maxMove) return null;
   return validAt(P, m, fx, u, v, 1e-7) ? [u, v] : null;
+}
+
+// 焦散与有效区边的精确交点.
+//   出射临界边 (k=1, 全反射临界) 旁, 出射方向随余量呈 √ 变化: 正好在边上 (余量 0) 解是病态的, 停在余量 1e-6 又差 0.15°
+//   (天上看得出, 三维里就是贴着精确边界的第二条线). 做法: 在余量 4e-6 / 1e-6 / 2.5e-7 各解一次,
+//   以 σ = √余量 为自变量二次外推到 σ = 0 — 与 HaloEP 末端点 (焦散∩出射) 一致到 1e-12.
+//   其它约束旁是光滑的, 直接解到余量 1e-10.
+function edgeExact(x0, k, P, m, fx, maxMove = 0.05) {
+  if (k !== 1) return edgeNewton(x0, k, P, m, fx, maxMove, 1e-10);
+  const tg = [4e-6, 1e-6, 2.5e-7], xs = [];
+  let seed = x0;
+  for (const t of tg) {
+    const y = edgeNewton(seed, k, P, m, fx, maxMove, t);
+    if (edgeExact.stat) edgeExact.stat[t] = (edgeExact.stat[t] || 0) + (y ? 0 : 1);
+    if (!y) return null;
+    xs.push(y); seed = y;
+  }
+  const [s1, s2, s3] = tg.map(Math.sqrt);
+  const w1 = s2 * s3 / ((s1 - s2) * (s1 - s3)), w2 = s1 * s3 / ((s2 - s1) * (s2 - s3)), w3 = s1 * s2 / ((s3 - s1) * (s3 - s2));
+  return [w1 * xs[0][0] + w2 * xs[1][0] + w3 * xs[2][0], w1 * xs[0][1] + w2 * xs[1][1] + w3 * xs[2][1]];
 }
 
 // 焦散段端点抛光: 端点 = 焦散 (Ĵ=0) 与当前最紧的有效约束的交点. 二分只能把点放在一条弦上,
@@ -888,7 +910,7 @@ function polishEnd(x, P, m, fx) {
   let k = 0;
   for (let i = 1; i < m0.length; i++) if (m0[i] < m0[k]) k = i;
   if (m0[k] > 0.05) return x;                          // 离任何约束都远: 不是有效区边上的端点
-  return edgeNewton(x, k, P, m, fx) || x;
+  return edgeExact(x, k, P, m, fx) || x;
 }
 
 // 修正版 (显示): 网格追线在有效区边上有时走到头又原路折回 (同一段零线走两遍, 首尾相接成"闭环"), 两个真端点都丢了.
@@ -960,10 +982,13 @@ function extendRunsJ(runs, P, m, fx, step = 0.004, maxSteps = 120) {
         if (a[j] === ri && Math.abs(a[j + 1] - iEnd) < Math.min(12, n - 1)) continue;   // 自己端点附近的点不算
         const x = runs[a[j]][a[j + 1]];
         const du2 = Math.abs(wrap(x[0] - q[0] + Math.PI) - Math.PI), dv2 = Math.abs(wrap(x[1] - q[1] + Math.PI) - Math.PI);
-        if (Math.hypot(du2, dv2) < 1.5 * step) return true;
+        if (Math.hypot(du2, dv2) < 1.5 * step) {
+          // 碰到的点按 q 所在的周期副本给出 (坐标连续), 延拓线就接到它上面
+          return [q[0] + (wrap(x[0] - q[0] + Math.PI) - Math.PI), q[1] + (wrap(x[1] - q[1] + Math.PI) - Math.PI)];
+        }
       }
     }
-    return false;
+    return null;
   };
   const grow = (run, ri, atEnd) => {
     const n = run.length, iEnd = atEnd ? n - 1 : 0;
@@ -992,7 +1017,8 @@ function extendRunsJ(runs, P, m, fx, step = 0.004, maxSteps = 120) {
         if (lo !== a) added.push(polishEnd(lo, P, m, fx));
         break;
       }
-      if (hits(q, ri, iEnd, n)) break;
+      const hit = hits(q, ri, iEnd, n);
+      if (hit) { added.push(hit); break; }                 // 碰到已有的段: 接上去 (零线在这里闭合或与别段相连), 不留悬空的端
       added.push(q); b = a; a = q;
     }
     return added;
@@ -1243,11 +1269,14 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
     // 投影: 两支, 中点在中间 h 重解, 与边界线同一套加密
     const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
     for (const tk of tracks) {
-      const samples = tk.hs.map((h, i) => ({ h, x: tk.xs[i] }));
+      // 延拓在余量 1e-6 上做 (稳), 画出来的点用精确交点 (edgeExact)
+      //   (外推的几个 Newton 偶尔解不出, 就用余量 1e-6 的点顶上, 只差 0.15°, 不留缺口)
+      const exact = (h, x6) => { setSun(h); return edgeExact(x6, tk.k, P, m, fx) || x6; };
+      const samples = tk.hs.map((h, i) => ({ h, x: exact(h, tk.xs[i]), x6: tk.xs[i] }));
       const mid = (a, b) => {
         const h = 0.5 * (a.h + b.h);
-        const x = solveAt(h, [0.5 * (a.x[0] + b.x[0]), 0.5 * (a.x[1] + b.x[1])], tk.k, 0.05);
-        return x ? { h, x } : null;
+        const x6 = solveAt(h, [0.5 * (a.x6[0] + b.x6[0]), 0.5 * (a.x6[1] + b.x6[1])], tk.k, 0.05);
+        return x6 ? { h, x: exact(h, x6), x6 } : null;
       };
       const cache = new Map();
       const sky = s0 => {
@@ -1269,4 +1298,4 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
   return out;
 }
 
-export const _dbg = { edgeNewton, marginsAt, jHat };
+export const _dbg = { edgeNewton, marginsAt, jHat, edgeExact };
