@@ -311,21 +311,32 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
     };
     // 灯仰角 (从眼看) 附近锥映射的有效性变得极快 (晶体贴到灯或眼上), 有效窗口可能比 0.5° 的 h 步还窄, 两端都无效就整段漏掉:
     // 距它 1° 以内的 h 间隔再插 8 个样本 (以邻点为种子重解)
+    // 弧长延拓的轨迹 (tk.ys): 中间点取在弦上该处垂直于弦的超平面与曲线的交点 (h 不单调、跨折叠也对)
+    const RAD = Math.PI / 180, arc = !!tk.ys;
+    const fromY = y => ({ h: y[0] / RAD, sol: y.slice(1), y });
     const samples = [];
     for (let i = 0; i < tk.hs.length; i++) {
-      samples.push({ h: tk.hs[i], sol: tk.sols[i] });
+      samples.push(arc ? fromY(tk.ys[i]) : { h: tk.hs[i], sol: tk.sols[i] });
       if (i + 1 < tk.hs.length && tk.slv) {
         const ha = tk.hs[i], hb = tk.hs[i + 1];
         if (Math.min(Math.abs(ha - hSing), Math.abs(hb - hSing)) < 1.0 || (ha - hSing) * (hb - hSing) < 0) {
           let seed = tk.sols[i];
           for (let k = 1; k < 8; k++) {
+            if (arc) { const y = arcMid(tk.arcF, tk.ys[i], tk.ys[i + 1], k / 8, tk.arcOpt); if (y) samples.push(fromY(y)); continue; }
             const hk = ha + (hb - ha) * k / 8, sk = tk.slv(hk, seed);
             if (sk) { samples.push({ h: hk, sol: sk }); seed = sk; }
           }
         }
       }
     }
-    const mid = (a, b) => {
+    // 超平面校正解不出时退回定 h 求解 (两端 h 不同 ⟹ 中间没有折叠)
+    const mid = arc ? (a, b) => {
+      const y = arcMid(tk.arcF, a.y, b.y, 0.5, tk.arcOpt);
+      if (y) return fromY(y);
+      if (a.h === b.h || !tk.slv) return null;
+      const h = 0.5 * (a.h + b.h), sol = tk.slv(h, a.sol);
+      return sol ? fromY([h * RAD, ...sol]) : null;
+    } : (a, b) => {
       const h = 0.5 * (a.h + b.h);
       const sol = tk.slv ? tk.slv(h, a.sol) : null;
       return sol ? { h, sol } : null;
@@ -345,6 +356,142 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
     const smp = insertFolds(samples, foldAt, mid, 24);
     for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], mid, Lden, 9, 24, sag));
   }
+}
+
+// ------------------------------------------------------------------ 伪弧长延拓 (修正版轨迹用)
+// 边界线 = (h, 取向) 空间里的一条曲线 F(y) = 0 (y ∈ Rⁿ, n−1 个方程, y[0] = h 的弧度). 按 h 一步步走 (自然参数延拓)
+//   到 h 方向的折叠点 (两个解汇合、dh/ds = 0) 就走不下去: 折叠另一侧那一支丢了, 停下的端点也只准到 √(h 的二分精度).
+//   这里把 h 当未知数之一, 沿弧长走 (Keller): 预测 = 沿切线 (雅可比的零向量) 走一步; 校正 = Newton 解
+//   [F(y) = 0; t·(y − y预测) = 0], 即拉回曲线且落在过预测点、垂直切线的超平面上. 折叠处切线垂直于 h 轴, 照走不误, h 自然折返.
+//   步长按校正量与转角自适应; 出界 (opt.valid 不过 / F 无定义) 就减半, 减到 sMin 为止 (= 精确到 sMin 的端点).
+
+// n×n 线性方程 (部分主元消去), 奇异返回 null
+function solveN(A, b) {
+  const n = b.length, M = A.map((r, i) => [...r, b[i]]);
+  for (let c = 0; c < n; c++) {
+    let pr = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[pr][c])) pr = r;
+    if (!(Math.abs(M[pr][c]) > 1e-300)) return null;
+    [M[c], M[pr]] = [M[pr], M[c]];
+    for (let r = c + 1; r < n; r++) { const f = M[r][c] / M[c][c]; for (let k = c; k <= n; k++) M[r][k] -= f * M[c][k]; }
+  }
+  const x = new Array(n);
+  for (let r = n - 1; r >= 0; r--) { let v = M[r][n]; for (let k = r + 1; k < n; k++) v -= M[r][k] * x[k]; x[r] = v / M[r][r]; }
+  return x.every(Number.isFinite) ? x : null;
+}
+const dotN = (a, b) => { let v = 0; for (let i = 0; i < a.length; i++) v += a[i] * b[i]; return v; };
+const nrmN = a => Math.sqrt(dotN(a, a));
+// 差分雅可比 ((n−1)×n); 一侧无定义 (贴着有效区边) 就用另一侧. fwd: 前向差分 (n 次求值而不是 2n; 光滑的 F 够用)
+function jacN(F, y, f0, e, fwd = false) {
+  const n = y.length, J = f0.map(() => new Array(n));
+  for (let j = 0; j < n; j++) {
+    const yp = y.slice(), ym = y.slice(); yp[j] += e; ym[j] -= e;
+    const fp = F(yp), fm = fwd && fp ? null : F(ym);
+    for (let i = 0; i < f0.length; i++) {
+      if (fp && fm) J[i][j] = (fp[i] - fm[i]) / (2 * e);
+      else if (fp) J[i][j] = (fp[i] - f0[i]) / e;
+      else if (fm) J[i][j] = (f0[i] - fm[i]) / e;
+      else return null;
+    }
+  }
+  return J;
+}
+// (n−1)×n 矩阵的零向量 (广义叉积: 第 j 分量 = (−1)^j · 去掉第 j 列的行列式), 单位化
+function nullVec(J) {
+  const n = J[0].length, det = M => {
+    if (M.length === 1) return M[0][0];
+    let d = 0;
+    for (let c = 0; c < M.length; c++) d += (c % 2 ? -1 : 1) * M[0][c] * det(M.slice(1).map(r => r.filter((_, k) => k !== c)));
+    return d;
+  };
+  const t = [];
+  for (let j = 0; j < n; j++) t.push((j % 2 ? -1 : 1) * det(J.map(r => r.filter((_, k) => k !== j))));
+  const l = nrmN(t);
+  return l > 0 && Number.isFinite(l) ? t.map(v => v / l) : null;
+}
+// 校正: 从 y0 出发解 [F(y) = 0; nv·y = c]. 返回 { y, t (切线) } 或 null.
+//   y0 取曲线上已有的点 (而不是预测点/弦中点): 曲线贴着有效区的弯边走时 (外缘就在出射临界边内 1e-6), 切线上的预测点
+//   或弦中点会落到边外 (F 无定义); 从曲线点出发, Newton 第一步沿切线移向超平面, 出界还能回溯
+//   opt.stall: 残差 (以容差为单位) 连续两次迭代没降就放弃 —— 预测点离曲线太远时 Newton 方向一再指向域外, 回溯把步长压到 0
+//   原地空转, 不如早点失败让外层减步长 (末端点轨迹上这类空转曾占延拓时间的大半). 外缘贴着出射临界边 (√ 病态), Newton 本来就
+//   收敛得慢, 不用这条.
+function arcSolve(F, y0, nv, opt, c = dotN(nv, y0)) {
+  let y = y0.slice(), r1 = Infinity, r2 = Infinity;
+  for (let it = 0; it < 30; it++) {
+    const f = F(y);
+    if (!f) return null;
+    const g = dotN(nv, y) - c, rn = Math.max(...f.map((v, i) => Math.abs(v) / opt.tol[i]), Math.abs(g) / 1e-12);
+    if (opt.stall && it >= 2 && rn > 0.9 * r2) return null;
+    r2 = r1; r1 = rn;
+    const J = jacN(F, y, f, opt.eps, opt.fwd);
+    if (!J) return null;
+    if (rn < 1) {
+      const t = nullVec(J);
+      return t && opt.valid(y) ? { y, t } : null;
+    }
+    let d = solveN([...J, nv], [...f.map(v => -v), -g]);
+    if (!d) return null;
+    const dl = nrmN(d);
+    if (dl > opt.maxCorr) d = d.map(v => v * opt.maxCorr / dl);
+    // 回溯: 一步跨出 F 的定义域 (出射临界边外 Ĵ 无定义) 就减半
+    let bt = 0;
+    for (; bt < 40 && !F(y.map((v, i) => v + d[i])); bt++) d = d.map(v => 0.5 * v);
+    if (bt === 40) return null;
+    y = y.map((v, i) => v + d[i]);
+  }
+  return null;
+}
+// 周期坐标 (opt.wrap 里的下标, 周期 2π) 折回后的差 a − b
+function arcDiff(a, b, wrap) {
+  const d = a.map((v, i) => v - b[i]);
+  if (wrap) for (const i of wrap) d[i] -= 2 * Math.PI * Math.round(d[i] / (2 * Math.PI));
+  return d;
+}
+// 从 y0 (切线 t0) 沿弧长走到头: 返回点列 (不含 y0); closed = 绕回了 y0 (周期坐标按 2π 折回比较 ——
+//   取向角转一整圈回到同一取向, 不比折回就一圈圈走到步数上限)
+function arcTrace(F, y0, t0, opt) {
+  const out = [];
+  let y = y0, t = t0, s = opt.s0, len = 0;
+  for (let n = 0; n < opt.maxN; n++) {
+    if (opt.cancelled && opt.cancelled()) break;
+    const yp = y.map((v, i) => v + s * t[i]);
+    const r = arcSolve(F, y, t, opt, dotN(t, yp));
+    let tn = null;
+    if (r) {
+      tn = dotN(r.t, t) < 0 ? r.t.map(v => -v) : r.t;
+      const dc = nrmN(r.y.map((v, i) => v - yp[i]));
+      if (!(dc < 0.5 * s) || dotN(tn, t) < Math.cos(15 * Math.PI / 180)) tn = null;   // 校正跑远 / 转角过大: 可能跳到了别的分支
+    }
+    if (!tn) { if ((s *= 0.5) < opt.sMin) break; continue; }
+    out.push(r.y);
+    len += nrmN(r.y.map((v, i) => v - y[i]));
+    y = r.y; t = tn;
+    if (opt.stop && opt.stop(y)) break;
+    if (len > 4 * opt.sMax && nrmN(arcDiff(y, y0, opt.wrap)) < 1.5 * s && dotN(t, t0) > 0) { out.closed = true; break; }
+    s = Math.min(opt.sMax, 1.5 * s);
+  }
+  return out;
+}
+// 两个样本之间曲线上的点 (frac 处): 过弦上该点、垂直于弦的超平面与曲线的交点 —— 折叠两侧的样本之间也取得对
+function arcMid(F, ya, yb, frac, opt) {
+  const ch = yb.map((v, i) => v - ya[i]), l = nrmN(ch);
+  if (!(l > 0)) return null;
+  const nv = ch.map(v => v / l), c = dotN(nv, ya) + frac * l;
+  // 解须落在两样本之间 (到两端都比弦短), 否则是 Newton 收敛到了别的分支
+  const between = r => r && nrmN(r.y.map((v, i) => v - ya[i])) < l && nrmN(r.y.map((v, i) => v - yb[i])) < l ? r.y : null;
+  return between(arcSolve(F, frac <= 0.5 ? ya : yb, nv, opt, c)) || between(arcSolve(F, frac <= 0.5 ? yb : ya, nv, opt, c));
+}
+// 一条轨迹: 从 y0 两个方向各走到头, 拼成一列 (h 不必单调)
+function arcBoth(F, y0, opt) {
+  const r0 = arcSolve(F, y0, [1, ...new Array(y0.length - 1).fill(0)], opt);
+  if (!r0) return null;
+  const fw = arcTrace(F, r0.y, r0.t, opt);
+  if (fw.closed) {                                  // 补上闭合点 (起点按周期平移到末点那一圈), 中点插值才连续
+    const last = fw[fw.length - 1], d = arcDiff(last, r0.y, opt.wrap);
+    return { ys: [r0.y, ...fw, last.map((v, i) => v - d[i])], closed: true };
+  }
+  const bw = arcTrace(F, r0.y, r0.t.map(v => -v), opt);
+  return { ys: [...bw.reverse(), r0.y, ...fw], closed: false };
 }
 
 const DIV_SEEDS = [3, 10, 18, 26, 29.4, 36, 50, 62, 68.5, 75, 82];
@@ -428,7 +575,40 @@ export function computeDivergentCausticEdges(path, m, fixedAng, lampElevDeg, lam
         if (f === null) return null;
         return solveEndW(sc, f, tk.eps, sd, tk.kind === 'turn');
       };
-      extendTrack(tk, h0, seedW, slv, dh, cancelled);
+      if (fine && tk.kind !== 'cusp') arcExtend(tk, h0, seedW, fen, rname, slv);
+      else extendTrack(tk, h0, seedW, slv, dh, cancelled);
+    };
+    // 修正版: end / turn 轨迹 = (h, w) 里的曲线 { 篱笆 = 0, Ĵ (或转折泛函) = 0, |w|² = 1 }, 伪弧长延拓 ——
+    //   两个末端点在某个 h 汇合消失 (h 方向的折叠) 时绕过去接着走另一支, 不再停在折叠点、丢掉另一支
+    const DEG = Math.PI / 180;
+    // 场景按 h 缓存几份 (差分雅可比在 h ± ε 与 h 之间来回)
+    const scCache = new Map();
+    const scAt = hd => {
+      let sc = scCache.get(hd);
+      if (sc) { setSun(hd); return sc; }
+      sc = sceneAt(hd);
+      if (scCache.size >= 6) scCache.delete(scCache.keys().next().value);
+      scCache.set(hd, sc);
+      return sc;
+    };
+    const arcExtend = (tk, h0, seedW, fen, rname, slv) => {
+      tk.slv = slv;
+      const b0 = slv(h0, seedW);
+      if (b0 === null) return;
+      const turn = tk.kind === 'turn';
+      const F = y => {
+        const sc = scAt(y[0] / DEG), w = [y[1], y[2], y[3]];
+        const f = turn ? (sc.Reach.find(x => x.name === rname) || null) : fen;
+        if (f === null) return null;
+        const a = sc.P.fval(f, w), b = turn ? jturnW(sc, w) : sc.jhatW(w, tk.eps);
+        return Number.isFinite(a) && Number.isFinite(b) ? [a, b, dot(w, w) - 1] : null;
+      };
+      const opt = { eps: 1e-7, stall: true, tol: [1e-11, 1e-11, 1e-13], maxCorr: 0.05, s0: 0.005, sMax: 0.02, sMin: 1e-7, maxN: 3000, cancelled,
+        valid: y => { if (Math.abs(y[0]) > 89 * DEG) return false; const sc = scAt(y[0] / DEG), w = [y[1], y[2], y[3]]; return sc.F.gram(w) >= -1e-9 && sc.minMargin(w) >= -1e-8; } };
+      const r = arcBoth(F, [h0 * DEG, ...b0], opt);
+      if (!r) return;
+      tk.ys = r.ys; tk.arcF = F; tk.arcOpt = opt;
+      tk.hs = r.ys.map(y => y[0] / DEG); tk.sols = r.ys.map(y => [y[1], y[2], y[3]]);
     };
 
     // (1) end / turn 身份发现 + 延拓
@@ -1355,24 +1535,18 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
   const out = [];
   try {
     const corr = midCorrector(P, m, fx, true);
-    const solveAt = (h, x0, k, mv) => { setSun(h); return edgeNewton(x0, k, P, m, fx, mv); };
     const onTrack = (h, x, k) => tracks.some(tk => tk.k === k && tk.hs.some((hh, i) => Math.abs(hh - h) < 1.01 && wdist(tk.xs[i], x) < 0.03));
-    // 从种子沿 h 走; 失败就把步长减半再试, 直到 1e-3° (轨迹尽头)
-    const extend = (tk, sgn) => {
-      let h = tk.hs[tk.hs.length - 1], x = tk.xs[tk.xs.length - 1], prev = tk.xs.length > 1 ? tk.xs[tk.xs.length - 2] : null, dh = 0.25;
-      for (let n = 0; n < 4000 && Math.abs(h) < 89.9; n++) {
-        if (cancelled && cancelled()) return;
-        const h2 = Math.max(-89.9, Math.min(89.9, h + sgn * dh));
-        const guess = prev ? [2 * x[0] - prev[0], 2 * x[1] - prev[1]] : x;
-        const x2 = solveAt(h2, guess, tk.k, 0.05) || solveAt(h2, x, tk.k, 0.05);
-        if (!x2 || wdist(x2, x) > 0.06) {
-          if (dh < 1e-3) return;
-          dh *= 0.5; prev = null; continue;
-        }
-        tk.hs.push(h2); tk.xs.push(x2); prev = x; x = x2; h = h2;
-        if (dh < 0.25) dh = Math.min(0.25, dh * 2);
-      }
+    // 外缘 = (h, u, v) 里的曲线 { Ĵ = 0, 余量_k = 1e-6 } (余量 1e-6 上稳, 画的时候再用 edgeExact 到精确的边).
+    //   伪弧长延拓 (arcTrace): h 也是未知数, 两个外缘点在某个 h 汇合消失 (h 方向的折叠) 时沿曲线绕过去, 另一支接着走.
+    const DEG = Math.PI / 180, TAU = 1e-6, Jh = jHat(m, fx, P);
+    const rimF = k => y => {
+      setSun(y[0] / DEG);
+      const j = Jh(y[1], y[2]), mk = marginsAt(y[1], y[2], P, m, fx)[k];
+      return Number.isFinite(j) && Number.isFinite(mk) ? [j, mk - TAU] : null;
     };
+    // 出射临界边旁 Ĵ 随余量呈 √ 变化: 差分步长要远小于目标余量 (同 edgeNewton)
+    const rimOpt = k => ({ eps: k === 1 ? 2e-3 * TAU : 1e-7, tol: [1e-10, 1e-3 * TAU], maxCorr: 0.02, s0: 0.003, sMax: 0.02, sMin: 1e-7, maxN: 3000, cancelled, wrap: [1, 2],
+      valid: y => { if (Math.abs(y[0]) > 89.9 * DEG) return false; setSun(y[0] / DEG); return validAt(P, m, fx, y[1], y[2], 1e-7); } });
     for (let hs = -88; hs <= 88; hs += 2) {
       if (cancelled && cancelled()) break;
       setSun(hs);
@@ -1386,26 +1560,31 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
         if (mg[k] > 1e-2) continue;                                     // 不在有效区边上 (段在别处结束)
         const x0 = edgeNewton(x, k, P, m, fx);
         if (!x0 || onTrack(hs, x0, k)) continue;
-        const tk = { k, hs: [hs], xs: [x0] };
-        extend(tk, 1);
-        tk.hs.reverse(); tk.xs.reverse();
-        extend(tk, -1);
-        tk.hs.reverse(); tk.xs.reverse();
-        if (tk.hs.length >= 3) tracks.push(tk);
+        const F = rimF(k), opt = rimOpt(k), r = arcBoth(F, [hs * DEG, x0[0], x0[1]], opt);
+        if (!r || r.ys.length < 3) continue;
+        tracks.push({ k, F, opt, ys: r.ys, hs: r.ys.map(y => y[0] / DEG), xs: r.ys.map(y => [y[1], y[2]]) });
       }
     }
-    if (causticRims2Dof.debug) causticRims2Dof.debug.push(...tracks.map(tk => ({ k: tk.k, h0: tk.hs[0], h1: tk.hs[tk.hs.length - 1], n: tk.hs.length, x0: tk.xs[0], x1: tk.xs[tk.xs.length - 1] })));
+    if (causticRims2Dof.debug) causticRims2Dof.debug.push(...tracks.map(tk => ({ k: tk.k, h0: tk.hs[0], h1: tk.hs[tk.hs.length - 1], n: tk.hs.length, x0: tk.xs[0], x1: tk.xs[tk.xs.length - 1], ys: tk.ys })));
     // 投影: 两支, 中点在中间 h 重解, 与边界线同一套加密
     const Lden = Math.max(1e-3, Math.min(maxDist, dist3(L, E)) / 150), sag = Math.max(2e-4, 1e-4 * dist3(L, E));
     for (const tk of tracks) {
       // 延拓在余量 1e-6 上做 (稳), 画出来的点用精确交点 (edgeExact)
       //   (外推的几个 Newton 偶尔解不出, 就用余量 1e-6 的点顶上, 只差 0.15°, 不留缺口)
       const exact = (h, x6) => { setSun(h); return edgeExact(x6, tk.k, P, m, fx) || x6; };
-      const samples = tk.hs.map((h, i) => ({ h, x: exact(h, tk.xs[i]), x6: tk.xs[i] }));
+      const sample = y => { const h = y[0] / DEG, x6 = [y[1], y[2]]; return { h, x: exact(h, x6), x6, y }; };
+      const samples = tk.ys.map(sample);
+      // 中点: 弦中点处垂直于弦的超平面与曲线的交点 (折叠两侧的样本之间也对)
+      //   (两条边重合的退化段上超平面校正可能失败: 退回定 h 的 edgeNewton, 此时两端 h 不同、中间没有折叠)
       const mid = (a, b) => {
-        const h = 0.5 * (a.h + b.h);
-        const x6 = solveAt(h, [0.5 * (a.x6[0] + b.x6[0]), 0.5 * (a.x6[1] + b.x6[1])], tk.k, 0.05);
-        return x6 ? { h, x: exact(h, x6), x6 } : null;
+        let y = arcMid(tk.F, a.y, b.y, 0.5, tk.opt);
+        if (!y && a.h !== b.h) {
+          const h = 0.5 * (a.h + b.h);
+          setSun(h);
+          const x6 = edgeNewton([0.5 * (a.x6[0] + b.x6[0]), 0.5 * (a.x6[1] + b.x6[1])], tk.k, P, m, fx, 0.05);
+          if (x6) y = [h * DEG, x6[0], x6[1]];
+        }
+        return y ? sample(y) : null;
       };
       const cache = new Map();
       const sky = s0 => {
@@ -1427,4 +1606,4 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
   return out;
 }
 
-export const _dbg = { edgeNewton, marginsAt, jHat, edgeExact };
+export const _dbg = { edgeNewton, marginsAt, jHat, edgeExact, arcSolve, arcMid, jacN, nullVec };
