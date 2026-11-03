@@ -175,10 +175,9 @@ function runMain() {
   });
 }
 
-// 两层曲线 (各若干条折线) 在三维里相隔多远: A 上取样点到 B 上最近点的距离, 取 75% 分位 (层在灯旁汇聚、在远处散开,
-//   取偏高的分位才反映稀疏的那一侧). 两个方向: how = 'mean' 取平均 (分配补层用), 'min' 取小者 (判断是否太挤用 —
-//   一层多出一小段时反方向的距离很大, 取大者会把"挤"掩盖掉)
-function layerGap(A, B, how = 'mean') {
+// 两层曲线 (各若干条折线) 在三维里相隔多远: A 上取样点到 B 上最近点的距离, 取 q 分位 (默认 75%: 层在灯旁汇聚、在远处散开,
+//   取偏高的分位才反映稀疏的那一侧). how = 'mean': 两个方向取平均 (分配补层用); 'from': 只量 A → B (A 是否整条都贴着 B)
+function layerGap(A, B, how = 'mean', q = 0.75) {
   const pts = (L, cap) => {
     let n = 0; for (const c of L.curves) n += (c.p || c).length / 3;
     const st = Math.max(1, Math.ceil(n / cap)), out = [];
@@ -195,10 +194,10 @@ function layerGap(A, B, how = 'mean') {
       ds.push(Math.sqrt(m));
     }
     ds.sort((x, y) => x - y);
-    return ds[Math.floor(0.75 * (ds.length - 1))];
+    return ds[Math.floor(q * (ds.length - 1))];
   };
-  const a = pts(A, 150), b = pts(B, 1500), a2 = pts(B, 150), b2 = pts(A, 1500), g1 = one(a, b), g2 = one(a2, b2);
-  return how === 'min' ? Math.min(g1, g2) : 0.5 * (g1 + g2);
+  const g1 = one(pts(A, 150), pts(B, 1500));
+  return how === 'from' ? g1 : 0.5 * (g1 + one(pts(B, 150), pts(A, 1500)));
 }
 
 // 二自由度: 原窗体的 h 层在 −90°..90° 上等分, 真正有曲线的往往只占一小段, 而且等 h 间隔的层在三维里疏密悬殊
@@ -541,16 +540,18 @@ function buildDL() {
         P.layers.forEach((l, ih) => { if (l) all.push({ h: layerH(P, ih), curves: l.curves }); });
         all.push(...P.dense);
         all.sort((a, b) => a.h - b.h);
-        // 全部算完后去掉挤在一起的层 (与上一条留下的层相距不到中位间距的 0.3 倍), 疏密更匀
+        // 全部算完后去掉多余的层: 整条 (95% 的点) 都贴着上一条留下的层 (不到中位间距的 0.3 倍), 疏密更匀.
+        //   只量"这一层 → 上一层"一个方向: 上一层可能很短 (只剩灯旁一小段, 层都在那里汇聚), 反方向量出来很近,
+        //   却不说明这一层多余 —— 它在远处也许铺开一大片. 以前取两个方向的小者, 就把这样的层连同后面一串都丢了.
         let show = all;
         if (!busy.dense && all.length > 8) {
           const nz = all.filter(l => l.curves.length), gaps = [];
-          for (let k = 0; k + 1 < nz.length; k++) gaps.push(layerGap(nz[k], nz[k + 1], 'min'));
+          for (let k = 0; k + 1 < nz.length; k++) gaps.push(layerGap(nz[k], nz[k + 1]));
           const med = gaps.slice().sort((x, y) => x - y)[Math.floor(gaps.length / 2)] || 0;
           show = [];
           let last = null;
           nz.forEach((l, k) => {
-            if (last && k + 1 < nz.length && layerGap(last, l, 'min') < 0.3 * med) return;
+            if (last && k + 1 < nz.length && layerGap(l, last, 'from', 0.95) < 0.3 * med) return;
             show.push(l); last = l;
           });
         }
