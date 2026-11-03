@@ -225,10 +225,19 @@ function tooFar(a, b, Lden) {
   return dist3(a.P, b.P) > Lden || angD(a.s, b.s) > 0.3 || angD(a.u, b.u) > 1.0;
 }
 
+// 点到线段 ab 的距离
+function chordDev(p, a, b) {
+  const ab = sub(b, a), ap = sub(p, a), l2 = dot(ab, ab);
+  const t = l2 > 0 ? Math.max(0, Math.min(1, dot(ab, ap) / l2)) : 0;
+  return Math.hypot(ap[0] - t * ab[0], ap[1] - t * ab[1], ap[2] - t * ab[2]);
+}
+
 // 一条参数化曲线 (参数 x: 标量或数组, 任意) 的一支 → 加密好的折线们. 通用于 h-层曲线与 h-延拓轨迹.
 //   samples: 参数序列; mapAt(x) → 该支状态或 null; mid(xa, xb) → 中间参数 (可含校正) 或 null.
 //   有效 ↔ 无效 的转折处二分 (iters 次) 找精确端点. 返回 [{ p, d }].
-function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40) {
+//   sag > 0 (边界线用): 段长/张角已够细时还要看中点离弦多远, 超过 sag 就再分 —— 弯得急的地方 (√ 区、尖点旁)
+//   按长度分段的折线会从真曲线上偏出去, 层线端点明明落在曲线上, 却离画出来的折线一两厘米.
+function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40, sag = 0) {
   const out = [];
   let P = [], D = [];
   const push = st => { P.push(st.P[0], st.P[1], st.P[2]); D.push(st.s[0], st.s[1], st.s[2]); };
@@ -248,7 +257,8 @@ function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40) {
   };
   // 两端都有效的一段: 递归加密 (不推入起点, 推入终点)
   const dens = (xa, sa, xb, sb, dep) => {
-    if (dep >= maxDepth || !tooFar(sa, sb, Lden)) { push(sb); return; }
+    const far = tooFar(sa, sb, Lden);
+    if (dep >= maxDepth || (!far && !(sag > 0))) { push(sb); return; }
     const xm = mid(xa, xb);
     if (xm === null) { push(sb); return; }
     const sm = mapAt(xm);
@@ -261,6 +271,7 @@ function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40) {
       if (e2.x !== xb) dens(e2.x, e2.s, xb, sb, dep + 1);
       return;
     }
+    if (!far && chordDev(sm.P, sa.P, sb.P) <= sag) { push(sb); return; }
     dens(xa, sa, xm, sm, dep + 1);
     dens(xm, sm, xb, sb, dep + 1);
   };
@@ -284,7 +295,7 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
   const pc = new PathC(path, LP.partial);
   setSun(10);
   const refScene = new Scene(pc, FamC.make(m, fixedAng), pctx);
-  const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
+  const Lden = Math.max(1e-3, Math.min(maxDist, dist3(L, E)) / 150), sag = Math.max(2e-4, 1e-4 * dist3(L, E));
   const hSing = Math.atan2(L[2] - E[2], Math.hypot(L[0] - E[0], L[1] - E[1])) * 180 / Math.PI;
   for (const tk of tracks) {
     tk.pts3 = [];
@@ -332,7 +343,7 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
     const foldAt = x => { const D = skyAt(x.h, x.sol); return D ? coneFold(D, x.h * Math.PI / 180, L, E) : null; };
     // 轨迹上每个中点都要重解一次末端点 (Newton), 二分 24 次已是 0.5° 步长的 2⁻²⁴
     const smp = insertFolds(samples, foldAt, mid, 24);
-    for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], mid, Lden, 9, 24));
+    for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], mid, Lden, 9, 24, sag));
   }
 }
 
@@ -471,6 +482,39 @@ export function computeDivergentCausticEdges(path, m, fixedAng, lampElevDeg, lam
             if (tk.hs.length >= 3) tracks.push(tk);
           }
         }
+    // (2b) 修正版: 闭环焦散上的尖点. HaloEP 只从焦散的 end/turn 端点出发沿线找尖点, 整圈都在有效区里的闭环没有端点,
+    //   上面的尖点它看不到 —— 层线在那里折回 (天空曲线的尖点经锥映射仍是尖点), 却没有脊线. 每 2° 一层追修正版焦散线,
+    //   沿线看天空方向的弦是否反向 (尖点处天空曲线折回), 候选处用 solveCuspUV 精确解 (Ĵ = 0 且切向在映射的核里, V = 0),
+    //   再同样沿 h 延拓. 判重按周期折回比较 (u, v); 退化纤维 (V 沿整条线 ≈ 0) 用两侧 |V| 的对比度剔除.
+    if (withCusps && fine) {
+      const TWO = 2 * Math.PI, wd = a => a - TWO * Math.round(a / TWO);
+      const known = (hd, uv) => tracks.some(tk => tk.kind === 'cusp' && tk.hs.some((h, i) =>
+        Math.abs(h - hd) < 0.8 && Math.abs(wd(tk.sols[i][0] - uv[0])) < 3e-2 && Math.abs(wd(tk.sols[i][1] - uv[1])) < 3e-2));
+      const skyN = x => { const c = Chain3(x[0], x[1], m, fixedAng, pctx), n = Math.hypot(c.Dx, c.Dy, c.Dz); return [c.Dx / n, c.Dy / n, c.Dz / n]; };
+      for (let hs = -88; hs <= 88; hs += 2) {
+        if (cancelled && cancelled()) return tracks;
+        const sc = sceneAt(hs);
+        for (const run of traceCausticFine(pctx, m, fixedAng, 61)) {
+          const n = run.length;
+          if (n < 7) continue;
+          const closed = Math.hypot(wd(run[0][0] - run[n - 1][0]), wd(run[0][1] - run[n - 1][1])) < 0.05;
+          const Ds = run.map(skyN), at = i => closed ? (i + n) % n : i;
+          for (let i = closed ? 0 : 1; i < (closed ? n : n - 1); i++) {
+            const a = Ds[at(i - 1)], b = Ds[at(i)], c = Ds[at(i + 1)], c0 = sub(b, a), c1 = sub(c, b);
+            if (!(nrm(c0) > 1e-9 && nrm(c1) > 1e-9 && dot(c0, c1) < 0)) continue;
+            const uv = solveCuspUV(sc, run[at(i)]);
+            if (uv === null || known(hs, uv)) continue;
+            if (!closed && (i < 3 || i + 3 >= n)) continue;
+            const vc = nrm(cuspState(sc, uv[0], uv[1]).V);
+            const vn = Math.min(nrm(cuspState(sc, ...run[at(i - 3)]).V), nrm(cuspState(sc, ...run[at(i + 3)]).V));
+            if (!(vn > Math.max(1e2 * vc, 1e-8))) continue;
+            const tk = newTrack('cusp', 0, '焦散尖点 (pleat 脊线)');
+            extend(tk, hs, uv, null, null);
+            if (tk.hs.length >= 3) tracks.push(tk);
+          }
+        }
+      }
+    }
     // (3) 锥映射
     if (fine) projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist);
     else projectTracks(tracks, m, fixedAng, path, L, E, maxDist);
@@ -787,9 +831,11 @@ function coneMapRuns(runs, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, 
 // 修正版: 取向平面曲线 → 两支各自加密 (中点校正回 J=0), 有效↔无效转折处二分; 每条带精确视方向 { p, d }
 // checkValid = false: 段已按篱笆自己的有效性 (可达带 + 其余约束, w 空间) 精确裁好; 再用取向空间的宽容差判一次会在
 //   段内别处切断 (出射临界篱笆本身就压在出射约束的边上), 段端偏离真正的边界
+// 周期坐标差折回到 (−π, π] (闭环可能绕周期轴整圈, 首尾差 2π)
+const wd2 = a => a - 2 * Math.PI * Math.round(a / (2 * Math.PI));
 function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, checkValid = true) {
   const hRad = hDeg * Math.PI / 180;
-  const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
+  const Lden = Math.max(1e-3, Math.min(maxDist, dist3(L, E)) / 150);
   for (const run of runs) {
     const cache = new Map();
     const branches = x => {
@@ -813,7 +859,21 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
       return Dn > 1e-12 ? coneFold([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E) : null;
     };
     const smp = insertFolds(run, foldAt, mid);
-    for (let b = 0; b < 2; b++) outCurves.push(...refineBranch(smp, x => branches(x)[b], mid, Lden));
+    const n = run.length, closed = n > 3 && Math.hypot(wd2(run[0][0] - run[n - 1][0]), wd2(run[0][1] - run[n - 1][1])) < 1e-3;
+    for (let b = 0; b < 2; b++) {
+      const pcs = refineBranch(smp, x => branches(x)[b], mid, Lden);
+      // 闭环: 起点 (追线的种子, 位置任意) 两侧的首段与末段其实是同一段, 接起来 —— 否则层线在种子处断成两截,
+      //   种子恰在尖点旁时两截都从这里朝同一方向出发, 看起来像停在半空
+      if (closed && pcs.length >= 2) {
+        const f = pcs[0], l = pcs[pcs.length - 1], k = l.p.length - 3;
+        if (Math.hypot(f.p[0] - l.p[k], f.p[1] - l.p[k + 1], f.p[2] - l.p[k + 2]) < 1e-3) {
+          const p = new Float32Array(l.p.length + f.p.length - 3), d = new Float32Array(p.length);
+          p.set(l.p); p.set(f.p.subarray(3), l.p.length); d.set(l.d); d.set(f.d.subarray(3), l.d.length);
+          pcs[0] = { p, d }; pcs.pop();
+        }
+      }
+      outCurves.push(...pcs);
+    }
   }
 }
 
@@ -1007,8 +1067,24 @@ function traceCausticFine(P, m, fx, nGrid) {
     }
     return null;
   };
+  // 踩回自己: 本条已走过的线段 (同一格子哈希, 记弧长). 近似 X 形交叉 (近鞍点, 零线是两支几乎相碰的双曲线) 处,
+  //   第一次经过可能顺着双曲线拐上一个闭环, 绕一圈回来再直穿, 从此绕着闭环转到步数上限 —— 闭合判据只认起点, 认不出.
+  //   这里: 新点落在本条较早一段 (弧长差 > 4·HMAX) 的线段上且同向 (< 8°, 重走同一条线时方向几乎不差; 浅角自交不算), 说明这段已经追过, 停下.
+  const COS_R = Math.cos(8 * Math.PI / 180);
   const march = (x0, d0) => {
-    const pts = [];
+    const pts = [], own = new Map();
+    const ownAdd = (a, b, s0) => { const k = hk(Math.floor(wrap(a[0]) / cell), Math.floor(wrap(a[1]) / cell)); let l = own.get(k); if (!l) own.set(k, l = []); l.push([a, b, s0]); };
+    const ownHit = (y, sl, sNow) => {
+      const cu = Math.floor(wrap(y[0]) / cell), cv = Math.floor(wrap(y[1]) / cell), tol = Math.max(1e-5, 0.05 * sl);
+      for (let du = -1; du <= 1; du++) for (let dv = -1; dv <= 1; dv++) for (const [a, b, s0] of own.get(hk(cu + du, cv + dv)) || []) {
+        if (s0 > sNow - 4 * HMAX) continue;
+        const px = wd(y[0] - a[0]), py = wd(y[1] - a[1]), sx = b[0] - a[0], sy = b[1] - a[1], l2 = sx * sx + sy * sy;
+        if (!(l2 > 0) || (sx * dir[0] + sy * dir[1]) < COS_R * Math.sqrt(l2)) continue;
+        const t = Math.max(0, Math.min(1, (px * sx + py * sy) / l2));
+        if (Math.hypot(px - t * sx, py - t * sy) < tol) return true;
+      }
+      return false;
+    };
     let x = x0, dir = d0, h = 0.005, run = 0, hLast = 0.005, hops = 0;
     for (let n = 0; n < 6000; n++) {
       const y = correct([x[0] + h * dir[0], x[1] + h * dir[1]], 0.6 * h);
@@ -1016,7 +1092,12 @@ function traceCausticFine(P, m, fx, nGrid) {
       if (!y || !(sl > 0.3 * h) || sx * dir[0] + sy * dir[1] < COS_T * sl) {
         if ((h *= 0.5) < HMIN) {                                    // 奇点
           const j = hops < 20 ? hop(x, dir, hLast) : null;
-          if (!j) return { pts, closed: false };
+          if (!j) {
+            // 停下的点若其实贴着有效区边 (零线斜着扎向出射临界边, 边外 Ĵ 无定义, 先失败的是校正而不是有效性判据),
+            //   照样抛光到精确交点 —— 出射临界旁位置随 √余量 变化, 余量 1e-5 就差出几厘米
+            if (pts.length && Math.min(...marginsAt(x[0], x[1], P, m, fx)) < 1e-3) pts[pts.length - 1] = polishEnd(x, P, m, fx);
+            return { pts, closed: false };
+          }
           hops++; pts.push(j.y); x = j.y; dir = j.t; h = hLast;
         }
         continue;
@@ -1033,11 +1114,14 @@ function traceCausticFine(P, m, fx, nGrid) {
         return { pts, closed: false };
       }
       run += sl;
-      // 闭合: 这一步的线段掠过起点
-      if (run > 4 * HMAX) {
+      // 闭合: 这一步的线段掠过起点, 且走向与出发时相同 —— 细长的"手指" (两条臂相距 1e-4 级、并排走很远的 U 形零线)
+      //   回程那条臂也会从起点旁擦过, 但方向相反, 不是闭合
+      if (run > 4 * HMAX && sx * d0[0] + sy * d0[1] > 0.5 * sl) {
         const px = wd(x0[0] - x[0]), py = wd(x0[1] - x[1]), t = Math.max(0, Math.min(1, (px * sx + py * sy) / (sl * sl)));
         if (Math.hypot(px - t * sx, py - t * sy) < 1e-4 * Math.max(1, sl / 1e-3)) { pts.push([x[0] + px, x[1] + py]); return { pts, closed: true }; }
       }
+      if (run > 8 * HMAX && ownHit(y, sl, run)) return { pts, closed: false };
+      ownAdd(x, y, run - sl);
       pts.push(y);
       const t = tangent(y, [sx, sy]);
       if (!t) return { pts, closed: false };
@@ -1312,7 +1396,7 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
     }
     if (causticRims2Dof.debug) causticRims2Dof.debug.push(...tracks.map(tk => ({ k: tk.k, h0: tk.hs[0], h1: tk.hs[tk.hs.length - 1], n: tk.hs.length, x0: tk.xs[0], x1: tk.xs[tk.xs.length - 1] })));
     // 投影: 两支, 中点在中间 h 重解, 与边界线同一套加密
-    const Lden = Math.max(0.1, Math.min(maxDist, dist3(L, E)) / 150);
+    const Lden = Math.max(1e-3, Math.min(maxDist, dist3(L, E)) / 150), sag = Math.max(2e-4, 1e-4 * dist3(L, E));
     for (const tk of tracks) {
       // 延拓在余量 1e-6 上做 (稳), 画出来的点用精确交点 (edgeExact)
       //   (外推的几个 Newton 偶尔解不出, 就用余量 1e-6 的点顶上, 只差 0.15°, 不留缺口)
@@ -1337,7 +1421,7 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
       };
       const foldAt = s0 => { const D = sky(s0); return D ? coneFold(D, s0.h * Math.PI / 180, L, E) : null; };
       const smp = insertFolds(samples, foldAt, mid, 24);
-      for (let b = 0; b < 2; b++) out.push(...refineBranch(smp, s0 => branches(s0)[b], mid, Lden, 9, 24));
+      for (let b = 0; b < 2; b++) out.push(...refineBranch(smp, s0 => branches(s0)[b], mid, Lden, 9, 24, sag));
     }
   } finally { setSun(oldTH); }
   return out;
