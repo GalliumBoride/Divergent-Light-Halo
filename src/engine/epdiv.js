@@ -7,7 +7,7 @@
 // 与 C# 逐句对应 (对账见 tools/).
 
 import { LP, OMode, setSun, PathCtx, Chain3, jana3, validAt, axesMeta, traceContours, allFams, famEval3, SqK } from './lp.js';
-import { PathC, FamC, Scene, polishPair, fenceSamples, cuspState, minMarginUV, computeEndpoints } from './ep.js';
+import { PathC, FamC, Scene, polishPair, fenceSamples, projectFence, cuspState, minMarginUV, computeEndpoints } from './ep.js';
 import { tryConePoint } from './cone.js';
 
 const f32 = Math.fround;
@@ -186,7 +186,7 @@ function insertFolds(samples, foldAt, mid, iters = 40) {
         if (fm === null) break;
         if (fm > 0) hi = m; else lo = m;
       }
-      if (lo !== samples[i - 1] && lo !== x) out.push(lo);
+      if (lo !== samples[i - 1] && lo !== x) { lo.fold = true; out.push(lo); }
     }
     out.push(x);
     pf = f;
@@ -194,6 +194,14 @@ function insertFolds(samples, foldAt, mid, iters = 40) {
   return out;
 }
 
+// 折叠点上两支本应重合, 但两支的差 ∝ √(折叠量), 折叠量的舍入噪声 (出射掠射面上出射方向本身 ∝ √0, 噪声 ~1e-8) 被开方放大,
+//   二分到底两支仍差几毫米到一厘米, 层线在折叠处断开. 两支的平均里 √ 项正负相消, 随参数光滑 → 两支都取平均, 误差只剩线性的舍入.
+function foldMerge(v) {
+  const a = v[0], b = v[1], avg = (p, q) => [0.5 * (p[0] + q[0]), 0.5 * (p[1] + q[1]), 0.5 * (p[2] + q[2])];
+  const s = avg(a.s, b.s), u = avg(a.u, b.u), ns = nrm(s), nu = nrm(u);
+  const m = { P: avg(a.P, b.P), s: scl(s, 1 / ns), u: scl(u, 1 / nu) };
+  return [m, m];
+}
 function coneBranchesFull(Dsky, hRad, L, E, maxDist) {
   const DDv = sub(L, E);
   const d = scl(Dsky, -1.0);
@@ -347,6 +355,7 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
       if (v === undefined) {
         const D = skyAt(x.h, x.sol);
         v = D ? coneBranchesFull(D, x.h * Math.PI / 180, L, E, maxDist) : [null, null];
+        if (x.fold && v[0] && v[1]) v = foldMerge(v);
         cache.set(x, v);
       }
       return v;
@@ -779,43 +788,62 @@ export function fenceRuns(path, m, fixedAng, surfId, fine = false) {
   return runs;
 }
 
+// 运行里的点 = [u, v, w0, w1, w2, ε]: (u, v) 给锥映射 (Chain3), w 是篱笆自己的坐标 (晶体系单位向量, 篱笆是球面上的闭式曲线).
+//   加密与二分的中点都取在篱笆上 (w 弦中点归一化后投回篱笆), 不取 (u, v) 弦中点 —— 后者不在篱笆上:
+//   篱笆在 (u, v) 里很弯 (可达带边 ε± 汇合处 ζ ∝ √, 两个样本 (u, v) 可差几十度) 时中点偏得很远, 层线画成锯齿.
+//   篱笆在这里无效的点 u = v = NaN (锥映射给 null, 加密时按断开处理).
 function fenceRunsFine(fam, sc, fen, runs) {
-  const uvAt = (w, eps) => {
-    if (!(fam.gram(w) >= -1e-9 && sc.minMargin(w) >= -1e-7)) return null;
-    const E = fam.lift(w, eps);
-    return E === null ? null : fam.uvOf(E[0], E[1], E[2]);
-  };
-  // a 有效, b 无效: 沿弦 (再归一化到单位球, 偏离篱笆是二阶小量) 二分 40 次 → 最后一个有效点
-  const edge = (wa, wb, eps) => {
-    let lo = wa, hi = wb, uv = uvAt(wa, eps);
-    for (let it = 0; it < 40; it++) {
-      const mm = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), 0.5 * (lo[2] + hi[2])], n = nrm(mm);
-      const wm = n > 1e-15 ? scl(mm, 1 / n) : mm;
-      const u = uvAt(wm, eps);
-      if (u) { lo = wm; uv = u; } else hi = wm;
-    }
-    return uv;
-  };
   const TWO = 2 * Math.PI;
-  const unwrap = run => {
-    for (let i = 1; i < run.length; i++)
-      for (let k = 0; k < 2; k++) run[i][k] -= TWO * Math.round((run[i][k] - run[i - 1][k]) / TWO);
-    return run;
+  const pt = (w, eps, near) => {
+    let uv = null;
+    if (fam.gram(w) >= -1e-9 && sc.minMargin(w) >= -1e-7) {
+      const E = fam.lift(w, eps);
+      if (E !== null) uv = fam.uvOf(E[0], E[1], E[2]);
+    }
+    if (!uv) return [NaN, NaN, w[0], w[1], w[2], eps];
+    if (near) for (let k = 0; k < 2; k++) uv[k] -= TWO * Math.round((uv[k] - near[k]) / TWO);    // 周期坐标展开成连续的
+    return [uv[0], uv[1], w[0], w[1], w[2], eps];
   };
-  for (const comp of fenceSamples(sc, fen, 700)) {
+  const ok = p => Number.isFinite(p[0]);
+  const mid = (a, b) => {
+    const s = [a[2] + b[2], a[3] + b[3], a[4] + b[4]], n = nrm(s);
+    if (!(n > 1e-15)) return null;
+    const w0 = scl(s, 1 / n), w = projectFence(sc, fen, w0) || w0;
+    return pt(w, a[5], ok(a) ? a : ok(b) ? b : null);
+  };
+  // a 有效, b 无效: 二分 40 次 → 最后一个有效点 (段端在别的篱笆上, 或在可达带边 ε± 两段汇合处)
+  const edge = (a, b) => {
+    let lo = a, hi = b;
+    for (let it = 0; it < 40; it++) {
+      const mm = mid(lo, hi);
+      if (!mm) break;
+      if (ok(mm)) lo = mm; else hi = mm;
+    }
+    return lo;
+  };
+  const near = (p, q) => { for (let k = 0; k < 2; k++) p[k] -= TWO * Math.round((p[k] - q[k]) / TWO); return p; };
+  for (const comp0 of fenceSamples(sc, fen, 700)) {
+    // 每个分量都是闭合曲线. 整圈的 (ℓ ∥ u0, θ 均匀取样) 不含终点 θ = 2π: 补上首点, 否则末样本与首样本之间那一段
+    //   永远连不上, 层线在这里断开一个取样间隔. 跨过分量起点的首末两段接成一段.
+    const comp = dist3(comp0[comp0.length - 1], comp0[0]) > 1e-12 ? [...comp0, comp0[0]] : comp0;
     for (let e = 0; e < 2; e++) {
-      const eps = e === 0 ? 1 : -1;
-      let cur = null, pw = null, puv = null;
-      for (const w of comp) {
-        const uv = uvAt(w, eps);
-        if (uv && !puv && pw) cur = [edge(w, pw, eps)];
-        if (!uv && puv) { cur.push(edge(pw, w, eps)); if (cur.length >= 2) runs.push(unwrap(cur)); cur = null; }
-        if (uv) { if (!cur) cur = []; cur.push(uv); }
-        pw = w; puv = uv;
+      const eps = e === 0 ? 1 : -1, own = [];
+      let cur = null, prev = null, first0 = false;                // first0: 第一段从分量起点开始
+      for (let i = 0; i < comp.length; i++) {
+        const p = pt(comp[i], eps, null);
+        if (ok(p) && prev && !ok(prev)) cur = [edge(p, prev)];
+        if (!ok(p) && prev && ok(prev)) { cur.push(edge(prev, p)); if (cur.length >= 2) own.push(cur); cur = null; }
+        if (ok(p)) { if (!cur) { cur = []; if (i === 0) first0 = true; } else near(p, cur[cur.length - 1]); cur.push(p); }
+        prev = p;
       }
-      if (cur && cur.length >= 2) runs.push(unwrap(cur));
+      if (cur && cur.length >= 2) {
+        if (first0 && own.length) { const b = own.shift(); for (const q of b.slice(1)) cur.push(near(q, cur[cur.length - 1])); }
+        own.push(cur);
+      }
+      runs.push(...own);
     }
   }
+  runs.mid = mid;
   return runs;
 }
 
@@ -1013,7 +1041,7 @@ function coneMapRuns(runs, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, 
 //   段内别处切断 (出射临界篱笆本身就压在出射约束的边上), 段端偏离真正的边界
 // 周期坐标差折回到 (−π, π] (闭环可能绕周期轴整圈, 首尾差 2π)
 const wd2 = a => a - 2 * Math.PI * Math.round(a / (2 * Math.PI));
-function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, checkValid = true) {
+function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, checkValid = true, graze = false) {
   const hRad = hDeg * Math.PI / 180;
   const Lden = Math.max(1e-3, Math.min(maxDist, dist3(L, E)) / 150);
   for (const run of runs) {
@@ -1023,9 +1051,10 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
       if (v === undefined) {
         v = [null, null];
         if (!checkValid || validAt(P, m, fx, x[0], x[1], 1e-4)) {
-          const ch = Chain3(x[0], x[1], m, fx, P);
+          const ch = Chain3(x[0], x[1], m, fx, P, graze);
           const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
           if (Dn > 1e-12) v = coneBranchesFull([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E, maxDist);
+          if (x.fold && v[0] && v[1]) v = foldMerge(v);
         }
         cache.set(x, v);
       }
@@ -1034,7 +1063,7 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
     const mid = (a, b) => corr(a, b);
     const foldAt = x => {
       if (checkValid && !validAt(P, m, fx, x[0], x[1], 1e-4)) return null;
-      const ch = Chain3(x[0], x[1], m, fx, P);
+      const ch = Chain3(x[0], x[1], m, fx, P, graze);
       const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
       return Dn > 1e-12 ? coneFold([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E) : null;
     };
@@ -1420,9 +1449,9 @@ export function lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, 
       const verts = [], curves = [];
       coneMapRuns(caus, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, curves);
       if (fine) {                                   // 修正版曲线 (显示); 采样点仍是原窗体的
-        const fc = [], corr = midCorrector(P, m, fx, surfId === 'caustic');
         const fr = surfId === 'caustic' ? traceCausticFine(P, m, fx, nGrid) : fenceRuns(lpFaces, m, fx, surfId, true);
-        coneMapRunsFine(fr, hDeg, m, fx, P, L, [0, 0, eyeHeight], maxDist, corr, fc, surfId === 'caustic');
+        const fc = [], corr = fr.mid || midCorrector(P, m, fx, surfId === 'caustic');
+        coneMapRunsFine(fr, hDeg, m, fx, P, L, [0, 0, eyeHeight], maxDist, corr, fc, surfId === 'caustic', surfId === 'exit');
         layers.push({ curves: fc, verts: Float32Array.from(verts) });
       } else layers.push({ curves, verts: Float32Array.from(verts) });
     }
@@ -1439,12 +1468,12 @@ export function parallelArc2Dof(lpFaces, lampElev, eyeHeight, nGrid, zetaFree, f
     setSun(lampElev);
     let runs = surfId === 'caustic' ? sliceRuns2Dof(P, m, fx, nGrid) : fenceRuns(lpFaces, m, fx, surfId, fine);
     if (fine) {
-      const corr = midCorrector(P, m, fx, surfId === 'caustic');
       if (surfId === 'caustic') runs = traceCausticFine(P, m, fx, nGrid);
+      const corr = runs.mid || midCorrector(P, m, fx, surfId === 'caustic');
       for (const run of runs) {
         const mapAt = x => {
           if (!validAt(P, m, fx, x[0], x[1], 1e-4)) return null;
-          const ch = Chain3(x[0], x[1], m, fx, P);
+          const ch = Chain3(x[0], x[1], m, fx, P, surfId === 'exit');
           const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
           if (!(Dn > 1e-12)) return null;
           const D = [ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn];
@@ -1595,7 +1624,12 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
       };
       const branches = s0 => {
         let v = cache.get(s0);
-        if (v === undefined) { const D = sky(s0); v = D ? coneBranchesFull(D, s0.h * Math.PI / 180, L, E, maxDist) : [null, null]; cache.set(s0, v); }
+        if (v === undefined) {
+          const D = sky(s0);
+          v = D ? coneBranchesFull(D, s0.h * Math.PI / 180, L, E, maxDist) : [null, null];
+          if (s0.fold && v[0] && v[1]) v = foldMerge(v);
+          cache.set(s0, v);
+        }
         return v;
       };
       const foldAt = s0 => { const D = sky(s0); return D ? coneFold(D, s0.h * Math.PI / 180, L, E) : null; };

@@ -138,8 +138,10 @@ export function newC3(P) {
 
 const _E = new Float64Array(9);
 
-/** Chain3: 写入 out (newC3 分配), 返回 out. */
-export function chain3(sc, sw, m, fixedAng, P, out) {
+/** Chain3: 写入 out (newC3 分配), 返回 out.
+ *  graze = true: 已知出射掠射 (出射余量 qE² − K 恒为 0, 出射掠射面上的点), 出射方向里的 √(qE² − K) 直接取 0 ——
+ *  否则 1e-16 的舍入被开方放大成 1e-8 的方向噪声. */
+export function chain3(sc, sw, m, fixedAng, P, out, graze = false) {
   const e = orientOf(m, fixedAng, sc, sw, _E);
   const A3 = LP.A3, cf = P.coef, n = P.faces.length;
   let c1 = cf[0], c2 = cf[1], c3 = cf[2];
@@ -165,15 +167,15 @@ export function chain3(sc, sw, m, fixedAng, P, out) {
   uy = c1 * e[1] + c2 * e[4] + c3 * e[7];
   uz = c1 * e[2] + c2 * e[5] + c3 * e[8];
   const qE = Px * ux + Py * uy + Pz * uz;
-  const tE = -qE - Math.sqrt(Math.max(qE * qE - K, 0.0));
+  const tE = -qE - (graze ? 0.0 : Math.sqrt(Math.max(qE * qE - K, 0.0)));
   out.qE = qE;
   out.Dx = Px + tE * ux; out.Dy = Py + tE * uy; out.Dz = Pz + tE * uz;
   return out;
 }
 
 /** 分配新结果的 Chain3 (非热路径用). */
-export function Chain3(sc, sw, m, fixedAng, P) {
-  return chain3(sc, sw, m, fixedAng, P, newC3(P));
+export function Chain3(sc, sw, m, fixedAng, P, graze = false) {
+  return chain3(sc, sw, m, fixedAng, P, newC3(P), graze);
 }
 
 export function valid3(c, tol) {

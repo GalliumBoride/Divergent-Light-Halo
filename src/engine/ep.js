@@ -253,8 +253,12 @@ class FamC {
       if (Math.abs(wrapPi(-ze - this.Fixed)) < Math.abs(wrapPi(ze - this.Fixed)) - 1e-12) { al += Math.PI; roll += Math.PI; }
       sc = al; sw = roll;
     } else if (this.M === OMode.ZenFree) {
-      if (Math.abs(wrapPi(roll - this.Fixed)) > Math.PI / 2) { al += Math.PI; ze = 2 * Math.PI - ze; }
-      sc = al; sw = ze;
+      // 自旋已知 (= Fixed): 先从 e1/e2 消去自旋, e1b = (−sin α, cos α, 0) 与 ζ 无关, e2b_z = sin ζ.
+      //   旧式 α = atan2(e3) 在 c 轴竖直 (ζ = 0, 正是 Lowitz 可达带边 ε± 汇合处) 时 e3 水平分量为 0, α 成了舍入噪声;
+      //   自旋差 π 的等价表示在这里自动变成 (α+π, −ζ).
+      const c = Math.cos(this.Fixed), s = Math.sin(this.Fixed);
+      const b1x = c * e1[0] - s * e2[0], b1y = c * e1[1] - s * e2[1], b2z = s * e1[2] + c * e2[2];
+      sc = Math.atan2(-b1x, b1y); sw = Math.atan2(b2z, e3[2]);
     } else {
       if (Math.abs(wrapPi(al - this.Fixed)) > Math.PI / 2) { roll += Math.PI; ze = 2 * Math.PI - ze; }
       sc = roll; sw = ze;
@@ -1009,4 +1013,4 @@ export function computeEndpoints(faces, m, fixedAng, withCusps = true) {
 }
 
 // 发散光 h-延拓 (epdiv.js) 要用的内部件
-export { PathC, FamC, Scene, polishPair, fenceSamples, cuspState, minMarginUV, wUV };
+export { PathC, FamC, Scene, polishPair, fenceSamples, projectFence, cuspState, minMarginUV, wUV };
