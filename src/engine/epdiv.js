@@ -1576,6 +1576,36 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
     // 出射临界边旁 Ĵ 随余量呈 √ 变化: 差分步长要远小于目标余量 (同 edgeNewton)
     const rimOpt = k => ({ eps: k === 1 ? 2e-3 * TAU : 1e-7, tol: [1e-10, 1e-3 * TAU], maxCorr: 0.02, s0: 0.003, sMax: 0.02, sMin: 1e-7, maxN: 3000, cancelled, wrap: [1, 2],
       valid: y => { if (Math.abs(y[0]) > 89.9 * DEG) return false; setSun(y[0] / DEG); return validAt(P, m, fx, y[1], y[2], 1e-7); } });
+    // 焦散整条是一根坐标线 x_j = c (对称取向上的折叠: 如柱晶 roll = 60°, 取向 c ± δ 映到同一天空点, J 沿整条线恒为 0):
+    //   外缘就是这条线走出有效区的地方, 直接解 { x_j = c, 余量_k = τ }, 两个方程都良态. 一般式 { Ĵ = 0, 余量_k = τ } 在这里病态:
+    //   J 沿线恒 0, 而对称取向上入射角 = 出射角, 入射掠射时出射也掠射 (出射余量 ≈ 入射余量²), Ĵ = J·√mE 又被压一次,
+    //   延拓一步只能走 2e-4 (3-1-5-7 柱晶 ζ37: 一条外缘 1900 步, 外缘任务 6 s, 还留缺口).
+    const wd = a => a - TWO * Math.round(a / TWO);
+    const lineOf = run => {
+      for (const j of [1, 0]) {
+        const c = run[0][j];
+        let ok = true, span = 0;
+        for (const x of run) { if (Math.abs(wd(x[j] - c)) > 1e-5) { ok = false; break; } span = Math.max(span, Math.abs(wd(x[1 - j] - run[0][1 - j]))); }
+        if (ok && span > 0.05) return { j, c };
+      }
+      return null;
+    };
+    // 沿线 (另一坐标 i) 一维 Newton 到 余量_k = target
+    const lineEdge = (x, ln, k, target) => {
+      const i = 1 - ln.j, p = x.slice(); p[ln.j] = ln.c;
+      const mk = s => { const q = p.slice(); q[i] = s; return marginsAt(q[0], q[1], P, m, fx)[k]; };
+      let s = p[i];
+      for (let it = 0; it < 40; it++) {
+        const f = mk(s) - target, e = 1e-7, g = (mk(s + e) - mk(s - e)) / (2 * e);
+        if (!Number.isFinite(f) || !(Math.abs(g) > 1e-12)) return null;
+        let ds = -f / g;
+        if (Math.abs(ds) > 0.02) ds = 0.02 * Math.sign(ds);
+        s += ds;
+        if (Math.abs(ds) < 1e-13) break;
+      }
+      p[i] = s;
+      return Math.abs(mk(s) - target) < 1e-3 * Math.max(target, 1e-9) && Math.abs(wd(s - x[i])) < 0.05 ? p : null;
+    };
     for (let hs = -88; hs <= 88; hs += 2) {
       if (cancelled && cancelled()) break;
       setSun(hs);
@@ -1584,6 +1614,30 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
         setSun(hs);
         const mg = marginsAt(x[0], x[1], P, m, fx);
         if (!mg.every(Number.isFinite)) continue;
+        const ln = lineOf(run);
+        if (ln) {
+          // 取沿线线性过零的那个余量 (另一个在这里 ∝ 它的平方, 斜率为 0)
+          const i = 1 - ln.j, e = 1e-6;
+          let k = -1, best = 0;
+          mg.forEach((v, kk) => {
+            if (v > 1e-2) return;
+            const q1 = x.slice(), q2 = x.slice(); q1[i] += e; q2[i] -= e;
+            const sl = Math.abs(marginsAt(q1[0], q1[1], P, m, fx)[kk] - marginsAt(q2[0], q2[1], P, m, fx)[kk]) / (2 * e);
+            if (sl > best) { best = sl; k = kk; }
+          });
+          if (k < 0) continue;
+          const x0 = lineEdge(x, ln, k, TAU);
+          if (!x0 || onTrack(hs, x0, k)) continue;
+          const F = y => {
+            setSun(y[0] / DEG);
+            const mk = marginsAt(y[1], y[2], P, m, fx)[k];
+            return Number.isFinite(mk) ? [wd(y[1 + ln.j] - ln.c), mk - TAU] : null;
+          };
+          const opt = { ...rimOpt(k), eps: 1e-7, tol: [1e-12, 1e-3 * TAU] }, r = arcBoth(F, [hs * DEG, x0[0], x0[1]], opt);
+          if (!r || r.ys.length < 3) continue;
+          tracks.push({ k, F, opt, line: ln, ys: r.ys, hs: r.ys.map(y => y[0] / DEG), xs: r.ys.map(y => [y[1], y[2]]) });
+          continue;
+        }
         let k = 0;
         for (let i = 1; i < mg.length; i++) if (mg[i] < mg[k]) k = i;
         if (mg[k] > 1e-2) continue;                                     // 不在有效区边上 (段在别处结束)
@@ -1600,7 +1654,7 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
     for (const tk of tracks) {
       // 延拓在余量 1e-6 上做 (稳), 画出来的点用精确交点 (edgeExact)
       //   (外推的几个 Newton 偶尔解不出, 就用余量 1e-6 的点顶上, 只差 0.15°, 不留缺口)
-      const exact = (h, x6) => { setSun(h); return edgeExact(x6, tk.k, P, m, fx) || x6; };
+      const exact = (h, x6) => { setSun(h); return (tk.line ? lineEdge(x6, tk.line, tk.k, 0) : edgeExact(x6, tk.k, P, m, fx)) || x6; };
       const sample = y => { const h = y[0] / DEG, x6 = [y[1], y[2]]; return { h, x: exact(h, x6), x6, y }; };
       const samples = tk.ys.map(sample);
       // 中点: 弦中点处垂直于弦的超平面与曲线的交点 (折叠两侧的样本之间也对)
@@ -1610,7 +1664,8 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
         if (!y && a.h !== b.h) {
           const h = 0.5 * (a.h + b.h);
           setSun(h);
-          const x6 = edgeNewton([0.5 * (a.x6[0] + b.x6[0]), 0.5 * (a.x6[1] + b.x6[1])], tk.k, P, m, fx, 0.05);
+          const xm = [0.5 * (a.x6[0] + b.x6[0]), 0.5 * (a.x6[1] + b.x6[1])];
+          const x6 = tk.line ? lineEdge(xm, tk.line, tk.k, TAU) : edgeNewton(xm, tk.k, P, m, fx, 0.05);
           if (x6) y = [h * DEG, x6[0], x6[1]];
         }
         return y ? sample(y) : null;
