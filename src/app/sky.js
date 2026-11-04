@@ -468,6 +468,7 @@ export class SkyView {
     ctx.lineJoin = 'round'; ctx.lineCap = 'round';
     const sides = S.mirror ? [1, -1] : [1];
     for (const ln of S.lines) {
+      if (ln.only3d) continue;
       ctx.lineWidth = ln.width || 1.6;
       ctx.setLineDash(ln.dash || []);
       if (ln.segCols) {

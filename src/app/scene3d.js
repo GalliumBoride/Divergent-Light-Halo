@@ -107,16 +107,29 @@ export class Scene3D {
   }
 
   _lineMat(col, width, o = {}) {
-    const key = 'L' + JSON.stringify([col, width, !!o.dashed, o.dashSize, o.gapSize, o.alpha ?? 1, !!o.vc]);
+    const key = 'L' + JSON.stringify([col, width, !!o.dashed, o.dashSize, o.gapSize, o.alpha ?? 1, !!o.vc, !!o.va]);
     return this._mat(key, () => {
       const m = new LineMaterial({
         color: col3(col).getHex(), linewidth: width, worldUnits: false,
         dashed: !!o.dashed, dashSize: o.dashSize || 0.6, gapSize: o.gapSize || 0.45,
-        transparent: (o.alpha ?? 1) < 1, opacity: o.alpha ?? 1,
+        transparent: (o.alpha ?? 1) < 1 || !!o.va, opacity: o.alpha ?? 1,
         // 镜像副本用 scale.y = −1, three 会把它的三角形当成反面; 粗线是屏幕空间四边形, 方向不随镜像翻转 → 必须双面, 否则另一半的线全被剔掉
         side: THREE.DoubleSide,
       });
       if (o.vc) m.vertexColors = true;
+      // 逐顶点不透明度 (补线淡入): LineMaterial 只有 RGB 顶点色, 另加一对实例属性 instanceAlphaStart/End 乘进片元 alpha.
+      //   不写深度: 半透明的淡线不能挡住后画的线
+      if (o.va) {
+        m.depthWrite = false;
+        m.onBeforeCompile = sh => {
+          sh.vertexShader = sh.vertexShader
+            .replace('attribute vec3 instanceColorEnd;', 'attribute vec3 instanceColorEnd;\nattribute float instanceAlphaStart;\nattribute float instanceAlphaEnd;\nvarying float vAlphaV;')
+            .replace('vColor.xyz = ( position.y < 0.5 ) ? instanceColorStart : instanceColorEnd;',
+              'vColor.xyz = ( position.y < 0.5 ) ? instanceColorStart : instanceColorEnd;\nvAlphaV = ( position.y < 0.5 ) ? instanceAlphaStart : instanceAlphaEnd;');
+          sh.fragmentShader = 'varying float vAlphaV;\n' + sh.fragmentShader.replace('gl_FragColor = vec4( diffuseColor.rgb, alpha );', 'gl_FragColor = vec4( diffuseColor.rgb, alpha * vAlphaV );');
+        };
+        m.customProgramCacheKey = () => 'line-vertex-alpha';
+      }
       m.resolution.set(this.W || 1, this.H || 1);
       this.lineMats.push(m);
       return m;
@@ -281,6 +294,17 @@ export class Scene3D {
         for (let j = 0; j < 2 * Math.max(0, posOf(s).length / 3 - 1); j++) { cols[k++] = r; cols[k++] = gg; cols[k++] = b; }
       });
       g.setColors(cols);
+      if (ln.vAlpha) {                  // 每个顶点一个不透明度 (补线淡入), 每段 (起, 止) 两个
+        const al = new Float32Array(2 * pos.length / 6);
+        let q = 0;
+        ln.segs.forEach((s, i) => { const a = ln.vAlpha[i]; for (let j = 0; j + 1 < a.length; j++) { al[q++] = a[j]; al[q++] = a[j + 1]; } });
+        const buf = new THREE.InstancedInterleavedBuffer(al, 2, 1);
+        g.setAttribute('instanceAlphaStart', new THREE.InterleavedBufferAttribute(buf, 1, 0));
+        g.setAttribute('instanceAlphaEnd', new THREE.InterleavedBufferAttribute(buf, 1, 1));
+        const obj = new LineSegments2(g, this._lineMat([255, 255, 255], (ln.width || 1.3) * 1.15, { alpha: ln.alpha ?? 1, vc: true, va: true }));
+        obj.renderOrder = 1;            // 在其余线之后画 (它不写深度)
+        return obj;
+      }
       return new LineSegments2(g, this._lineMat([255, 255, 255], (ln.width || 1.3) * 1.15, { alpha: ln.alpha ?? 1, vc: true }));
     }
     const obj = new LineSegments2(g, this._lineMat(ln.col, (ln.width || 1.6) * 1.15, { dashed: !!ln.dash, alpha: ln.alpha ?? 1, dashSize: this.span * 0.012, gapSize: this.span * 0.008 }));

@@ -610,6 +610,27 @@ function projectFence(sc, fen, w) {
 }
 
 // ================================================== 焦散 ∩ 篱笆
+// 交点须是孤立的: Ĵ 沿篱笆走 δ (w ± δ·t) 不能比离开篱笆走 δ (w ± δ·n) 小好几个量级. 出射余量恒为 0 的一段篱笆上
+//   (如 3-1-5-7 柱晶: 两次反射把面 3 的临界角映成面 7 的, 入射掠射时出射也恰好掠射) Ĵ = J·√mE 整段为 0,
+//   "号变"只是 1e-17 的舍入噪声 —— 拿它当末端点去延拓, 会沿这一整片退化解乱走, 画出悬空的圈.
+//   真交点处两者之比 ≈ 焦散与篱笆夹角的正切, 阈值 1e-4 只拒掉 < 0.006° 的近相切接触.
+function isolatedOnFence(sc, fen, w, eps) {
+  const g = sc.P.fgrad(fen, w);
+  if (!g) return true;
+  let nv = sub(g, scl(w, dot(g, w)));
+  const nn = nrm(nv);
+  if (!(nn > 1e-12)) return true;
+  nv = scl(nv, 1 / nn);
+  const tv = cross(w, nv), d = 1e-3;
+  let along = 0, off = 0;
+  for (const s of [-1, 1]) {
+    const wa = projectFence(sc, fen, add(w, scl(tv, s * d)));
+    if (wa) { const J = sc.jhatW(wa, eps); if (Number.isFinite(J)) along = Math.max(along, Math.abs(J)); }
+    const wo = add(w, scl(nv, s * d)), J2 = sc.jhatW(scl(wo, 1 / nrm(wo)), eps);
+    if (Number.isFinite(J2)) off = Math.max(off, Math.abs(J2));
+  }
+  return !(off > 0) || along > 1e-4 * off;
+}
 function solveCausticFence(sc, fen, eps, n) {
   const outw = [];
   const near = (z, w) => Math.abs(z[0] - w[0]) < 1e-9 && Math.abs(z[1] - w[1]) < 1e-9 && Math.abs(z[2] - w[2]) < 1e-9;
@@ -653,6 +674,7 @@ function solveCausticFence(sc, fen, eps, n) {
       if (w === null && Math.abs(sc.jhatW(w0, eps)) <= 1e-6 * scale && Math.abs(sc.P.fval(fen, w0)) < 1e-11) w = w0;
       if (w === null) continue;
       if (outw.some(z => near(z, w))) continue;
+      if (!isolatedOnFence(sc, fen, w, eps)) continue;
       outw.push(w);
     }
     // 兜底: |Ĵ| 局部极小 = 相切接触 (偶次零点不号变)
@@ -668,6 +690,7 @@ function solveCausticFence(sc, fen, eps, n) {
       const move = Math.max(Math.abs(w[0] - comp[i][0]), Math.max(Math.abs(w[1] - comp[i][1]), Math.abs(w[2] - comp[i][2])));
       if (move > 0.15) continue;
       if (outw.some(z => near(z, w))) continue;
+      if (!isolatedOnFence(sc, fen, w, eps)) continue;
       nTan++;
       if (nTan > 8) { outw.length = added0; break; }   // 病态分量整体丢弃
       outw.push(w);

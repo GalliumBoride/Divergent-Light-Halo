@@ -8,6 +8,7 @@ import { Scene3D } from './scene3d.js';
 import { CrystalPreview } from './crystal.js';
 import { t, term, termKeys, setLang, getLang, detectLang, applyI18n } from './i18n.js';
 import { PRESETS } from './presets.js';
+import { distTo, FILL_LO, FILL_HI } from './spacing.js';
 import { parsePath, parseMultiPaths, faceNumFromCompact } from '../engine/crystal.js';
 import { apexDegFromMiller, millerFromApexDeg } from '../engine/lp.js';
 
@@ -98,7 +99,7 @@ let R = null;            // 主结果 { key, paths: [ … ], t0, ms, done, total
 let RO = null;           // 焦散 { key, paths: [ … ] }
 let RC = null;           // 锥切片 { key, data, dof }
 let RS = null;           // 球壳 { key, paths: [ … ], ms }
-const busy = { main: false, dense: false, obs: false, cone: false, shell: false };
+const busy = { main: false, dense: false, fill: false, obs: false, cone: false, shell: false };
 const errs = [];
 
 function mainKey() {
@@ -119,7 +120,7 @@ function runMain() {
   const cs = codes(), o = orient(), q = S.q;
   const tasks = [], route = [];
   R = { key, paths: [], t0: performance.now(), ms: 0, done: 0, total: 0, dof: o.dof, dDone: 0, dTotal: 0 };
-  pool.cancel('dense'); busy.dense = false;
+  pool.cancel('dense'); pool.cancel('fill'); busy.dense = busy.fill = false;
   errs.length = 0;
   const K = Math.max(2, NW * 2);
   cs.forEach((code, ip) => {
@@ -244,9 +245,132 @@ function runDense(myR) {
     if (res === null || R !== myR) return;
     busy.dense = false; myR.ms = performance.now() - myR.t0;
     refresh(); setStatus();
+    runFill(myR);
   }).catch(err => {
     if (R !== myR) return;
     busy.dense = false; errs.push(String(err.message || err)); console.error(err);
+    refresh(); setStatus();
+  });
+}
+
+// 整条画的层 (按 h 排好的 [{ h, curves }]). 全部算完后去掉多余的层: 整条 (95% 的点) 都贴着上一条留下的层
+//   (不到中位间距的 0.3 倍). 只量"这一层 → 上一层"一个方向: 上一层可能很短 (只剩灯旁一小段, 层都在那里汇聚), 反方向量出来很近,
+//   却不说明这一层多余 —— 它在远处也许铺开一大片. 以前取两个方向的小者, 就把这样的层连同后面一串都丢了.
+function baseLayers(P) {
+  const ver = (P.lver || 0) + (busy.dense ? 0.5 : 0);
+  if (P.base && P.base.ver === ver) return P.base.list;
+  const all = [];
+  P.layers.forEach((l, ih) => { if (l) all.push({ h: layerH(P, ih), curves: l.curves }); });
+  all.push(...P.dense);
+  all.sort((a, b) => a.h - b.h);
+  let show = all;
+  if (!busy.dense && all.length > 8) {
+    const nz = all.filter(l => l.curves.length), gaps = [];
+    for (let k = 0; k + 1 < nz.length; k++) gaps.push(layerGap(nz[k], nz[k + 1]));
+    const med = gaps.slice().sort((x, y) => x - y)[Math.floor(gaps.length / 2)] || 0;
+    show = [];
+    let last = null;
+    nz.forEach((l, k) => {
+      if (last && k + 1 < nz.length && layerGap(l, last, 'from', 0.95) < 0.3 * med) return;
+      show.push(l); last = l;
+    });
+  }
+  P.base = { ver, list: show };
+  return show;
+}
+
+// ------------------------------------------------------------ 补线 (只画在 3D 里)
+// 层线 = 仰角 h 的光锥与晕面的交线, 每条都收向灯, 相邻两层的三维间距大致 ∝ 离灯距离 (灯旁几厘米, 远处几十厘米),
+//   整条的层线怎么排都压不平. 做法同地形图的补充等高线 / 等间距流线 (Jobard–Lefer): 整条层线照旧画; 相邻两层 A, B 张开处
+//   在中间仰角补算一层 (那一段上它就是该 h 的真层线), 只画张开的那一段, 而且逐点淡入: 不透明度 = smoothstep(g; 1.4d*, 2.4d*),
+//   g = 到 A 与到 B 的距离之和. 线的"墨量" ≈ Σ不透明度 / 间距 在过渡带里保持在 0.71–0.83 / d* (硬切则在 2d* 处跳一倍,
+//   补线起止处一道道白条). 新层再与两侧比, 逐级对分 (≤ FILL_ROUNDS 级). d* = 整条层线逐点间距中位数的 0.75 倍
+//   (墨量对上原来的中位疏密). 天空里的疏密按张角算, 是另一回事, 补线不画进天空.
+const FILL_ROUNDS = 3;
+// d*: 相邻整层逐点间距 (A 上的点到 B 的距离) 中位数的 0.75 倍
+function fillScale(base) {
+  const nz = base.filter(l => l.curves.length);
+  if (nz.length < 3) return 0;
+  const g = [];
+  for (let k = 0; k + 1 < nz.length; k++) g.push(layerGap(nz[k], nz[k + 1]));
+  g.sort((x, y) => x - y);
+  const cap = 3 * (g[Math.floor(g.length / 2)] || 0), ds = [];
+  if (!(cap > 0)) return 0;
+  for (let k = 0; k + 1 < nz.length; k++) {
+    const f = distTo(nz[k + 1].curves, cap);
+    let n = 0; for (const c of nz[k].curves) n += (c.p || c).length / 3;
+    const st = Math.max(1, Math.floor(n / 100));
+    let i = 0;
+    for (const c of nz[k].curves) { const p = c.p || c; for (let j = 0; j < p.length; j += 3, i++) if (i % st === 0) ds.push(f(p[j], p[j + 1], p[j + 2])); }
+  }
+  ds.sort((x, y) => x - y);
+  return 0.75 * ds[Math.floor(ds.length / 2)];
+}
+// 折线们 pieces 上离层 X 超过 1.4d* (补线开始淡入) 的那部分有多长 (每隔一点量, 只用来排先后)
+function gapLength(pieces, X, d) {
+  const f = distTo(X.curves, FILL_HI * d);
+  let L = 0;
+  for (const c of pieces) {
+    const p = c.p || c;
+    for (let i = 0; i + 8 < p.length; i += 6)
+      if (f(p[i], p[i + 1], p[i + 2]) > FILL_LO * d) L += Math.hypot(p[i + 6] - p[i], p[i + 7] - p[i + 1], p[i + 8] - p[i + 2]);
+  }
+  return L;
+}
+function runFill(myR, round = 1) {
+  if (myR.dof !== 2 || R !== myR) return;
+  const o = orient(), tasks = [], route = [];
+  const K = Math.max(2, NW * 2);
+  myR.paths.forEach((P, ip) => {
+    if (round === 1) { P.fill = []; P.fillD = fillScale(baseLayers(P)); P.fver = (P.fver || 0) + 1; }
+    const d = P.fillD;
+    if (!(d > 0)) return;
+    // 这一轮要比的相邻对: 第一轮 = 相邻整层 (两个方向都量); 之后 = 上一轮补的层与它两侧 (只量它画出来的那部分)
+    const pairs = [];
+    if (round === 1) {
+      const nz = baseLayers(P).filter(l => l.curves.length);
+      for (let k = 0; k + 1 < nz.length; k++) {
+        const A = nz[k], B = nz[k + 1];
+        pairs.push({ A, B, L: gapLength(A.curves, B, d) + gapLength(B.curves, A, d) });
+      }
+    } else for (const F of P.fill) if (F.lv === round - 1 && F.kept.length) {
+      pairs.push({ A: F.pa, B: F, L: gapLength(F.kept, F.pa, d) });
+      pairs.push({ A: F, B: F.pb, L: gapLength(F.kept, F.pb, d) });
+    }
+    // 第一轮不设上限 (随机漏掉几个间隔就是一道道白条); 往下几轮总数封顶 = 整层间隔数的 1.5 倍, 按张开的长度排先后
+    if (round === 1) P.fillCap = Math.round(1.5 * pairs.length);
+    const cand = pairs.filter(q => q.L > 3 * d && Math.abs(q.B.h - q.A.h) > 1e-4)
+      .sort((a, b) => b.L - a.L).slice(0, Math.max(round === 1 ? pairs.length : 0, P.fillCap - P.fill.length));
+    if (!cand.length) return;
+    const base = { ...common(), fp: P.fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta,
+      lowitz: !!o.lowitz, surf: S.surf2, nG: [61, 85, 109][S.q], d };   // 种子网格粗一些: 补线只画在层张开的大片区域, 比一格还小的闭环漏了无妨
+    // 修剪 (逐点到两侧的距离) 也在 Worker 里做, 主线程只收结果: 两侧层的折线随任务送过去
+    const pos = X => X.curves.map(c => c.p || c);
+    const n = Math.max(1, Math.ceil(cand.length / K));
+    for (let a = 0; a < cand.length; a += n) {
+      const part = cand.slice(a, a + n);
+      tasks.push({ kind: 'fill2', args: { ...base, items: part.map(q => ({ h: 0.5 * (q.A.h + q.B.h), pa: pos(q.A), pb: pos(q.B) })) } });
+      route.push([ip, part]);
+    }
+  });
+  if (!tasks.length) { if (busy.fill) myR.ms = performance.now() - myR.t0; busy.fill = false; refresh(); setStatus(); return; }
+  if (round === 1) { myR.dDone = 0; myR.dTotal = 0; }
+  myR.dTotal += tasks.length;
+  busy.fill = true; setStatus();
+  pool.run('fill', tasks, (i, data) => {
+    if (R !== myR) return;
+    const [ip, part] = route[i], P = myR.paths[ip];
+    data.forEach((l, k) => { if (l.curves.length) P.fill.push({ h: l.h, curves: l.curves, kept: l.kept, lv: round, pa: part[k].A, pb: part[k].B }); });
+    P.fver++;
+    myR.dDone++;
+    scheduleRefresh(); setStatus();
+  }).then(res => {
+    if (res === null || R !== myR) return;
+    if (round < FILL_ROUNDS) runFill(myR, round + 1);
+    else { busy.fill = false; myR.ms = performance.now() - myR.t0; refresh(); setStatus(); }
+  }).catch(err => {
+    if (R !== myR) return;
+    busy.fill = false; errs.push(String(err.message || err)); console.error(err);
     refresh(); setStatus();
   });
 }
@@ -314,7 +438,7 @@ let schedTimer = 0;
 function schedule(immediate) {
   clearTimeout(schedTimer);
   const go = () => {
-    if (!codes().length) { R = null; RO = null; RC = null; RS = null; for (const ch of ['main', 'dense', 'obs', 'cone', 'shell']) pool.cancel(ch); busy.main = busy.dense = busy.obs = busy.cone = busy.shell = false; refresh(); setStatus(); return; }
+    if (!codes().length) { R = null; RO = null; RC = null; RS = null; for (const ch of ['main', 'dense', 'fill', 'obs', 'cone', 'shell']) pool.cancel(ch); busy.main = busy.dense = busy.fill = busy.obs = busy.cone = busy.shell = false; refresh(); setStatus(); return; }
     runMain(); runObs(); runCone(); runShell(); refresh(); setStatus();
   };
   if (immediate) go(); else schedTimer = setTimeout(go, 140);
@@ -533,42 +657,19 @@ function buildDL() {
     if (ob) { if (lay.bEntry) line(ob.entry, C.entry, 2); if (lay.bMirror) line(ob.mirror, C.mirror, 2); if (lay.bTir) line(ob.tir, C.tir, 2); }
     if (lay.surf && P.dof === 2) {
       // 二自由度: 每个 h 层是一条 (或几条) 平行光曲线经锥映射 → 按层着色的线 (数据与配色不变就复用同一组对象)
-      const lk = [lay.colorBy, rng ? rng.join(',') : '', P.lver || 0, pcol, busy.dense ? 1 : 0].join('|');
+      const lk = [lay.colorBy, rng ? rng.join(',') : '', P.lver || 0, P.fver || 0, pcol, busy.dense ? 1 : 0].join('|');
       if (!P.layerLines || P.layerLines.key !== lk) {
-        const segs = [], segCols = [], D = baseline(), span = rng ? Math.max(1e-9, rng[1] - rng[0]) : 1;
-        const all = [];
-        P.layers.forEach((l, ih) => { if (l) all.push({ h: layerH(P, ih), curves: l.curves }); });
-        all.push(...P.dense);
-        all.sort((a, b) => a.h - b.h);
-        // 全部算完后去掉多余的层: 整条 (95% 的点) 都贴着上一条留下的层 (不到中位间距的 0.3 倍), 疏密更匀.
-        //   只量"这一层 → 上一层"一个方向: 上一层可能很短 (只剩灯旁一小段, 层都在那里汇聚), 反方向量出来很近,
-        //   却不说明这一层多余 —— 它在远处也许铺开一大片. 以前取两个方向的小者, 就把这样的层连同后面一串都丢了.
-        let show = all;
-        if (!busy.dense && all.length > 8) {
-          const nz = all.filter(l => l.curves.length), gaps = [];
-          for (let k = 0; k + 1 < nz.length; k++) gaps.push(layerGap(nz[k], nz[k + 1]));
-          const med = gaps.slice().sort((x, y) => x - y)[Math.floor(gaps.length / 2)] || 0;
-          show = [];
-          let last = null;
-          nz.forEach((l, k) => {
-            if (last && k + 1 < nz.length && layerGap(l, last, 'from', 0.95) < 0.3 * med) return;
-            show.push(l); last = l;
-          });
-        }
-        show.forEach(l => {
-          const h = l.h;
-          for (const c of l.curves) {
-            let col = pcol;
-            const cp = c.p || c;
-            if (rng && lay.colorBy === 'h') col = cmap((h - rng[0]) / span);
-            else if (rng && lay.colorBy === 'rho') col = cmap((rhoOf(cp, Math.floor(cp.length / 6), E, D) - rng[0]) / span);
-            segs.push(c); segCols.push(col);
-          }
-        });
-        P.layerLines = { key: lk, segs, segCols };
+        const D = baseline(), span = rng ? Math.max(1e-9, rng[1] - rng[0]) : 1;
+        const colOf = (h, cp) => rng && lay.colorBy === 'h' ? cmap((h - rng[0]) / span)
+          : rng && lay.colorBy === 'rho' ? cmap((rhoOf(cp, Math.floor(cp.length / 6), E, D) - rng[0]) / span) : pcol;
+        const segs = [], segCols = [], fSegs = [], fCols = [], fAl = [];
+        for (const l of baseLayers(P)) for (const c of l.curves) { segs.push(c); segCols.push(colOf(l.h, c.p || c)); }
+        for (const F of P.fill || []) for (const c of F.kept) { fSegs.push(c); fCols.push(colOf(F.h, c.p)); fAl.push(c.a); }
+        P.layerLines = { key: lk, segs, segCols, fSegs, fCols, fAl };
       }
-      const LL = P.layerLines;
-      if (LL.segs.length) dl.lines.push({ segs: LL.segs, segCols: LL.segCols, col: pcol, width: P.dense.length ? 1 : 1.3, alpha: 0.85 });
+      const LL = P.layerLines, wl = P.dense.length ? 1 : 1.3;
+      if (LL.segs.length) dl.lines.push({ segs: LL.segs, segCols: LL.segCols, col: pcol, width: wl, alpha: 0.85 });
+      if (LL.fSegs.length) dl.lines.push({ segs: LL.fSegs, segCols: LL.fCols, vAlpha: LL.fAl, col: pcol, width: wl, alpha: 0.85, only3d: true });
     }
     if (lay.pts) {
       const cl = pathCloud(P);
@@ -686,14 +787,14 @@ function renderColorbar(rng) {
 // ============================================================ 状态栏 / 面包屑 / 结果
 function setStatus() {
   const st = $('status'), tx = $('statusText');
-  const any = busy.main || busy.dense || busy.obs || busy.cone || busy.shell;
+  const any = busy.main || busy.dense || busy.fill || busy.obs || busy.cone || busy.shell;
   st.classList.toggle('busy', any);
   st.classList.toggle('err', errs.length > 0);
   $('prog3d').classList.toggle('on', any); $('progSky').classList.toggle('on', any);
   if (errs.length) { tx.textContent = t('st.err', { e: errs[0].split('\n')[0].slice(0, 120) }); return; }
   if (!codes().length) { tx.textContent = t('st.noPath'); return; }
   if (busy.main && R) { tx.textContent = t('st.main', { d: R.done, n: R.total }); return; }
-  if (busy.dense && R) { tx.textContent = t('st.dense', { d: R.dDone, n: R.dTotal }); return; }
+  if ((busy.dense || busy.fill) && R) { tx.textContent = t(busy.dense ? 'st.dense' : 'st.fill', { d: R.dDone, n: R.dTotal }); return; }
   if (any) { tx.textContent = t(busy.obs ? 'st.obs' : busy.shell ? 'st.shell' : 'st.cone'); return; }
   if (R) tx.textContent = t('st.done', { ms: Math.round(R.ms) });
 }
