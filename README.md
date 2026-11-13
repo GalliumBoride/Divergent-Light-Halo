@@ -20,7 +20,7 @@ The whole tool is one HTML file. You can also download [`dist/DivergentLightHalo
 - **Cone slice.** One layer of the computation: the cone of light leaving the lamp at elevation h, and the crystals on it.
 - **Divergency shell.** The halo curve on a sphere of radius r around the eye (ρ = r/D, κ = lg ρ), with arc ends, folds and cusps. ρ → 0 is the parallel-light halo, ρ → ∞ the anti-lamp profile.
 
-Two views, side by side or one at a time: a **3D scene** (orbit, zoom, pan; oblique / side / top / from-the-eye presets) and the **observer sky** (rectilinear, four fisheye projections or a panorama; drag to look around; hover for azimuth, elevation and distance from the lamp).
+Two views, side by side or one at a time: a **3D scene** (orbit, zoom, pan; oblique / side / top / from-the-eye presets) and the **observer sky** (rectilinear, four fisheye projections or a panorama; drag to look around; hover for azimuth, elevation and distance from the lamp). Under **Tools → Photo overlay** a real photo can be laid under the sky view to compare with (sky view only; load it, drag it onto the sky view or paste it). The sky is then framed to the photo's aspect ratio, so resizing the window does not shift one against the other, and at scale 1 the photo fills the frame (an all-sky fisheye photo at a 180° fisheye field has its image circle inscribed). The photo can be scaled, moved and rotated with sliders or, with “Drag photo” on, with the mouse (drag, wheel, Shift + drag); “Halo transp.” fades the simulated halo itself, while boundaries and the grid stay. The photo is kept in the browser (IndexedDB) and survives a reload.
 
 You can choose:
 - **Lamp and eye**: lamp elevation (−90° to 90°), lamp distance (1–300 m), eye height.

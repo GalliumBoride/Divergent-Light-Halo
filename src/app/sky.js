@@ -14,7 +14,10 @@ export function fovMax(lens) {
 }
 
 export class SkyProj {
-  set(az, el, fov, lens, W, H) {
+  // frame = { w, h }: 投影按这块居中的画框取景 (载入底图时 = 照片按长宽比等比放进视图), 鱼眼像圈内切画框、不留边;
+  //   不给就按整个视图 (鱼眼留 18 px 边)
+  set(az, el, fov, lens, W, H, frame = null) {
+    const FW = frame ? frame.w : W, FH = frame ? frame.h : H;
     this.lens = lens;
     const a = -az * DEG, e = el * DEG;
     const ce = Math.cos(e), se = Math.sin(e), ca = Math.cos(a), sa = Math.sin(a);
@@ -26,10 +29,10 @@ export class SkyProj {
     this.cosHf = Math.cos(Math.min(this.hf, Math.PI));
     this.azRad = -az * DEG;
     const hfLin = Math.min(this.hf, 85.0 * DEG);
-    this.linFocal = 0.5 * Math.sqrt(W * W + H * H) / Math.tan(hfLin);
-    this.eqScale = Math.min(W / 2.0, H) / Math.PI;
+    this.linFocal = 0.5 * Math.sqrt(FW * FW + FH * FH) / Math.tan(hfLin);
+    this.eqScale = Math.min(FW / 2.0, FH) / Math.PI;
     this.cx = W / 2; this.cy = H / 2; this.W = W; this.H = H;
-    this.rpx = Math.min(W, H) / 2 - 18;
+    this.rpx = Math.min(FW, FH) / 2 - (frame ? 0 : 18);
   }
 
   /** 方向 → 屏幕 (this.x, this.y); 不可见返回 false */
@@ -182,6 +185,18 @@ void main() {
   if (uPt > 0.5 && dot(gl_PointCoord - 0.5, gl_PointCoord - 0.5) > 0.25) discard;
   gl_FragColor = vec4(vCol, uAlpha);
 }`;
+// 底图: 一个带纹理的四边形 (屏幕像素坐标), 不透明, 画在晕面下面
+const VS_BG = `
+precision highp float;
+attribute vec2 aPos, aUv;
+uniform float uW, uH;
+varying vec2 vUv;
+void main() { vUv = aUv; gl_Position = vec4(2.0 * aPos.x / uW - 1.0, 1.0 - 2.0 * aPos.y / uH, 0.9, 1.0); }`;
+const FS_BG = `
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D uTex;
+void main() { gl_FragColor = vec4(texture2D(uTex, vUv).rgb, 1.0); }`;
 
 class SkyGL {
   constructor(canvas) {
@@ -190,22 +205,44 @@ class SkyGL {
     this.gl = gl;
     if (!gl) return;
     const mk = (src, type) => { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(s)); return s; };
-    const prog = (vs) => {
+    const prog = (vs, fs = FS) => {
       const p = gl.createProgram();
-      gl.attachShader(p, mk(vs, gl.VERTEX_SHADER)); gl.attachShader(p, mk(FS, gl.FRAGMENT_SHADER));
+      gl.attachShader(p, mk(vs, gl.VERTEX_SHADER)); gl.attachShader(p, mk(fs, gl.FRAGMENT_SHADER));
       gl.linkProgram(p);
       if (!gl.getProgramParameter(p, gl.LINK_STATUS)) console.error(gl.getProgramInfoLog(p));
       const u = {};
       const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
       for (let i = 0; i < n; i++) { const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); }
-      return { p, u, aDir: gl.getAttribLocation(p, 'aDir'), aCen: gl.getAttribLocation(p, 'aCen'), aCol: gl.getAttribLocation(p, 'aCol') };
+      return { p, u, aDir: gl.getAttribLocation(p, 'aDir'), aCen: gl.getAttribLocation(p, 'aCen'), aCol: gl.getAttribLocation(p, 'aCol'),
+        aPos: gl.getAttribLocation(p, 'aPos'), aUv: gl.getAttribLocation(p, 'aUv') };
     };
-    this.pm = prog(VS_MESH); this.pp = prog(VS_PTS);
+    this.pm = prog(VS_MESH); this.pp = prog(VS_PTS); this.pb = prog(VS_BG, FS_BG);
+    this.bgTex = null; this.bgQuad = gl.createBuffer(); this.bgUv = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.bgUv); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 1, 0, 0, 1, 1, 1]), gl.STATIC_DRAW);
     this.meshes = new Map();       // 数据数组 → GPU 缓冲
     this.clouds = new Map();
   }
 
   _buf(data) { const gl = this.gl, b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); return b; }
+
+  /** 底图纹理 (画布 / 位图, 已缩到纹理上限以内); null = 清除 */
+  setBgImage(src) {
+    const gl = this.gl;
+    if (!gl) return;
+    if (this.bgTex) { gl.deleteTexture(this.bgTex); this.bgTex = null; }
+    if (!src) return;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, src);
+    // 任意尺寸 (WebGL1 非 2 的幂): 不做 mipmap, 边缘夹紧
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    this.bgTex = tex;
+  }
+  get maxTex() { return this.gl ? this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) : 4096; }
   _free(e) { for (const k of ['dir', 'cen', 'col']) if (e[k]) this.gl.deleteBuffer(e[k]); }
 
   /** 网格: [{ dir: Float32Array (每顶点), cols: Uint8Array | null, col: [r,g,b] }] (三角形不共享顶点) */
@@ -262,12 +299,28 @@ class SkyGL {
     this.cloudList = list.map(c => this.clouds.get(c.dir));
   }
 
-  render(p, V, dpr, mirror) {
+  // bgQuad: 底图四角的屏幕坐标 [左上, 右上, 左下, 右下] (不画底图时 null); haloA: 晕本身的不透明度倍数 (「晕透明」)
+  render(p, V, dpr, mirror, bgQuad = null, haloA = 1) {
     const gl = this.gl;
     if (!gl) return;
     gl.viewport(0, 0, this.cv.width, this.cv.height);
     gl.clearColor(1, 1, 1, 1); gl.clearDepth(1);
     gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    if (bgQuad && this.bgTex) {
+      const pr = this.pb;
+      gl.useProgram(pr.p);
+      gl.uniform1f(pr.u.uW, p.W); gl.uniform1f(pr.u.uH, p.H);
+      gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.bgTex); gl.uniform1i(pr.u.uTex, 0);
+      for (let i = 0; i < 4; i++) gl.disableVertexAttribArray(i);       // 上一帧网格 / 点留下的属性数组 (缓冲可能已释放)
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.bgQuad); gl.bufferData(gl.ARRAY_BUFFER, bgQuad, gl.DYNAMIC_DRAW);
+      gl.enableVertexAttribArray(pr.aPos); gl.vertexAttribPointer(pr.aPos, 2, gl.FLOAT, false, 0, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.bgUv);
+      gl.enableVertexAttribArray(pr.aUv); gl.vertexAttribPointer(pr.aUv, 2, gl.FLOAT, false, 0, 0);
+      gl.disable(gl.DEPTH_TEST); gl.disable(gl.BLEND);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.disableVertexAttribArray(pr.aPos); gl.disableVertexAttribArray(pr.aUv);
+    }
+    if (!(haloA > 0.002)) return;
     const round = V.lens >= 1 && V.lens <= 4 && V.fov < 359 ? 1 : 0;
     const setU = (pr) => {
       const u = pr.u;
@@ -281,7 +334,7 @@ class SkyGL {
     if (this.meshList && this.meshList.length) {
       const pr = this.pm;
       gl.useProgram(pr.p); setU(pr);
-      gl.uniform1f(pr.u.uAlpha, 0.62); gl.uniform1f(pr.u.uPt, 0);
+      gl.uniform1f(pr.u.uAlpha, 0.62 * haloA); gl.uniform1f(pr.u.uPt, 0);
       gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LESS);
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       for (const ys of sides) {
@@ -297,7 +350,7 @@ class SkyGL {
     if (this.cloudList && this.cloudList.length) {
       const pr = this.pp;
       gl.useProgram(pr.p); setU(pr);
-      gl.uniform1f(pr.u.uAlpha, 0.55); gl.uniform1f(pr.u.uPt, 1); gl.uniform1f(pr.u.uPs, 2.2 * dpr);
+      gl.uniform1f(pr.u.uAlpha, 0.55 * haloA); gl.uniform1f(pr.u.uPt, 1); gl.uniform1f(pr.u.uPs, 2.2 * dpr);
       gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       for (const ys of sides) {
         gl.uniform1f(pr.u.uMirror, ys);
@@ -336,11 +389,37 @@ export class SkyView {
     this.hover = null;
     this.onView = null;
     this.onHover = null;
+    this.onBg = null;              // 拖图 / 滚轮改了底图摆放 → 回调同步面板
     this.dragging = false;
+    // 底图 (同原窗体「发散光 BSDF 渲染」的底图拟合): 载入后整个投影按照片长宽比的画框取景 (显示与否都不变,
+    //   开关底图时模拟不跳); 照片在画框里: scale 1 = 铺满画框, ox/oy 单位 = 半个画框 (oy 向上为正), rot 度 (逆时针为正)
+    this.bgImg = null;             // { iw, ih } 原图像素 (纹理可能缩过, 比例不变)
+    this.bg = { show: true, edit: false, scale: 1, ox: 0, oy: 0, rot: 0 };
+    this.haloA = 1;                // 晕本身 (网格 / 采样点 / 二自由度层线) 的不透明度倍数
     this._bind();
   }
 
   setView(v) { Object.assign(this.V, v); this.V.fov = Math.min(this.V.fov, fovMax(this.V.lens)); this.draw(); }
+  setBgImage(src, iw, ih) { this.gpu.setBgImage(src); this.bgImg = src ? { iw, ih } : null; this.draw(); }
+  setBg(o) { Object.assign(this.bg, o); this.cv.style.cursor = this.bg.edit && this.bgImg ? 'move' : ''; this.draw(); }
+  setHaloAlpha(a) { this.haloA = a; this.draw(); }
+  get maxTex() { return this.gpu.maxTex; }
+  // 画框: 照片按长宽比等比放进视图 (没有照片时 null = 整个视图)
+  frame() {
+    if (!this.bgImg || !(this.cssW > 0)) return null;
+    const f = Math.min(this.cssW / this.bgImg.iw, this.cssH / this.bgImg.ih);
+    return { w: this.bgImg.iw * f, h: this.bgImg.ih * f };
+  }
+  // 照片四角的屏幕坐标 [左上, 右上, 左下, 右下] (屏幕 y 向下, 所以逆时针 rot 对应 −rot)
+  _bgQuad(fr) {
+    const b = this.bg;
+    if (!fr || !b.show) return null;
+    const cx = this.cssW / 2 + b.ox * fr.w / 2, cy = this.cssH / 2 - b.oy * fr.h / 2;
+    const hw = fr.w * b.scale / 2, hh = fr.h * b.scale / 2, a = -b.rot * DEG, c = Math.cos(a), s = Math.sin(a);
+    const q = new Float32Array(8);
+    [[-hw, -hh], [hw, -hh], [-hw, hh], [hw, hh]].forEach(([x, y], i) => { q[2 * i] = cx + x * c - y * s; q[2 * i + 1] = cy + x * s + y * c; });
+    return q;
+  }
   setScene(S) {
     this.S = S;
     this.gpu.setMeshes(S ? S.meshes || [] : []);
@@ -351,13 +430,26 @@ export class SkyView {
   _bind() {
     const cv = this.cv;
     let drag = null;
+    const bgEdit = () => this.bg.edit && this.bgImg;
     cv.addEventListener('pointerdown', e => {
-      drag = { x: e.clientX, y: e.clientY, az: this.V.az, el: this.V.el };
+      drag = { x: e.clientX, y: e.clientY, az: this.V.az, el: this.V.el, bg: bgEdit() ? { ...this.bg } : null };
       try { cv.setPointerCapture(e.pointerId); } catch (err) { /* 合成事件没有指针 */ }
       this.dragging = true;
     });
     cv.addEventListener('pointermove', e => {
       const r = cv.getBoundingClientRect();
+      if (drag && drag.bg) {
+        // 拖图: 左键拖动 = 移动 (按画框的显示尺寸换算, 与画框同一基准), Shift + 拖动 = 旋转 (0.3°/px)
+        const dx = e.clientX - drag.x, dy = e.clientY - drag.y, fr = this.frame();
+        if (e.shiftKey) this.bg.rot = wrap180(drag.bg.rot + dx * 0.3);
+        else if (fr) {
+          this.bg.ox = Math.max(-3, Math.min(3, drag.bg.ox + dx / (fr.w / 2)));
+          this.bg.oy = Math.max(-3, Math.min(3, drag.bg.oy - dy / (fr.h / 2)));
+        }
+        this.draw();
+        if (this.onBg) this.onBg(this.bg);
+        return;
+      }
       if (drag) {
         const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
         const k = this.V.fov / Math.max(200, Math.min(r.width, r.height));
@@ -378,6 +470,12 @@ export class SkyView {
     cv.addEventListener('pointerleave', () => { this.hover = null; this.drawOverlayOnly(); if (this.onHover) this.onHover(null); });
     cv.addEventListener('wheel', e => {
       e.preventDefault();
+      if (bgEdit()) {                       // 拖图模式: 滚轮缩放照片 (乘性)
+        this.bg.scale = Math.max(0.01, Math.min(20, this.bg.scale * (e.deltaY < 0 ? 1.08 : 1 / 1.08)));
+        this.draw();
+        if (this.onBg) this.onBg(this.bg);
+        return;
+      }
       const f = Math.exp(e.deltaY * 0.0012);
       this.V.fov = Math.max(2, Math.min(fovMax(this.V.lens), this.V.fov * f));
       this.draw();
@@ -428,9 +526,10 @@ export class SkyView {
     this.resize();
     const W = this.cssW, H = this.cssH, ctx = this.ctx, V = this.V, p = this.proj;
     if (!(W > 2 && H > 2)) return;
-    p.set(V.az, V.el, V.fov, V.lens, W, H);
+    const fr = this.frame();
+    p.set(V.az, V.el, V.fov, V.lens, W, H, fr);
     const S = this.S;
-    this.gpu.render(p, V, this.dpr, !!(S && S.mirror));
+    this.gpu.render(p, V, this.dpr, !!(S && S.mirror), this._bgQuad(fr), this.haloA);
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, this.cv.width, this.cv.height);
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
@@ -469,18 +568,20 @@ export class SkyView {
     const sides = S.mirror ? [1, -1] : [1];
     for (const ln of S.lines) {
       if (ln.only3d) continue;
+      const al = (ln.alpha ?? 1) * (ln.body ? this.haloA : 1);      // body: 晕本身 (二自由度层线), 跟「晕透明」走
+      if (!(al > 0.003)) continue;
       ctx.lineWidth = ln.width || 1.6;
       ctx.setLineDash(ln.dash || []);
       if (ln.segCols) {
         ln.segs.forEach((seg, k) => {
-          ctx.strokeStyle = css(ln.segCols[k], ln.alpha ?? 1);
+          ctx.strokeStyle = css(ln.segCols[k], al);
           ctx.beginPath();
           for (const ys of sides) this._pathOf(seg, ys);
           ctx.stroke();
         });
         continue;
       }
-      ctx.strokeStyle = css(ln.col, ln.alpha ?? 1);
+      ctx.strokeStyle = css(ln.col, al);
       ctx.beginPath();
       for (const ys of (ln.noMirror ? [1] : sides)) for (const seg of ln.segs) this._pathOf(seg, ys);
       ctx.stroke();
@@ -594,7 +695,12 @@ export class SkyView {
   }
 
   _drawFrame() {
-    const ctx = this.ctx, p = this.proj, V = this.V;
+    const ctx = this.ctx, p = this.proj, V = this.V, fr = this.frame();
+    if (fr) {                                    // 底图画框 (照片按比例放进视图的那块)
+      ctx.strokeStyle = 'rgba(0,0,0,.28)'; ctx.lineWidth = 1; ctx.setLineDash([4, 4]);
+      ctx.strokeRect(p.cx - fr.w / 2 + 0.5, p.cy - fr.h / 2 + 0.5, fr.w - 1, fr.h - 1);
+      ctx.setLineDash([]);
+    }
     if (V.lens === 0 || V.lens === 5) return;
     if (V.fov >= 359) return;
     ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 1;

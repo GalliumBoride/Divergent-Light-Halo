@@ -42,6 +42,7 @@ const DEFAULTS = {
          caustic: false, cSeam: false, cAsym: true, parArc: true, ref22: false, foci: true, ground: true, mirror: true },
   cone: { on: false, h: 22, alpha: 30 },
   shell: { on: false, kappa: -0.301, r: 7.5, master: 'kappa', sphere: true, alpha: 12 },
+  bg: { show: true, edit: false, scale: 1, ox: 0, oy: 0, rot: 0, haloT: 0 },
   view: 'split', single: 'sky', sky: { az: 0, el: 10, fov: 180, lens: 2 }, lang: null,
   panel: true, rt: 'layers', crystalOpen: false,
 };
@@ -652,7 +653,7 @@ function buildDL() {
     if (lay.surf && P.mesh && P.mesh.pos.length)
       dl.meshes.push({ pos: P.mesh.pos, dir: P.mesh.dir, nrm: P.mesh.nrm, cols: meshColors(P, lay.colorBy, rng), col: pcol });
     // 平面退化 (灯眼等高的板晶柱面光路): 晕面整块躺在灯眼所在的水平面里, 天空里全在地平线上 — 画成地平线上的弧
-    if (lay.surf && P.mesh && P.mesh.sky) line(P.mesh.sky, pcol, 3, { skyOnly: true });
+    if (lay.surf && P.mesh && P.mesh.sky) line(P.mesh.sky, pcol, 3, { skyOnly: true, body: true });
     const ob = P.mesh && P.mesh.outline;            // 平面退化时的边界线 (边界引擎在这里也退化, 用网格的精确区间端点)
     if (ob) { if (lay.bEntry) line(ob.entry, C.entry, 2); if (lay.bMirror) line(ob.mirror, C.mirror, 2); if (lay.bTir) line(ob.tir, C.tir, 2); }
     if (lay.surf && P.dof === 2) {
@@ -668,7 +669,7 @@ function buildDL() {
         P.layerLines = { key: lk, segs, segCols, fSegs, fCols, fAl };
       }
       const LL = P.layerLines, wl = P.dense.length ? 1 : 1.3;
-      if (LL.segs.length) dl.lines.push({ segs: LL.segs, segCols: LL.segCols, col: pcol, width: wl, alpha: 0.85 });
+      if (LL.segs.length) dl.lines.push({ segs: LL.segs, segCols: LL.segCols, col: pcol, width: wl, alpha: 0.85, body: true });
       if (LL.fSegs.length) dl.lines.push({ segs: LL.fSegs, segCols: LL.fCols, vAlpha: LL.fAl, col: pcol, width: wl, alpha: 0.85, only3d: true });
     }
     if (lay.pts) {
@@ -1215,6 +1216,101 @@ function renderProbes() {
   $('shellStatus').textContent = ss;
 }
 
+// ============================================================ 底图对比 (只在观测者天空里)
+// 同原窗体「发散光 BSDF 渲染」的底图拟合: 载入 / 重置 / 清除, 显示开关, 鼠标拖图 (拖动 = 移动, 滚轮 = 缩放, Shift + 拖动 = 旋转),
+//   缩放 / 左右 / 上下 / 旋转 (都可键入数值) + 晕本身的透明度. 照片 Blob 存 IndexedDB (刷新后还在), 摆放参数存在状态里.
+//   照片也可以拖进天空视图, 或在页面上 Ctrl+V 粘贴.
+const bgDB = (() => {
+  const open = () => new Promise((res, rej) => {
+    const r = indexedDB.open('divergent-light-halo', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('bg');
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+  const run = (mode, fn) => open().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('bg', mode), q = fn(tx.objectStore('bg'));
+    tx.oncomplete = () => res(q.result); tx.onerror = () => rej(tx.error);
+  }));
+  return {
+    put: v => run('readwrite', s => s.put(v, 'img')).catch(() => {}),
+    get: () => run('readonly', s => s.get('img')).catch(() => null),
+    del: () => run('readwrite', s => s.delete('img')).catch(() => {}),
+  };
+})();
+let bgInfo = null;                    // { name, w, h } 当前底图
+async function loadBg(blob, name, fresh) {
+  try {
+    const img = await createImageBitmap(blob);
+    const iw = img.width, ih = img.height, k = Math.min(1, Math.min(sky.maxTex, 4096) / Math.max(iw, ih));
+    let src = img;
+    if (k < 1) {                      // 大照片缩到纹理上限以内 (比例不变, 画框按原图比例)
+      const c = document.createElement('canvas');
+      c.width = Math.round(iw * k); c.height = Math.round(ih * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      src = c;
+    }
+    sky.setBgImage(src, iw, ih);
+    bgInfo = { name: name || '', w: iw, h: ih };
+    if (fresh) {                      // 新照片从像素对齐开始 (沿用上一张的缩放 / 平移看起来像裁坏了)
+      Object.assign(S.bg, { show: true, scale: 1, ox: 0, oy: 0, rot: 0 });
+      if (!(S.bg.haloT > 0)) S.bg.haloT = 50;
+      bgDB.put({ blob, name: bgInfo.name });
+      save();
+    }
+  } catch (err) {
+    $('bgStatus').textContent = t('bg.fail', { e: err.message || String(err) });
+    return;
+  }
+  applyBg();
+}
+function applyBg() {
+  sky.setBg({ show: S.bg.show, edit: S.bg.edit, scale: S.bg.scale, ox: S.bg.ox, oy: S.bg.oy, rot: S.bg.rot });
+  sky.setHaloAlpha(1 - S.bg.haloT / 100);
+  renderBg();
+}
+const bgSyncs = [];
+function bgPair(sl, inp, key, toSl, fromSl, fmt) {
+  const sync = () => { sl.value = toSl(S.bg[key]); inp.value = fmt(S.bg[key]); };
+  sl.addEventListener('input', () => { S.bg[key] = fromSl(+sl.value); inp.value = fmt(S.bg[key]); save(); applyBg(); });
+  inp.addEventListener('change', () => {
+    const v = parseFloat(inp.value);
+    if (Number.isFinite(v)) S.bg[key] = clamp(v, +inp.min, +inp.max);
+    sync(); save(); applyBg();
+  });
+  bgSyncs.push(sync);
+}
+bgPair($('slBgScale'), $('inBgScale'), 'scale', v => Math.round(100 * Math.log10(v)), v => Math.round(Math.pow(10, v / 100) * 100) / 100, v => v.toFixed(2));
+bgPair($('slBgX'), $('inBgX'), 'ox', v => Math.round(v * 100), v => v / 100, v => v.toFixed(2));
+bgPair($('slBgY'), $('inBgY'), 'oy', v => Math.round(v * 100), v => v / 100, v => v.toFixed(2));
+bgPair($('slBgRot'), $('inBgRot'), 'rot', v => Math.round(v * 10), v => v / 10, v => v.toFixed(1));
+bgPair($('slHaloT'), $('inHaloT'), 'haloT', v => v, v => v, v => String(Math.round(v)));
+function renderBg() {
+  $('ckBg').checked = S.bg.show; $('ckBgEdit').checked = S.bg.edit;
+  for (const f of bgSyncs) f();
+  for (const id of ['btnBgReset', 'btnBgClear']) $(id).disabled = !bgInfo;
+  $('bgStatus').textContent = bgInfo ? t('bg.info', bgInfo) + (S.bg.edit ? '\n' + t('bg.editHint') : '') : t('bg.none');
+}
+let bgSaveT = 0;
+sky.onBg = b => {
+  Object.assign(S.bg, { scale: Math.round(b.scale * 1000) / 1000, ox: b.ox, oy: b.oy, rot: b.rot });
+  for (const f of bgSyncs) f();
+  clearTimeout(bgSaveT); bgSaveT = setTimeout(save, 200);
+};
+$('ckBg').addEventListener('change', e => { S.bg.show = e.target.checked; save(); applyBg(); });
+$('ckBgEdit').addEventListener('change', e => { S.bg.edit = e.target.checked; save(); applyBg(); });
+$('btnBgLoad').addEventListener('click', () => $('fileBg').click());
+$('fileBg').addEventListener('change', e => { const f = e.target.files[0]; if (f) loadBg(f, f.name, true); e.target.value = ''; });
+$('btnBgReset').addEventListener('click', () => { Object.assign(S.bg, { scale: 1, ox: 0, oy: 0, rot: 0 }); save(); applyBg(); });
+$('btnBgClear').addEventListener('click', () => { sky.setBgImage(null); bgInfo = null; bgDB.del(); applyBg(); });
+// 拖进天空视图 / 粘贴
+const imageOf = list => [...(list || [])].find(f => f && f.type && f.type.startsWith('image/'));
+$('paneSky').addEventListener('dragover', e => { if ([...e.dataTransfer.items].some(i => i.type.startsWith('image/'))) e.preventDefault(); });
+$('paneSky').addEventListener('drop', e => { const f = imageOf(e.dataTransfer.files); if (f) { e.preventDefault(); loadBg(f, f.name, true); } });
+window.addEventListener('paste', e => {
+  if (/^(INPUT|TEXTAREA)$/.test(document.activeElement && document.activeElement.tagName)) return;
+  const f = imageOf([...e.clipboardData.items].map(i => i.kind === 'file' ? i.getAsFile() : null));
+  if (f) { e.preventDefault(); loadBg(f, f.name || 'clipboard', true); }
+});
+
 // ============================================================ 术语提示 / 术语表
 const tip = $('tip');
 function showTip(btn) {
@@ -1319,7 +1415,7 @@ function applyLang(code) {
   S.lang = setLang(code); save();
   applyI18n();
   renderSeg('langSeg', S.lang, 'lang');
-  fillLens(); fillSurf(); renderPresets(); renderModeUI(); renderMiller(); renderMoreTags(); renderChain(); drawSceneFig();
+  fillLens(); fillSurf(); renderPresets(); renderModeUI(); renderMiller(); renderMoreTags(); renderChain(); drawSceneFig(); renderBg();
   layersBuilt = ''; baseKey = '';
   RO = null;                                   // 焦散诊断文字随语言
   schedule(true);
@@ -1353,6 +1449,8 @@ sky.setView(S.sky);
 renderView();
 applyLang(detectLang(S.lang));
 syncSkyUI();
+applyBg();
+bgDB.get().then(r => { if (r && r.blob) loadBg(r.blob, r.name, false); });
 
 // 调试/自动化截图用 (控制台可用): 视图对象与状态
 window.__dlh = { v3, sky, S, refresh, pool, get R() { return R; } };

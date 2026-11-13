@@ -291,6 +291,47 @@
           <p class="probe-status" id="shellStatus"></p>
         </div>
       </div>
+      <div class="probe">
+        <div class="probe-head">
+          <label class="switch"><input type="checkbox" id="ckBg"><span class="sw"></span><b data-i18n="bg.title">底图对比</b></label>
+          <button class="qmark" data-term="bg" aria-label="?">?</button>
+          <label class="switch mini"><input type="checkbox" id="ckBgEdit"><span class="sw"></span><span data-i18n="bg.edit">鼠标拖图</span></label>
+        </div>
+        <div class="probe-body" id="bgBody">
+          <div class="crystal-btns">
+            <button class="btn small" id="btnBgLoad" data-i18n="bg.load">载入底图</button>
+            <button class="btn small" id="btnBgReset" data-i18n="bg.reset">重置图片</button>
+            <button class="btn small" id="btnBgClear" data-i18n="bg.clear">清除底图</button>
+            <input type="file" id="fileBg" accept="image/*" hidden>
+          </div>
+          <div class="slider-row">
+            <label for="slBgScale" class="lbl" data-i18n="bg.scale">缩放</label>
+            <input type="range" id="slBgScale" min="-200" max="130" step="1">
+            <span class="numbox wide"><input type="number" id="inBgScale" min="0.01" max="20" step="0.01"><i>×</i></span>
+          </div>
+          <div class="slider-row">
+            <label for="slBgX" class="lbl" data-i18n="bg.offX">左右</label>
+            <input type="range" id="slBgX" min="-300" max="300" step="1">
+            <span class="numbox wide"><input type="number" id="inBgX" min="-3" max="3" step="0.01"></span>
+          </div>
+          <div class="slider-row">
+            <label for="slBgY" class="lbl" data-i18n="bg.offY">上下</label>
+            <input type="range" id="slBgY" min="-300" max="300" step="1">
+            <span class="numbox wide"><input type="number" id="inBgY" min="-3" max="3" step="0.01"></span>
+          </div>
+          <div class="slider-row">
+            <label for="slBgRot" class="lbl" data-i18n="bg.rot">旋转</label>
+            <input type="range" id="slBgRot" min="-1800" max="1800" step="1">
+            <span class="numbox wide"><input type="number" id="inBgRot" min="-180" max="180" step="0.1"><i>°</i></span>
+          </div>
+          <div class="slider-row">
+            <label for="slHaloT" class="lbl" data-i18n="bg.haloT">晕透明</label>
+            <input type="range" id="slHaloT" min="0" max="100" step="1">
+            <span class="numbox wide"><input type="number" id="inHaloT" min="0" max="100" step="1"><i>%</i></span>
+          </div>
+          <p class="probe-status" id="bgStatus"></p>
+        </div>
+      </div>
     </section>
 
     <section class="rt-page" data-page="res">
