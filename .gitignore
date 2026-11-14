@@ -5,3 +5,6 @@ tools/ref-*/
 tools/cmp-*.mjs
 tools/cases*.json
 *.tmp.mjs
+
+# test/mesh2 的场景缓存 (层 + 精确边界线, 可重算)
+test/mesh2/cache/

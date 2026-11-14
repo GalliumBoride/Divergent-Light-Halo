@@ -145,7 +145,7 @@ const RUN = {
     });
   },
 
-  mesh2: a => stitchLayers2(a.layers, a.L, a.D),
+  mesh2: a => stitchLayers2(a.layers, a.L, a.D, a.feats || null),
 
   rims2: a => {
     const lp = a.fp.map(lpFaceFromCompact);
