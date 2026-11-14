@@ -72,7 +72,8 @@ export default {
 
   'lay.title': ['图层', 'Layers'],
   'lg.surface': ['晕面', 'Halo surface'], 'lg.bdry': ['边界', 'Boundaries'], 'lg.caustic': ['焦散', 'Caustics'], 'lg.ref': ['参考', 'Reference'],
-  'lay.surf': ['晕面', 'Halo surface'], 'lay.pts': ['光锥采样点 (原窗体)', 'Light-cone samples (original)'], 'lay.colorBy': ['着色', 'colour by'],
+  'lay.surf': ['晕面', 'Halo surface'], 'lay.pts': ['光锥采样点 (原窗体)', 'Light-cone samples (original)'], 'lay.colorBy': ['着色', 'colour by'], 'lay.style2': ['画法', 'draw as'],
+  'style2.lines': ['层线', 'Layer lines'], 'style2.mesh': ['曲面', 'Surface'], 'style2.both': ['曲面 + 层线', 'Surface + lines'],
   'color.h': ['按灯处仰角 h', 'by cone elevation h'], 'color.rho': ['按发散度 ρ', 'by divergency ρ'],
   'color.mono': ['单色', 'single colour'], 'color.path': ['按光路', 'by path'],
   'lay.bEntry': ['入射掠射', 'Entry grazing'], 'lay.bMirror': ['镜面掠射', 'Mirror grazing'], 'lay.bTir': ['出射临界', 'Exit critical'],
@@ -116,7 +117,7 @@ export default {
   'res.nothing': ['这个取向下光路走不通, 或者晶体都在截断距离外 / 灯后方: 没有晕.', 'The path does not work for this orientation, or every crystal is beyond the truncation or behind the lamp: no halo.'],
 
   'st.err': ['出错: {e}', 'Error: {e}'], 'st.noPath': ['没有光路', 'no path'],
-  'st.main': ['计算晕面 {d}/{n}', 'computing surface {d}/{n}'], 'st.dense': ['加密 h 层 {d}/{n}', 'densifying h layers {d}/{n}'], 'st.fill': ['补线 {d}/{n}', 'filling sparse gaps {d}/{n}'],
+  'st.main': ['计算晕面 {d}/{n}', 'computing surface {d}/{n}'], 'st.dense': ['加密 h 层 {d}/{n}', 'densifying h layers {d}/{n}'], 'st.fill': ['补线 {d}/{n}', 'filling sparse gaps {d}/{n}'], 'st.mesh2': ['缝合曲面', 'stitching the surface'],
   'st.obs': ['计算焦散…', 'computing caustic…'], 'st.shell': ['计算球壳…', 'computing shell…'], 'st.cone': ['计算锥切片…', 'computing cone slice…'],
   'st.done': ['完成 · {ms} ms', 'done · {ms} ms'],
   'gl.title': ['术语', 'Glossary'],

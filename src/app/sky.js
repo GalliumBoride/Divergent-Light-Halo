@@ -245,15 +245,19 @@ class SkyGL {
   get maxTex() { return this.gl ? this.gl.getParameter(this.gl.MAX_TEXTURE_SIZE) : 4096; }
   _free(e) { for (const k of ['dir', 'cen', 'col']) if (e[k]) this.gl.deleteBuffer(e[k]); }
 
-  /** 网格: [{ dir: Float32Array (每顶点), cols: Uint8Array | null, col: [r,g,b] }] (三角形不共享顶点) */
+  /** 网格: [{ dir: Float32Array (每顶点), cols: Uint8Array | null, col: [r,g,b], subdiv? }] (三角形不共享顶点) */
   setMeshes(list) {
     if (!this.gl) return;
     const keep = new Set();
-    for (const m of list) {
-      keep.add(m.dir);
-      const colKey = m.cols || String(m.col);
-      let e = this.meshes.get(m.dir);
+    for (const m0 of list) {
+      keep.add(m0.dir);
+      const colKey = m0.cols || String(m0.col);
+      let e = this.meshes.get(m0.dir);
       if (e && e.colKey === colKey) continue;
+      // subdiv: 天球上张角大的三角形细分 (方向取球面中点, 一分为四, 直到都小于 25°) 而不剔除 ——
+      //   二自由度曲面在灯点收拢, 扇形三角形一个顶点在灯上、另两个在二十几度外, 是真的面, 剔掉就是一道从灯拉出去的白带
+      const m = m0.subdiv ? { ...m0, ...subdivSky(m0.dir, m0.cols, Math.cos(25 * Math.PI / 180)) } : m0;
+      if (e && m0.subdiv) { this._free(e); e = null; }
       if (!e) {
         // 每顶点再带一份三角形重心方向: 着色器据此统一剔除 / 展开全景经度. 顶点间张角 > 25° 的三角形
         // (逐顶点投影后直边会严重偏离真实像) 重心置零 = 剔除; 网格加密后正常不会出现
@@ -268,7 +272,7 @@ class SkyGL {
           for (let k = 0; k < 3; k++) { C[o + 3 * k] = x; C[o + 3 * k + 1] = y; C[o + 3 * k + 2] = z; }
         }
         e = { n, dir: this._buf(D), cen: this._buf(C), col: null };
-        this.meshes.set(m.dir, e);
+        this.meshes.set(m0.dir, e);
       } else if (e.col) this.gl.deleteBuffer(e.col);
       const n = e.n, col = new Float32Array(3 * n);
       if (m.cols) for (let i = 0; i < 3 * n; i++) col[i] = m.cols[i] / 255;
@@ -364,6 +368,39 @@ class SkyGL {
     gl.disable(gl.BLEND);
   }
 }
+// 天球上张角大的三角形细分: 任一顶点离重心方向超过 acos(cosBig) 就按三边的球面中点一分为四 (颜色取平均), 最多 4 层.
+//   张角超过 60° 的不细分 (交给剔除): 那么大的多半是连错的, 不是灯旁收拢的扇形
+function subdivSky(D, cols, cosBig) {
+  const cosHuge = Math.cos(60 * Math.PI / 180);
+  const dir = [], col = cols ? [] : null;
+  const big = (a, b, c) => {
+    let x = a[0] + b[0] + c[0], y = a[1] + b[1] + c[1], z = a[2] + b[2] + c[2];
+    const l = Math.hypot(x, y, z);
+    if (!(l > 1e-6)) return false;                 // 退化的不管 (交给剔除)
+    x /= l; y /= l; z /= l;
+    return [a, b, c].some(v => v[0] * x + v[1] * y + v[2] * z < cosBig);
+  };
+  const mid = (a, b) => { const x = a[0] + b[0], y = a[1] + b[1], z = a[2] + b[2], l = Math.hypot(x, y, z) || 1; return [x / l, y / l, z / l]; };
+  const cm = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+  const emit = (a, b, c, ca, cb, cc, dep) => {
+    if (dep < 4 && big(a, b, c)) {
+      const ab = mid(a, b), bc = mid(b, c), ca_ = mid(c, a);
+      const cab = col && cm(ca, cb), cbc = col && cm(cb, cc), cca = col && cm(cc, ca);
+      emit(a, ab, ca_, ca, cab, cca, dep + 1); emit(ab, b, bc, cab, cb, cbc, dep + 1);
+      emit(ca_, bc, c, cca, cbc, cc, dep + 1); emit(ab, bc, ca_, cab, cbc, cca, dep + 1);
+      return;
+    }
+    dir.push(...a, ...b, ...c);
+    if (col) col.push(...ca, ...cb, ...cc);
+  };
+  for (let o = 0; o + 8 < D.length; o += 9) {
+    const v = k => [D[o + 3 * k], D[o + 3 * k + 1], D[o + 3 * k + 2]], c = k => cols ? [cols[o + 3 * k], cols[o + 3 * k + 1], cols[o + 3 * k + 2]] : null;
+    const a = v(0), b = v(1), cc = v(2), dmin = Math.min(a[0] * b[0] + a[1] * b[1] + a[2] * b[2], b[0] * cc[0] + b[1] * cc[1] + b[2] * cc[2], cc[0] * a[0] + cc[1] * a[1] + cc[2] * a[2]);
+    emit(a, b, cc, c(0), c(1), c(2), dmin < cosHuge ? 99 : 0);
+  }
+  return { dir: Float32Array.from(dir), cols: col ? Uint8Array.from(col, x => Math.round(x)) : null };
+}
+
 function bind(gl, loc, buf) {
   if (loc < 0) return;
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);

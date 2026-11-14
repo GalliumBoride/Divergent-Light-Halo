@@ -247,11 +247,19 @@ function chordDev(p, a, b) {
 //   按长度分段的折线会从真曲线上偏出去, 层线端点明明落在曲线上, 却离画出来的折线一两厘米.
 function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40, sag = 0) {
   const out = [];
-  let P = [], D = [];
-  const push = st => { P.push(st.P[0], st.P[1], st.P[2]); D.push(st.s[0], st.s[1], st.s[2]); };
+  // 状态带取向坐标 st.x 时 (层线), 每个点的 (u, v) 也一起输出 (x): 二自由度曲面网格用它对应相邻两层
+  let P = [], D = [], X = [];
+  const push = st => { P.push(st.P[0], st.P[1], st.P[2]); D.push(st.s[0], st.s[1], st.s[2]); if (st.x) X.push(st.x[0], st.x[1]); };
   // 整条落在一个点上的不要: 退化纤维 (一圈取向的天空方向都一样, J 沿它恒为 0) 映成一个点, 是点状焦散, 画不成线
   const extent = () => { let e = 0; for (let i = 3; i < P.length; i += 3) e = Math.max(e, Math.abs(P[i] - P[0]) + Math.abs(P[i + 1] - P[1]) + Math.abs(P[i + 2] - P[2])); return e; };
-  const flush = () => { if (P.length >= 6 && extent() > 1e-6) out.push({ p: Float32Array.from(P), d: Float32Array.from(D) }); P = []; D = []; };
+  const flush = () => {
+    if (P.length >= 6 && extent() > 1e-6) {
+      const o = { p: Float32Array.from(P), d: Float32Array.from(D) };
+      if (X.length === 2 * P.length / 3) o.x = Float32Array.from(X);
+      out.push(o);
+    }
+    P = []; D = []; X = [];
+  };
   // 有效 xa 与无效 xb 之间的转折点: 返回最后一个有效的 { x, s }
   const edge = (xa, sa, xb) => {
     let lo = xa, slo = sa, hi = xb;
@@ -1055,6 +1063,7 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
           const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
           if (Dn > 1e-12) v = coneBranchesFull([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E, maxDist);
           if (x.fold && v[0] && v[1]) v = foldMerge(v);
+          for (const q of v) if (q) q.x = x;
         }
         cache.set(x, v);
       }
@@ -1078,9 +1087,12 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
         if (Math.hypot(f.p[0] - l.p[k], f.p[1] - l.p[k + 1], f.p[2] - l.p[k + 2]) < 1e-3) {
           const p = new Float32Array(l.p.length + f.p.length - 3), d = new Float32Array(p.length);
           p.set(l.p); p.set(f.p.subarray(3), l.p.length); d.set(l.d); d.set(f.d.subarray(3), l.d.length);
-          pcs[0] = { p, d }; pcs.pop();
+          const m = { p, d };
+          if (f.x && l.x) { m.x = new Float32Array(l.x.length + f.x.length - 2); m.x.set(l.x); m.x.set(f.x.subarray(2), l.x.length); }
+          pcs[0] = m; pcs.pop();
         }
       }
+      for (const c of pcs) c.b = b;                 // 锥映射的哪一支 (曲面网格只在同一支内缝合)
       outCurves.push(...pcs);
     }
   }
@@ -1441,7 +1453,11 @@ export function lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, 
   const layers = [];
   try {
     for (let ih = from; ih < to; ih++) {
-      const hDeg = hFixed !== null ? hFixed : -90.0 + 180.0 * ih / Math.max(1, nH - 1);   // hFixed: 单层 (锥切片)
+      let hDeg = hFixed !== null ? hFixed : -90.0 + 180.0 * ih / Math.max(1, nH - 1);   // hFixed: 单层 (锥切片)
+      // 修正版的掠射面在 Lowitz 族里 h → 0 时闭式取样奇异: 太阳水平时可达带边缩成两个极点 (w ∥ Ec), 一整圈取向映到同一个 w,
+      //   层线穿过的那一段在 w 里只有 ∝ |sin h| 宽, |h| < 1e-5° 时分辨不出、整段丢掉 (h = 0 那层只剩四成长).
+      //   层线随 h 连续, 这一层取它的极限: 按 ±0.01° 算 (画面上分不出)
+      if (fine && surfId !== 'caustic' && zetaFree && Math.abs(hDeg) < 0.01) hDeg = hDeg < 0 ? -0.01 : 0.01;
       const hRad = hDeg * Math.PI / 180.0;
       const cosH = Math.cos(hRad), sinH = Math.sin(hRad);
       setSun(hDeg);

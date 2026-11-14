@@ -38,7 +38,7 @@ const DEFAULTS = {
   elev: 10, dist: 15, eye: 0,
   paths: '3-5', mode: 'parry', zeta: -90, theta: 0, colZeta: -90, lowTheta: 0, surf2: 'caustic',
   n: 1.31, apexUp: 56, apexLo: 56, q: 0, maxDist: 80, pyr: false,
-  lay: { surf: true, pts: false, colorBy: 'h', bEntry: true, bMirror: true, bTir: true, bSeam: true, bTurn: true, bCusp: true, bRim: true,
+  lay: { surf: true, pts: false, colorBy: 'h', style2: 'lines', bEntry: true, bMirror: true, bTir: true, bSeam: true, bTurn: true, bCusp: true, bRim: true,
          caustic: false, cSeam: false, cAsym: true, parArc: true, ref22: false, foci: true, ground: true, mirror: true },
   cone: { on: false, h: 22, alpha: 30 },
   shell: { on: false, kappa: -0.301, r: 7.5, master: 'kappa', sphere: true, alpha: 12 },
@@ -100,7 +100,7 @@ let R = null;            // 主结果 { key, paths: [ … ], t0, ms, done, total
 let RO = null;           // 焦散 { key, paths: [ … ] }
 let RC = null;           // 锥切片 { key, data, dof }
 let RS = null;           // 球壳 { key, paths: [ … ], ms }
-const busy = { main: false, dense: false, fill: false, obs: false, cone: false, shell: false };
+const busy = { main: false, dense: false, fill: false, mesh2: false, obs: false, cone: false, shell: false };
 const errs = [];
 
 function mainKey() {
@@ -121,7 +121,7 @@ function runMain() {
   const cs = codes(), o = orient(), q = S.q;
   const tasks = [], route = [];
   R = { key, paths: [], t0: performance.now(), ms: 0, done: 0, total: 0, dof: o.dof, dDone: 0, dTotal: 0 };
-  pool.cancel('dense'); pool.cancel('fill'); busy.dense = busy.fill = false;
+  pool.cancel('dense'); pool.cancel('fill'); pool.cancel('mesh2'); busy.dense = busy.fill = busy.mesh2 = false;
   errs.length = 0;
   const K = Math.max(2, NW * 2);
   cs.forEach((code, ip) => {
@@ -154,7 +154,7 @@ function runMain() {
     if (part === 'bdry') P.bdry = d;
     else if (part === 'edges') P.edges = d;
     else if (part === 'rims') P.rims2 = d || null;
-    else if (part === 'mesh') { P.mesh = d; P.meshCol = null; }
+    else if (part === 'mesh') P.mesh = d;
     else if (part === 'h') d.forEach((a, k) => { P.h[at + k] = a; });
     else if (part === 's') d.forEach((a, k) => { P.s[at + k] = a; });
     else if (part === 'layers') { d.forEach((a, k) => { P.layers[at + k] = a; }); P.lver = (P.lver || 0) + 1; }
@@ -170,6 +170,7 @@ function runMain() {
     refresh(); setStatus();
     frame3d();
     runDense(myR);
+    runMesh2(myR);
   }).catch(err => {
     if (R !== myR) return;
     busy.main = false; errs.push(String(err.message || err)); console.error(err);
@@ -247,6 +248,7 @@ function runDense(myR) {
     busy.dense = false; myR.ms = performance.now() - myR.t0;
     refresh(); setStatus();
     runFill(myR);
+    runMesh2(myR);
   }).catch(err => {
     if (R !== myR) return;
     busy.dense = false; errs.push(String(err.message || err)); console.error(err);
@@ -376,6 +378,52 @@ function runFill(myR, round = 1) {
   });
 }
 
+// 二自由度画成曲面 (画法选「曲面」或「曲面 + 层线」时): 全部整层 (第一轮 + 加密, 按 h 排) 相邻两层缝成三角形,
+//   在 Worker 里做 (engine/stitch2.js). 层数据随任务复制过去 (主线程还要画线). 加密还在跑时先不缝, 等它完.
+function runMesh2(myR) {
+  if (!myR || myR.dof !== 2 || R !== myR || S.lay.style2 === 'lines' || busy.dense || busy.main) return;
+  const { L } = scene(), D = baseline(), tasks = [], route = [];
+  myR.paths.forEach((P, ip) => {
+    if (P.mesh2 && P.mesh2.lver === P.lver) return;
+    const all = [];
+    P.layers.forEach((l, ih) => { if (l && l.curves.length) all.push({ h: layerH(P, ih), curves: l.curves }); });
+    for (const l of P.dense) if (l.curves.length) all.push(l);
+    if (all.length < 2) return;
+    all.sort((a, b) => a.h - b.h);
+    tasks.push({ kind: 'mesh2', args: { layers: all.map(l => ({ h: l.h, curves: l.curves.map(c => ({ p: c.p, d: c.d, x: c.x, b: c.b })) })), L, D } });
+    route.push([ip, P.lver]);
+  });
+  if (!tasks.length) return;
+  busy.mesh2 = true; setStatus();
+  const extra = [];                    // 对不上的相邻两层 → 中间补算一层 (同一自由度网格插行), 只补一轮
+  pool.run('mesh2', tasks, (i, d) => {
+    if (R !== myR) return;
+    const [ip, lv] = route[i], P = myR.paths[ip];
+    P.mesh2 = { ...d, lver: lv };
+    if (!P.mesh2Grown && d.bad && d.bad.length) { P.mesh2Grown = true; extra.push([ip, d.bad.map(([a, b]) => 0.5 * (a + b))]); }
+    scheduleRefresh();
+  }).then(res => {
+    if (res === null || R !== myR) return;
+    if (!extra.length) { busy.mesh2 = false; refresh(); setStatus(); return; }
+    const o = orient(), t2 = [], r2 = [];
+    for (const [ip, hs] of extra) {
+      const P = myR.paths[ip];
+      t2.push({ kind: 'layers2h', args: { ...common(), fp: P.fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta,
+        lowitz: !!o.lowitz, surf: S.surf2, nG: [101, 141, 181][S.q], hs } });
+      r2.push(ip);
+    }
+    return pool.run('mesh2', t2, (i, d) => {
+      if (R !== myR) return;
+      const P = myR.paths[r2[i]];
+      P.dense.push(...d); P.lver = (P.lver || 0) + 1;
+    }).then(r => { if (r === null || R !== myR) return; busy.mesh2 = false; runMesh2(myR); });
+  }).catch(err => {
+    if (R !== myR) return;
+    busy.mesh2 = false; errs.push(String(err.message || err)); console.error(err);
+    refresh(); setStatus();
+  });
+}
+
 function runObs() {
   if (!S.lay.caustic) { pool.cancel('obs'); busy.obs = false; return; }
   const key = obsKey();
@@ -439,7 +487,7 @@ let schedTimer = 0;
 function schedule(immediate) {
   clearTimeout(schedTimer);
   const go = () => {
-    if (!codes().length) { R = null; RO = null; RC = null; RS = null; for (const ch of ['main', 'dense', 'fill', 'obs', 'cone', 'shell']) pool.cancel(ch); busy.main = busy.dense = busy.fill = busy.obs = busy.cone = busy.shell = false; refresh(); setStatus(); return; }
+    if (!codes().length) { R = null; RO = null; RC = null; RS = null; for (const ch of ['main', 'dense', 'fill', 'mesh2', 'obs', 'cone', 'shell']) pool.cancel(ch); busy.main = busy.dense = busy.fill = busy.mesh2 = busy.obs = busy.cone = busy.shell = false; refresh(); setStatus(); return; }
     runMain(); runObs(); runCone(); runShell(); refresh(); setStatus();
   };
   if (immediate) go(); else schedTimer = setTimeout(go, 140);
@@ -526,18 +574,18 @@ function colorRange(mode) {
 const layerH = (P, ih) => -90 + 180 * ih / Math.max(1, P.nH - 1);
 
 // 网格顶点颜色 (按 h 用网格自带的精确 h; 按 ρ 由位置算)
-function meshColors(P, mode, rng) {
+function meshColors(m, mode, rng) {
   if (mode === 'mono' || mode === 'path' || !rng) return null;
   const key = mode + '|' + rng.join(',');
-  if (P.meshCol && P.meshCol.key === key) return P.meshCol.cols;
-  const pos = P.mesh.pos, n = pos.length / 3, cols = new Uint8Array(3 * n);
+  if (m.colCache && m.colCache.key === key) return m.colCache.cols;
+  const pos = m.pos, n = pos.length / 3, cols = new Uint8Array(3 * n);
   const { E } = scene(), D = baseline(), span = Math.max(1e-9, rng[1] - rng[0]);
   for (let i = 0; i < n; i++) {
-    const v = mode === 'h' ? P.mesh.h[i] : rhoOf(pos, i, E, D);
+    const v = mode === 'h' ? m.h[i] : rhoOf(pos, i, E, D);
     const c = cmap((v - rng[0]) / span);
     cols[3 * i] = c[0]; cols[3 * i + 1] = c[1]; cols[3 * i + 2] = c[2];
   }
-  P.meshCol = { key, cols };
+  m.colCache = { key, cols };
   return cols;
 }
 
@@ -651,12 +699,14 @@ function buildDL() {
   if (R) R.paths.forEach((P, ip) => {
     const pcol = lay.colorBy === 'path' ? PATHCOL[ip % PATHCOL.length] : C.pts;
     if (lay.surf && P.mesh && P.mesh.pos.length)
-      dl.meshes.push({ pos: P.mesh.pos, dir: P.mesh.dir, nrm: P.mesh.nrm, cols: meshColors(P, lay.colorBy, rng), col: pcol });
+      dl.meshes.push({ pos: P.mesh.pos, dir: P.mesh.dir, nrm: P.mesh.nrm, cols: meshColors(P.mesh, lay.colorBy, rng), col: pcol });
     // 平面退化 (灯眼等高的板晶柱面光路): 晕面整块躺在灯眼所在的水平面里, 天空里全在地平线上 — 画成地平线上的弧
     if (lay.surf && P.mesh && P.mesh.sky) line(P.mesh.sky, pcol, 3, { skyOnly: true, body: true });
     const ob = P.mesh && P.mesh.outline;            // 平面退化时的边界线 (边界引擎在这里也退化, 用网格的精确区间端点)
     if (ob) { if (lay.bEntry) line(ob.entry, C.entry, 2); if (lay.bMirror) line(ob.mirror, C.mirror, 2); if (lay.bTir) line(ob.tir, C.tir, 2); }
-    if (lay.surf && P.dof === 2) {
+    const st2 = lay.style2 || 'lines', mesh2 = P.dof === 2 && st2 !== 'lines' && P.mesh2 && P.mesh2.pos.length ? P.mesh2 : null;
+    if (lay.surf && mesh2) dl.meshes.push({ pos: mesh2.pos, dir: mesh2.dir, nrm: mesh2.nrm, cols: meshColors(mesh2, lay.colorBy, rng), col: pcol, subdiv: true });
+    if (lay.surf && P.dof === 2 && (st2 !== 'mesh' || !mesh2)) {      // 选了「曲面」但网格还没缝好时先画层线
       // 二自由度: 每个 h 层是一条 (或几条) 平行光曲线经锥映射 → 按层着色的线 (数据与配色不变就复用同一组对象)
       const lk = [lay.colorBy, rng ? rng.join(',') : '', P.lver || 0, P.fver || 0, pcol, busy.dense ? 1 : 0].join('|');
       if (!P.layerLines || P.layerLines.key !== lk) {
@@ -788,7 +838,7 @@ function renderColorbar(rng) {
 // ============================================================ 状态栏 / 面包屑 / 结果
 function setStatus() {
   const st = $('status'), tx = $('statusText');
-  const any = busy.main || busy.dense || busy.fill || busy.obs || busy.cone || busy.shell;
+  const any = busy.main || busy.dense || busy.fill || busy.mesh2 || busy.obs || busy.cone || busy.shell;
   st.classList.toggle('busy', any);
   st.classList.toggle('err', errs.length > 0);
   $('prog3d').classList.toggle('on', any); $('progSky').classList.toggle('on', any);
@@ -796,7 +846,7 @@ function setStatus() {
   if (!codes().length) { tx.textContent = t('st.noPath'); return; }
   if (busy.main && R) { tx.textContent = t('st.main', { d: R.done, n: R.total }); return; }
   if ((busy.dense || busy.fill) && R) { tx.textContent = t(busy.dense ? 'st.dense' : 'st.fill', { d: R.dDone, n: R.dTotal }); return; }
-  if (any) { tx.textContent = t(busy.obs ? 'st.obs' : busy.shell ? 'st.shell' : 'st.cone'); return; }
+  if (any) { tx.textContent = t(busy.mesh2 ? 'st.mesh2' : busy.obs ? 'st.obs' : busy.shell ? 'st.shell' : 'st.cone'); return; }
   if (R) tx.textContent = t('st.done', { ms: Math.round(R.ms) });
 }
 
@@ -887,7 +937,7 @@ function layerCount(id) {
   if (id === 'pts') { let k = 0; for (const P of R.paths) k += pathCloud(P).pts.length / 3; return fmtN(k); }
   if (id === 'surf') {
     let k = 0, c = 0;
-    for (const P of R.paths) { if (P.mesh) k += P.mesh.nTri; for (const l of P.layers) if (l) c += l.curves.length; for (const l of P.dense) c += l.curves.length; }
+    for (const P of R.paths) { if (P.mesh) k += P.mesh.nTri; if (P.mesh2 && S.lay.style2 !== 'lines') k += P.mesh2.nTri; for (const l of P.layers) if (l) c += l.curves.length; for (const l of P.dense) c += l.curves.length; }
     return k ? fmtN(k) + ' △' : c ? String(c) : '';
   }
   if (['bEntry', 'bMirror', 'bTir', 'bSeam', 'bTurn', 'bCusp', 'bRim', 'caustic', 'cSeam', 'cAsym', 'parArc'].includes(id)) return String(n);
@@ -909,6 +959,8 @@ function renderLayers() {
         + (ly.term ? `<button class="qmark" data-term="${ly.term}" aria-label="?">?</button>` : '') + '</label>';
       if (ly.colorMode) html += `<div class="color-mode"><span class="lcount">${t('lay.colorBy')}</span><select id="selColor">`
         + ['h', 'rho', 'mono', 'path'].map(m => `<option value="${m}">${t('color.' + m)}</option>`).join('') + '</select></div>';
+      if (ly.colorMode && dof === 2) html += `<div class="color-mode"><span class="lcount">${t('lay.style2')}</span><select id="selStyle2">`
+        + ['lines', 'mesh', 'both'].map(m => `<option value="${m}">${t('style2.' + m)}</option>`).join('') + '</select></div>';
     }
     box.innerHTML = html;
     for (const cb of box.querySelectorAll('input[data-lay]')) cb.addEventListener('change', () => {
@@ -919,6 +971,7 @@ function renderLayers() {
       refresh(); setStatus();
     });
     $('selColor').addEventListener('change', e => { S.lay.colorBy = e.target.value; save(); refresh(); });
+    if ($('selStyle2')) $('selStyle2').addEventListener('change', e => { S.lay.style2 = e.target.value; save(); runMesh2(R); refresh(); setStatus(); });
     bindTerms(box);
   }
   for (const ly of LAYERS) {
@@ -932,6 +985,7 @@ function renderLayers() {
     const c = box.querySelector(`[data-cnt="${ly.id}"]`); if (c) c.textContent = layerCount(ly.id);
   }
   $('selColor').value = S.lay.colorBy;
+  if ($('selStyle2')) $('selStyle2').value = S.lay.style2;
 }
 
 // ============================================================ 左栏控件

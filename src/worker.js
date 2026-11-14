@@ -6,6 +6,7 @@
 //   layers2         二自由度光锥的一段 h 层 (焦散或选定的平行光曲线 → 锥映射)
 //   layers2h        二自由度光锥的指定 h 层 (只要显示曲线; 有曲线的 h 区间里加密用)
 //   fill2           补线: 指定 h 层 + 按两侧层修剪成只画张开处 (逐点淡入), 见 app/spacing.js
+//   mesh2           二自由度曲面网格: 相邻两层层线缝成三角形, 见 engine/stitch2.js
 //   edges2          二自由度曲面边界线 (末端点身份 h-延拓) + 平行光弧
 //   rims2           二自由度焦散面的外缘 (焦散∩有效区边, 沿 h 精确延拓); 选的不是焦散面时返回 null
 //   cone1 / cone2   锥切片 (一自由度闭式 / 二自由度单层)
@@ -21,6 +22,7 @@ import * as OC from './engine/obscaustic.js';
 import { fold2DofFine, fold1DofFine, seam1DofFine } from './engine/obsfine.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
 import { trimFill } from './app/spacing.js';
+import { stitchLayers2 } from './engine/stitch2.js';
 
 function transferOf(obj, list = []) {
   if (obj && typeof obj === 'object') {
@@ -142,6 +144,8 @@ const RUN = {
       return { h: it.h, curves, kept: trimFill({ curves, pa: { curves: it.pa }, pb: { curves: it.pb } }, a.d) };
     });
   },
+
+  mesh2: a => stitchLayers2(a.layers, a.L, a.D),
 
   rims2: a => {
     const lp = a.fp.map(lpFaceFromCompact);
