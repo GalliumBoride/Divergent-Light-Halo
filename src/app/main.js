@@ -11,6 +11,7 @@ import { PRESETS } from './presets.js';
 import { distTo, FILL_LO, FILL_HI } from './spacing.js';
 import { parsePath, parseMultiPaths, faceNumFromCompact } from '../engine/crystal.js';
 import { apexDegFromMiller, millerFromApexDeg } from '../engine/lp.js';
+import { criticalRadii, skyStepOf } from '../engine/mesh2s.js';
 
 /* global WORKER_SRC */
 const $ = id => document.getElementById(id);
@@ -96,11 +97,60 @@ function ranges(n, k) {
   return out;
 }
 
+// 球壳法分段并行: 以眼为心的半径范围 [1e-3 D, maxDist + D] 按对数切成 k 段, 每段一个 Worker (各段的网格在交界那层上接上).
+//   rHi > 0 (曲面所在的最远半径, 取自边界线) 时, 它以外 (多半没有曲面) 只占一段. 段的交界避开临界半径 (相对 ±0.3%)
+//   和灯所在的球壳 (±0.5%) —— 那里两侧的一对层要落在同一段里. → [[r0, r1, 初始层数, 预算份额] …]
+function shellChunks(L, E, crit, k, rHi) {
+  const D = Math.hypot(L[0] - E[0], L[1] - E[1], L[2] - E[2]), rMin = 1e-3 * D, rMax = S.maxDist + D;
+  const top = rHi > rMin * 10 && rHi * 1.2 < rMax * 0.8 ? rHi * 1.2 : rMax;
+  const nIn = top < rMax ? Math.max(1, k - 1) : Math.max(1, k), cuts = [rMin];
+  for (let i = 1; i < nIn; i++) cuts.push(rMin * Math.pow(top / rMin, i / nIn));
+  if (top < rMax) cuts.push(top);
+  cuts.push(rMax);
+  for (let i = 1; i + 1 < cuts.length; i++) {
+    let b = cuts[i];
+    for (let it = 0; it < 4; it++) {
+      const c = crit.find(rc => Math.abs(b / rc - 1) < 3e-3);
+      if (c !== undefined) b = c * (b < c ? 1 - 3e-3 : 1 + 3e-3);
+      else if (Math.abs(b / D - 1) < 5e-3) b = D * (b < D ? 1 - 5e-3 : 1 + 5e-3);
+      else break;
+    }
+    cuts[i] = b;
+  }
+  const out = [], all = Math.log(rMax / rMin);
+  for (let i = 0; i + 1 < cuts.length; i++) {
+    if (!(cuts[i + 1] > cuts[i] * 1.001)) continue;
+    const f = Math.log(cuts[i + 1] / cuts[i]) / all;
+    out.push([cuts[i], cuts[i + 1], Math.max(6, Math.round(72 * f)) + 1, f]);
+  }
+  return out;
+}
+// 各段的网格 / 层线拼在一起 (还没回来的段跳过: 边算边画). 交界层两段各给一次, 留一条. 一段也没成 → null
+function mergeShell(parts) {
+  const ok = parts.filter(d => d && d.ok && (d.nTri > 0 || (d.focal && d.focal.length)));
+  if (!ok.length) return null;
+  let n = 0, nh = 0;
+  for (const d of ok) { n += d.pos.length; nh += d.h.length; }
+  const pos = new Float32Array(n), dir = new Float32Array(n), nrm = new Float32Array(n), h = new Float32Array(nh);
+  let o = 0, oh = 0, rows = 0, loose = 0, ms = 0;
+  for (const d of ok) {
+    pos.set(d.pos, o); dir.set(d.dir, o); nrm.set(d.nrm, o); h.set(d.h, oh);
+    o += d.pos.length; oh += d.h.length; rows += d.rows || 0; loose += d.loose || 0; ms = Math.max(ms, d.ms || 0);
+  }
+  const all = [];
+  for (const d of ok) for (const l of d.lines) all.push(l);
+  all.sort((a, b) => a.r - b.r);
+  const lines = all.filter((l, i) => i === 0 || Math.abs(l.r / all[i - 1].r - 1) > 1e-9);
+  const focal = [];
+  for (const d of ok) for (const f of d.focal || []) focal.push(f);
+  return { ok: true, pos, dir, nrm, h, nTri: n / 9, lines, focal, rows, loose, ms, parts: ok.length };
+}
+
 let R = null;            // 主结果 { key, paths: [ … ], t0, ms, done, total }
 let RO = null;           // 焦散 { key, paths: [ … ] }
 let RC = null;           // 锥切片 { key, data, dof }
 let RS = null;           // 球壳 { key, paths: [ … ], ms }
-const busy = { main: false, dense: false, fill: false, mesh2: false, obs: false, cone: false, shell: false };
+const busy = { main: false, dense: false, fill: false, mesh2: false, obs: false, cone: false, shell: false, lay2: 0, pts: false };
 const errs = [];
 
 function mainKey() {
@@ -120,8 +170,10 @@ function runMain() {
   if (R && R.key === key) return;
   const cs = codes(), o = orient(), q = S.q;
   const tasks = [], route = [];
+  if (R) R.paths.forEach((_, i) => { pool.cancel('lay2-' + i); pool.cancel('mesh1-' + i); });
+  busy.lay2 = 0;
   R = { key, paths: [], t0: performance.now(), ms: 0, done: 0, total: 0, dof: o.dof, dDone: 0, dTotal: 0 };
-  pool.cancel('dense'); pool.cancel('fill'); pool.cancel('mesh2'); busy.dense = busy.fill = busy.mesh2 = false;
+  pool.cancel('dense'); pool.cancel('fill'); pool.cancel('mesh2'); pool.cancel('pts'); busy.dense = busy.fill = busy.mesh2 = busy.pts = false;
   errs.length = 0;
   const K = Math.max(2, NW * 2);
   cs.forEach((code, ip) => {
@@ -131,17 +183,29 @@ function runMain() {
     R.paths.push(P);
     if (o.dof === 1) {
       const nH = [320, 640, 1280][q], nA = [360, 720, 1440][q], nAS = [360, 720, 1440][q], nPs = [720, 1440, 2880][q];
-      tasks.push({ kind: 'mesh1', args: { ...base, budget: [60000, 160000, 400000][q] } }); route.push([ip, 'mesh']);
-      tasks.push({ kind: 'mesh1s', args: { ...base, budget: [60000, 90000, 140000][q], maxMs: 30000 } }); route.push([ip, 'mesh1s']);
+      // 晕面: 球壳法 (分段并行, 排在最前); (h, α) 网格只在球壳法没成、或平面退化时用
+      const { L: L1, E: E1 } = scene(), bud = [60000, 90000, 140000][q], ch = shellChunks(L1, E1, [], NW, 0);
+      P.s1 = new Array(ch.length); P.s1Left = ch.length;
+      ch.forEach((c, ci) => { tasks.push({ kind: 'mesh1s', args: { ...base, rMin: c[0], rMax: c[1], rows: c[2], budget: Math.max(8000, Math.round(2 * bud * c[3])), budgetAll: bud, maxMs: 30000 } }); route.push([ip, 'mesh1s', ci]); });
+      // 灯与眼等高时晕面可能整块躺在水平面里 (平面退化, 要 (h, α) 网格画地平线上的弧): 只有这时才同时算它
+      if (Math.abs(S.dist * Math.sin(S.elev * DEG) - S.eye) <= 1e-4 * S.dist) { tasks.push({ kind: 'mesh1', args: { ...base, budget: [60000, 160000, 400000][q] } }); route.push([ip, 'mesh']); }
       tasks.push({ kind: 'bdry1', args: base }); route.push([ip, 'bdry']);
-      for (const [a, b] of ranges(nAS, K)) { tasks.push({ kind: 'coneS', args: { ...base, nA: nAS, nPsi: nPs, from: a, to: b } }); route.push([ip, 's', a]); }
-      for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'coneH', args: { ...base, nH, nA, from: a, to: b } }); route.push([ip, 'h', a]); }
+      // 光锥采样点 (原窗体的 h 扫 / ψ 扫) 只在 "光锥采样点" 打开时才算 (runPts), 不与球壳法抢 Worker
     } else {
       const nH = [72, 120, 180][q], nG = [101, 141, 181][q];
       P.nH = nH;
+      // 晕面与层线: 球壳法, 按半径分段并行, 排在最前 —— 与边界线 / 外缘同时算 (不等它们给的临界半径, 拓扑变化由二分去夹)
+      const { L: L2, E: E2 } = scene(), bud = [60000, 90000, 140000][q], ch = shellChunks(L2, E2, [], NW, 0);
+      const sf = S.surf2 === 'caustic' ? null : S.surf2.replace('deg', 'seam');
+      P.shellParts = new Array(ch.length); P.shellLeft = ch.length; P.shellChunks = ch;
+      P.shellArgs = { ...base, L: L2, E: E2, surf: S.surf2, surfFence: sf, budgetAll: bud, maxMs: 60000 };
+      ch.forEach((c, ci) => {
+        tasks.push({ kind: 'mesh2s', args: { ...P.shellArgs, rMin: c[0], rMax: c[1], rows: c[2], budget: Math.max(8000, Math.round(2 * bud * c[3])), feats: [] } });
+        route.push([ip, 'shell', ci]);
+      });
       tasks.push({ kind: 'edges2', args: { ...base, surf: S.surf2, nG } }); route.push([ip, 'edges']);
       tasks.push({ kind: 'rims2', args: { ...base, surf: S.surf2, nG } }); route.push([ip, 'rims']);
-      for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'layers2', args: { ...base, surf: S.surf2, nH, nG, from: a, to: b } }); route.push([ip, 'layers', a]); }
+      // 光锥层 (h 层) 不在这里算: 晕面与层线都出自球壳法 (runMesh2); 只有球壳法没成的光路才补算光锥层去缝 (runLayers2)
     }
   });
   R.total = tasks.length;
@@ -157,11 +221,25 @@ function runMain() {
     else if (part === 'rims') P.rims2 = d || null;
     // 一自由度晕面: 球壳法的网格算好了就用它; (h, α) 网格只在球壳法没成、或平面退化 (灯眼等高的板晶柱面光路, 要画地平线上的弧) 时用
     else if (part === 'mesh') { if (!(P.mesh && P.mesh.shell) || d.flat) P.mesh = d; }
-    else if (part === 'mesh1s') { if (d.ok && !(P.mesh && P.mesh.flat)) P.mesh = { ...d, shell: true }; }
+    else if (part === 'mesh1s') {
+      P.s1[at] = d;
+      const m = mergeShell(P.s1);
+      if (m && !(P.mesh && P.mesh.flat)) P.mesh = { ...m, shell: true };
+      if (--P.s1Left === 0 && !m && !P.mesh) runMesh1Fallback(R, P);      // 球壳法各段都没成: 补算 (h, α) 网格
+    }
+    else if (part === 'shell') {
+      P.shellParts[at] = d;
+      const m = mergeShell(P.shellParts);
+      if (--P.shellLeft === 0) {
+        P.shell = m || { ok: false, why: (P.shellParts.find(x => x && !x.ok && x.why !== 'empty') || {}).why || 'empty' };
+        const bad = P.shellParts.filter(x => x && !x.ok && x.why !== 'empty');
+        if (m && bad.length) errs.push(`${P.code}: ${bad.length} / ${P.shellParts.length} shell chunks failed (${bad[0].why})`);
+      } else if (m) P.shell = m;
+    }
     else if (part === 'h') d.forEach((a, k) => { P.h[at + k] = a; });
     else if (part === 's') d.forEach((a, k) => { P.s[at + k] = a; });
     else if (part === 'layers') { d.forEach((a, k) => { P.layers[at + k] = a; }); P.lver = (P.lver || 0) + 1; }
-    if (part !== 'bdry' && part !== 'edges' && part !== 'mesh' && part !== 'mesh1s' && part !== 'rims') P.cloud = null;
+    if (part !== 'bdry' && part !== 'edges' && part !== 'mesh' && part !== 'mesh1s' && part !== 'rims' && part !== 'shell') P.cloud = null;
     if (--P.left === 0) P.ms = performance.now() - P.t0;
     R.done++;
     scheduleRefresh();
@@ -384,8 +462,9 @@ function runFill(myR, round = 1) {
 
 // 二自由度的晕面与层线 —— 球壳法 (engine/mesh2s.js, 在 Worker 里做): 层是发散度球壳 (以眼为心的球面) 上的轮廓,
 //   层线与曲面都出自它. 等精确边界线算完再发任务: 边界线离眼距离的极值就是层线拓扑会变的半径, 一并送去.
-//   在它算好之前先画光锥层线 (第一轮的那些层) 当预览. 球壳法超时 / 出错的光路 (P.shell.ok 为假) 才退回去
-//   用光锥层缝 (engine/stitch2.js) —— 那时才需要下面这一段.
+//   一条光路按半径分成几段, 各段在不同的 Worker 里与边界线同时算 (runMain 派出去), 回来一段拼一段 (边算边画).
+//   这里: 边界线到了以后, 含临界半径的段带上临界半径再算一遍 (见下); 球壳法超时 / 出错的光路 (P.shell.ok 为假)
+//   补算光锥层 (runLayers2), 用光锥层缝 (engine/stitch2.js).
 function runMesh2(myR) {
   if (!myR || myR.dof !== 2 || R !== myR || busy.main || busy.mesh2) return;
   const { L, E } = scene(), D = baseline(), tasks = [], route = [];
@@ -394,14 +473,20 @@ function runMesh2(myR) {
     const feats = [];
     for (const k of ['entry', 'tir', 'seam', 'turn', 'cusp']) for (const c of (P.edges && P.edges[k]) || []) { const p = c.p || c; if (p.length >= 6) feats.push({ p, d: c.d || null, edge: k === 'entry' || k === 'tir', fold: k === 'cusp' }); }
     for (const c of rimsOf(P) || []) { const p = c.p || c; if (p.length >= 6) feats.push({ p, d: c.d || null, edge: true }); }
-    if (P.shell === undefined) {
-      P.shell = null;
-      tasks.push({ kind: 'mesh2s', args: { ...common(), fp: P.fp, zeta: o0.zeta, theta: o0.theta, lowitz: !!o0.lowitz, L, E, surfFence: sf, maxD: S.maxDist,
-        budget: [60000, 90000, 140000][S.q], maxMs: 60000, feats: feats.map(f => f.p) } });
-      route.push([ip, -1]);
+    // 第二遍: 边界线到了, 含临界半径 (边界线离眼距离的极值与端点, 层线拓扑在这里变 —— 几条边界线交汇的角点也在其中) 的段
+    //   带上临界半径重算, 回来替换. 第一遍不等边界线、先画出来; 这一遍把角点等处夹准 (三维里差几十厘米的地方)
+    if (P.shell && P.shell.ok && !P.refined && P.shellChunks) {
+      P.refined = true;
+      const crit = criticalRadii(feats.map(f => f.p), L, E), bud = P.shellArgs.budgetAll;
+      P.shellChunks.forEach((c, ci) => {
+        if (!crit.some(rc => rc * (1 - 4e-4) > c[0] && rc * (1 + 4e-4) < c[1])) return;
+        tasks.push({ kind: 'mesh2s', args: { ...P.shellArgs, rMin: c[0], rMax: c[1], rows: c[2], budget: Math.max(8000, Math.round(2 * bud * c[3])), feats: feats.map(f => f.p) } });
+        route.push([ip, -1, ci]);
+      });
       return;
     }
     if (!P.shell || P.shell.ok || S.lay.style2 === 'lines' || (P.mesh2 && P.mesh2.lver === P.lver)) return;
+    if (!P.layers.length) { runLayers2(myR, P); return; }        // 球壳法没成: 先补算光锥层
     const all = [];
     P.layers.forEach((l, ih) => { if (l && l.curves.length) all.push({ h: layerH(P, ih), curves: l.curves }); });
     for (const l of P.dense) if (l.curves.length) all.push(l);
@@ -411,11 +496,13 @@ function runMesh2(myR) {
     route.push([ip, P.lver]);
   });
   if (!tasks.length) return;
-  busy.mesh2 = true; setStatus();
+  busy.mesh2 = true; myR.m2Done = 0; myR.m2Total = tasks.length; setStatus();
   pool.run('mesh2', tasks, (i, d) => {
     if (R !== myR) return;
-    const [ip, lv] = route[i], P = myR.paths[ip];
-    if (lv < 0) P.shell = d; else P.mesh2 = { ...d, lver: lv };
+    myR.m2Done++; setStatus();
+    const [ip, lv, ci] = route[i], P = myR.paths[ip];
+    if (lv < 0) { if (d && d.ok) { P.shellParts[ci] = d; const m = mergeShell(P.shellParts); if (m) P.shell = m; } }   // 第二遍的段
+    else P.mesh2 = { ...d, lver: lv };
     scheduleRefresh();
   }).then(res => {
     if (res === null || R !== myR) return;
@@ -424,6 +511,41 @@ function runMesh2(myR) {
   }).catch(err => {
     if (R !== myR) return;
     busy.mesh2 = false; errs.push(String(err.message || err)); console.error(err);
+    refresh(); setStatus();
+  });
+}
+
+// 一自由度球壳法没成的光路: 补算 (h, α) 网格 (engine/mesh1.js)
+function runMesh1Fallback(myR, P) {
+  const o = orient(), ip = myR.paths.indexOf(P);
+  const base = { ...common(), fp: P.fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta, lowitz: false };
+  busy.lay2++; setStatus();
+  pool.run('mesh1-' + ip, [{ kind: 'mesh1', args: { ...base, budget: [60000, 160000, 400000][S.q] } }], (i, d) => { if (R === myR && !P.mesh) { P.mesh = d; scheduleRefresh(); } })
+    .then(res => { if (res !== null && R === myR) { busy.lay2--; refresh(); setStatus(); } })
+    .catch(err => { if (R === myR) { busy.lay2--; errs.push(String(err.message || err)); refresh(); setStatus(); } });
+}
+
+// 球壳法没成的光路: 补算光锥层 (原窗体的 h 层), 算完再回 runMesh2 用光锥层缝 (engine/stitch2.js)
+function runLayers2(myR, P) {
+  if (P.lay2) return;
+  P.lay2 = true;
+  const o = orient(), q = S.q, nH = [72, 120, 180][q], nG = [101, 141, 181][q], K = Math.max(2, NW * 2), ch = 'lay2-' + myR.paths.indexOf(P);
+  const base = { ...common(), fp: P.fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta, lowitz: !!o.lowitz };
+  const tasks = [], at = [];
+  P.nH = nH;
+  for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'layers2', args: { ...base, surf: S.surf2, nH, nG, from: a, to: b } }); at.push(a); }
+  busy.lay2++; setStatus();
+  pool.run(ch, tasks, (i, d) => {
+    if (R !== myR) return;
+    d.forEach((a, k) => { P.layers[at[i] + k] = a; }); P.lver = (P.lver || 0) + 1;
+    scheduleRefresh();
+  }).then(res => {
+    if (res === null || R !== myR) return;
+    busy.lay2--; refresh(); setStatus();
+    runMesh2(myR);
+  }).catch(err => {
+    if (R !== myR) return;
+    busy.lay2--; errs.push(String(err.message || err)); console.error(err);
     refresh(); setStatus();
   });
 }
@@ -487,12 +609,34 @@ function runShell() {
     .catch(err => { if (RS === myR) { busy.shell = false; errs.push(String(err.message || err)); refresh(); setStatus(); } });
 }
 
+// 一自由度的光锥采样点 (原窗体: h 扫 + ψ 扫): 只在 "光锥采样点" 打开时才算, 结果放进 P.h / P.s (点云、导出用)
+function runPts() {
+  const myR = R;
+  if (!myR || myR.dof !== 1 || !S.lay.pts || myR.ptsReq) return;
+  myR.ptsReq = true;
+  const o = orient(), q = S.q, K = Math.max(2, NW * 2), tasks = [], route = [];
+  const nH = [320, 640, 1280][q], nA = [360, 720, 1440][q], nAS = [360, 720, 1440][q], nPs = [720, 1440, 2880][q];
+  myR.paths.forEach((P, ip) => {
+    const base = { ...common(), fp: P.fp, el: S.elev, dist: S.dist, eye: S.eye, maxD: S.maxDist, zeta: o.zeta, theta: o.theta, lowitz: false };
+    for (const [a, b] of ranges(nAS, K)) { tasks.push({ kind: 'coneS', args: { ...base, nA: nAS, nPsi: nPs, from: a, to: b } }); route.push([ip, 's', a]); }
+    for (const [a, b] of ranges(nH, K)) { tasks.push({ kind: 'coneH', args: { ...base, nH, nA, from: a, to: b } }); route.push([ip, 'h', a]); }
+  });
+  busy.pts = true; setStatus();
+  pool.run('pts', tasks, (i, d) => {
+    if (R !== myR) return;
+    const [ip, part, at] = route[i], P = myR.paths[ip];
+    if (part === 'h') d.forEach((a, k) => { P.h[at + k] = a; }); else d.forEach((a, k) => { P.s[at + k] = a; });
+    P.cloud = null; scheduleRefresh();
+  }).then(res => { if (res !== null && R === myR) { busy.pts = false; refresh(); setStatus(); } })
+    .catch(err => { if (R === myR) { busy.pts = false; errs.push(String(err.message || err)); refresh(); setStatus(); } });
+}
+
 let schedTimer = 0;
 function schedule(immediate) {
   clearTimeout(schedTimer);
   const go = () => {
-    if (!codes().length) { R = null; RO = null; RC = null; RS = null; for (const ch of ['main', 'dense', 'fill', 'mesh2', 'obs', 'cone', 'shell']) pool.cancel(ch); busy.main = busy.dense = busy.fill = busy.mesh2 = busy.obs = busy.cone = busy.shell = false; refresh(); setStatus(); return; }
-    runMain(); runObs(); runCone(); runShell(); refresh(); setStatus();
+    if (!codes().length) { if (R) R.paths.forEach((_, i) => pool.cancel('lay2-' + i)); R = null; RO = null; RC = null; RS = null; for (const ch of ['main', 'dense', 'fill', 'mesh2', 'obs', 'cone', 'shell', 'pts']) pool.cancel(ch); busy.main = busy.dense = busy.fill = busy.mesh2 = busy.obs = busy.cone = busy.shell = busy.pts = false; busy.lay2 = 0; refresh(); setStatus(); return; }
+    runMain(); runPts(); runObs(); runCone(); runShell(); refresh(); setStatus();
   };
   if (immediate) go(); else schedTimer = setTimeout(go, 140);
 }
@@ -714,16 +858,23 @@ function buildDL() {
     if (ob) { if (lay.bEntry) line(ob.entry, C.entry, 2); if (lay.bMirror) line(ob.mirror, C.mirror, 2); if (lay.bTir) line(ob.tir, C.tir, 2); }
     const sh = P.dof === 2 && P.shell && P.shell.ok ? P.shell : null;                  // 球壳法的结果 (网格 + 各层的线)
     const st2 = lay.style2 || 'lines', mesh2 = P.dof === 2 && st2 !== 'lines' ? (sh || (P.mesh2 && P.mesh2.pos.length ? P.mesh2 : null)) : null;
-    if (lay.surf && mesh2) dl.meshes.push({ pos: mesh2.pos, dir: mesh2.dir, nrm: mesh2.nrm, cols: meshColors(mesh2, lay.colorBy, rng), col: pcol, subdiv: true });
+    if (lay.surf && mesh2 && mesh2.pos.length) dl.meshes.push({ pos: mesh2.pos, dir: mesh2.dir, nrm: mesh2.nrm, cols: meshColors(mesh2, lay.colorBy, rng), col: pcol, subdiv: true });
+    // 焦线 (整段焦散映到天上同一点的退化处, 各层的焦点连成的线): 比焦散还亮, 按晕面的颜色画粗一点
+    if (lay.surf && sh && sh.focal && sh.focal.length) dl.lines.push({ segs: sh.focal, col: pcol, width: 2.6, alpha: 0.95, body: true });
     if (lay.surf && sh && st2 !== 'mesh') {
       // 层线 = 球壳轮廓. 按 h 着色时一条线上 h 是变的: 切成 32 个点一小段, 各按中点的 h 上色; 按 ρ 着色整条一个颜色
       const lk = [lay.colorBy, rng ? rng.join(',') : '', pcol].join('|');
       if (!sh.LL || sh.LL.key !== lk) {
         const D = baseline(), span = rng ? Math.max(1e-9, rng[1] - rng[0]) : 1, segs = [], segCols = [];
-        let acc = Infinity;                  // 与上一条画出来的层在天空里累计隔了多远: 不到 0.5° 的不画 (贴着眼睛的层几乎重合)
+        // 画哪些层: 按与上一条画出来的层在天空里累计隔了多远, 等分成约 70 条 (每条至少隔 0.5°、至多 3°). 层是怎么加进来的
+        //   (初始、天空间距 / 弦高加密、拓扑变化处二分、临界半径两侧) 不管, 画出来的层线疏密均匀 —— 否则二分与临界半径的层挤成密带
+        let tot = 0;
+        for (const row of sh.lines) if (Number.isFinite(row.gap)) tot += row.gap;
+        const step = Math.min(3 * DEG, Math.max(0.5 * DEG, tot / 70));
+        let acc = Infinity;
         for (const row of sh.lines) {
           acc += row.gap;
-          if (acc < 0.5 * DEG) continue;
+          if (acc < step) continue;
           acc = 0;
           for (const c of row.curves) {
           const n = c.p.length / 3;
@@ -839,6 +990,8 @@ function frame3d() {
   if (R) for (const P of R.paths) {
     const parts = [surfPts(P)];
     for (const l of P.layers) if (l) for (const c of l.curves) parts.push(c.p || c);
+    for (const k of ['entry', 'tir', 'seam', 'turn', 'cusp']) for (const c of (P.edges && P.edges[k]) || []) parts.push(c.p || c);
+    if (P.shell && P.shell.ok && P.shell.pos.length) parts.push(P.shell.pos);
     for (const a of parts) {
       const n = a.length / 3, st = Math.max(1, Math.floor(n / 4000));
       for (let i = 0; i < n; i += st) { xs.push(a[3 * i]); ys.push(a[3 * i + 1], -a[3 * i + 1]); zs.push(a[3 * i + 2]); }
@@ -871,7 +1024,7 @@ function renderColorbar(rng) {
 // ============================================================ 状态栏 / 面包屑 / 结果
 function setStatus() {
   const st = $('status'), tx = $('statusText');
-  const any = busy.main || busy.dense || busy.fill || busy.mesh2 || busy.obs || busy.cone || busy.shell;
+  const any = busy.main || busy.dense || busy.fill || busy.mesh2 || busy.obs || busy.cone || busy.shell || busy.lay2 > 0 || busy.pts;
   st.classList.toggle('busy', any);
   st.classList.toggle('err', errs.length > 0);
   $('prog3d').classList.toggle('on', any); $('progSky').classList.toggle('on', any);
@@ -879,7 +1032,8 @@ function setStatus() {
   if (!codes().length) { tx.textContent = t('st.noPath'); return; }
   if (busy.main && R) { tx.textContent = t('st.main', { d: R.done, n: R.total }); return; }
   if ((busy.dense || busy.fill) && R) { tx.textContent = t(busy.dense ? 'st.dense' : 'st.fill', { d: R.dDone, n: R.dTotal }); return; }
-  if (any) { tx.textContent = t(busy.mesh2 ? 'st.mesh2' : busy.obs ? 'st.obs' : busy.shell ? 'st.shell' : 'st.cone'); return; }
+  if (busy.mesh2 && R) { tx.textContent = t('st.mesh2', { d: R.m2Done || 0, n: R.m2Total || 0 }); return; }
+  if (any) { tx.textContent = t(busy.lay2 > 0 ? 'st.lay2' : busy.obs ? 'st.obs' : busy.shell ? 'st.shell' : 'st.cone'); return; }
   if (R) tx.textContent = t('st.done', { ms: Math.round(R.ms) });
 }
 
@@ -903,7 +1057,10 @@ function renderResults() {
     const np = pathCloud(P).pts.length / 3;
     const rows = [];
     if (P.mesh) rows.push([t('res.mesh'), t('res.meshLine', { n: fmtN(P.mesh.nTri), ms: P.mesh.ms })]);
-    if (P.dof === 2) rows.push([t('res.layers'), t('res.layersLine', {
+    if (P.dof === 2 && P.shell && P.shell.ok) {
+      rows.push([t('res.mesh'), t('res.meshLine', { n: fmtN(P.shell.nTri), ms: P.shell.ms })]);
+      rows.push([t('res.shells'), t('res.layersLine', { n: P.shell.lines.length, c: P.shell.lines.reduce((s2, l) => s2 + l.curves.length, 0) })]);
+    } else if (P.dof === 2) rows.push([t('res.layers'), t('res.layersLine', {
       n: P.layers.filter(l => l && l.curves.length).length + P.dense.filter(l => l.curves.length).length,
       c: P.layers.reduce((s, l) => s + (l ? l.curves.length : 0), 0) + P.dense.reduce((s, l) => s + l.curves.length, 0) })]);
     rows.push([t('res.points'), fmtN(np)]);
@@ -1000,6 +1157,7 @@ function renderLayers() {
       S.lay[cb.dataset.lay] = cb.checked; save();
       const id = cb.dataset.lay;
       if (id === 'caustic' || id === 'cSeam' || id === 'cAsym') runObs();
+      if (id === 'pts') runPts();
       if (is2() && S.shell.on && ['caustic', 'bEntry', 'bTir', 'bSeam'].includes(id)) runShell();
       refresh(); setStatus();
     });

@@ -107,7 +107,7 @@ export default {
   'res.title': ['结果', 'Results'],
   'res.empty': ['还没有结果.', 'No results yet.'],
   'res.points': ['采样点', 'samples'], 'res.mesh': ['网格', 'mesh'], 'res.meshLine': ['{n} 三角形 · {ms} ms', '{n} triangles · {ms} ms'],
-  'res.layers': ['h 层', 'h layers'], 'res.layersLine': ['{n} 层有曲线 · {c} 条', '{n} layers with curves · {c} curves'], 'res.bdry': ['边界段', 'boundary pieces'],
+  'res.layers': ['h 层', 'h layers'], 'res.shells': ['球壳层', 'shells'], 'res.layersLine': ['{n} 层有曲线 · {c} 条', '{n} layers with curves · {c} curves'], 'res.bdry': ['边界段', 'boundary pieces'],
   'res.bdryKinds1': ['掠入 / 镜面 / 出射', 'entry / mirror / exit'],
   'res.bdryKinds2': ['掠入 / 出射 / 接缝 / 转折 / 尖点', 'entry / exit / seam / turn / cusp'],
   'res.surf': ['曲面', 'surface'], 'res.surfFallback': ['这条光路没有选中的曲线, 已改用焦散', 'this path has no such curve; using the caustic'],
@@ -117,7 +117,7 @@ export default {
   'res.nothing': ['这个取向下光路走不通, 或者晶体都在截断距离外 / 灯后方: 没有晕.', 'The path does not work for this orientation, or every crystal is beyond the truncation or behind the lamp: no halo.'],
 
   'st.err': ['出错: {e}', 'Error: {e}'], 'st.noPath': ['没有光路', 'no path'],
-  'st.main': ['计算晕面 {d}/{n}', 'computing surface {d}/{n}'], 'st.dense': ['加密 h 层 {d}/{n}', 'densifying h layers {d}/{n}'], 'st.fill': ['补线 {d}/{n}', 'filling sparse gaps {d}/{n}'], 'st.mesh2': ['球壳法建晕面', 'building the surface from shells'],
+  'st.main': ['计算晕面 {d}/{n}', 'computing surface {d}/{n}'], 'st.dense': ['加密 h 层 {d}/{n}', 'densifying h layers {d}/{n}'], 'st.fill': ['补线 {d}/{n}', 'filling sparse gaps {d}/{n}'], 'st.mesh2': ['球壳法建晕面 {d}/{n}', 'building the surface from shells {d}/{n}'], 'st.lay2': ['球壳法没成, 改用光锥层', 'shell method failed, using light-cone layers'],
   'st.obs': ['计算焦散…', 'computing caustic…'], 'st.shell': ['计算球壳…', 'computing shell…'], 'st.cone': ['计算锥切片…', 'computing cone slice…'],
   'st.done': ['完成 · {ms} ms', 'done · {ms} ms'],
   'gl.title': ['术语', 'Glossary'],

@@ -23,7 +23,7 @@ import { fold2DofFine, fold1DofFine, seam1DofFine } from './engine/obsfine.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
 import { trimFill } from './app/spacing.js';
 import { stitchLayers2 } from './engine/stitch2.js';
-import { meshShells, shellSource, criticalRadii } from './engine/mesh2s.js';
+import { meshShells, shellSource, criticalRadii, skyStepOf } from './engine/mesh2s.js';
 
 function transferOf(obj, list = []) {
   if (obj && typeof obj === 'object') {
@@ -83,19 +83,22 @@ const RUN = {
   // 一自由度晕面, 球壳法: 层 = 发散度球壳上的弧 (computeShell, 闭式), 相邻两层在视方向里对应着缝 (engine/mesh2s.js).
   //   临界半径取自三维边界线 (入射掠射 / 镜面掠射 / 出射临界, 光锥法的边界引擎, 几十毫秒) 离眼距离的极值与端点.
   //   超时 / 出错 → { ok: false }, 调用方留着 (h, α) 网格 (mesh1)
+  //   分段并行 (a.rMin, a.rMax, a.rows: 这一段的半径范围与初始层数): 各段的点距一样 —— 按平行光弧 (r → 0 时的层线) 的天空长度
+  //   与总预算 a.budgetAll 定 (各段算出来的相同), 密度不在段间跳
   mesh1s: a => {
     const er = a.el * Math.PI / 180, L = [a.dist * Math.cos(er), 0, a.dist * Math.sin(er)], E = [0, 0, a.eye];
     const nr = a.fp.map(baseNormalFromCompact), t0 = Date.now(), limit = a.maxMs || 30000;
     const b = lightConeBoundaries(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta);
     const critical = criticalRadii([...b.entry, ...b.mirror, ...b.tir].map(c => c.p || c), L, E);
-    const compute = (r, seeds) => {
-      const res = computeShell(nr, a.zeta, a.theta, a.n, L, E, r, true, 0, 360, { seeds, cancelled: () => Date.now() - t0 > limit });
+    const skyFixed = a.budgetAll ? skyStepOf(parallelArc(a.fp, a.el, a.zeta, a.theta, a.n, E), E, a.budgetAll) : 0;
+    const compute = (r, o) => {
+      const res = computeShell(nr, a.zeta, a.theta, a.n, L, E, r, true, 0, 360, { seeds: o.seeds, noGrid: o.noGrid, cancelled: () => Date.now() - t0 > limit });
       const cusps = res.cuspP.slice();
       for (const q of res.arcs) for (const f of q.foldP) cusps.push(f);
       return { arcs: res.arcs.filter(q => q.p.length >= 2).map(q => ({ p: q.p, d: q.dir, closed: q.closed })), cusps, states: res.arcs.map(q => q.w) };
     };
     let m;
-    try { m = meshShells(shellSource(compute), L, E, { maxD: a.maxD, budget: a.budget, critical, cancelled: () => Date.now() - t0 > limit }); }
+    try { m = meshShells(shellSource(compute), L, E, { maxD: a.maxD, budget: a.budget, critical, rMin: a.rMin, rMax: a.rMax, rows: a.rows, skyFixed, cancelled: () => Date.now() - t0 > limit }); }
     catch (e) { return { ok: false, why: String(e && e.message || e) }; }
     if (!(m.nTri > 0)) return { ok: false, why: 'empty' };
     return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, rows: m.stat.rows, ms: Date.now() - t0 };
@@ -197,21 +200,29 @@ const RUN = {
   //   a.feats: 已经解出来的三维边界线 / 脊线 —— 它们离眼距离的极值与端点就是层线拓扑会变的半径 (criticalRadii).
   //   引擎的网格种子在有效区很窄处会漏弧, 由 shellSource 沿半径延拓补上 (相邻球壳上的状态点当种子).
   //   返回网格 (pos / dir / h / nrm) 和各层的线 lines: [{ r, curves: [{ p, d }] }]; 超时或出错 → { ok: false }
+  //   分段并行: a.rMin / a.rMax / a.rows = 这一段的半径范围与初始层数; 各段共用的点距 = a.skyFixed (弧度), 或按平行光弧与
+  //   总预算 a.budgetAll 在这里算 (各段算出来的一样). a.feats 可空: 不给临界半径时层线拓扑的变化由二分去夹 (准确度相同),
+  //   页面就不必等边界线算完, 网格与边界线同时开算
   mesh2s: a => {
     const nr = a.fp.map(baseNormalFromCompact);
     let sf = a.surfFence;
     if (sf && sf.length > 4 && /^\d+$/.test(sf.substring(4)) && parseInt(sf.substring(4), 10) > nr.length - 2) sf = null;
     const wantC = sf === null, fam = a.lowitz ? 'lowitz' : 'column', fixed = a.lowitz ? a.theta : a.zeta;
     const t0 = Date.now(), limit = a.maxMs || 60000;
-    const compute = (r, seeds) => {
-      const res = computeShell2Dof(nr, fam, fixed, a.n, a.L, a.E, r, true, wantC, nm => nm === sf, { seeds, keepStates: true });
-      return { arcs: res.curves.filter(c => (wantC ? c.kind === 0 : c.name === sf) && c.p.length >= 2).map(c => ({ p: c.p, d: c.dir, closed: c.closed })), cusps: res.cuspP, states: res.states || null };
+    let skyFixed = a.skyFixed || 0;
+    if (!skyFixed && a.budgetAll) {
+      const lp = a.fp.map(lpFaceFromCompact), surf = resolveSurface(lp, a.surf || 'caustic');
+      skyFixed = skyStepOf(parallelArc2Dof(lp, a.el, a.eye, 101, !!a.lowitz, a.zeta, a.theta, surf, true), a.E, a.budgetAll);
+    }
+    const compute = (r, o) => {
+      const res = computeShell2Dof(nr, fam, fixed, a.n, a.L, a.E, r, true, wantC, nm => nm === sf, { seeds: o.seeds, noGrid: o.noGrid, from: o.from, keepStates: true, skyStep: 2 });
+      return { arcs: res.curves.filter(c => (wantC ? c.kind === 0 : c.name === sf) && c.p.length >= 2).map(c => ({ p: c.p, d: c.dir, closed: c.closed })), cusps: res.cuspP, focal: wantC ? res.focalP : [], states: res.states || null, transported: !!res.transported };
     };
     let m;
-    try { m = meshShells(shellSource(compute), a.L, a.E, { maxD: a.maxD, budget: a.budget, critical: criticalRadii(a.feats || [], a.L, a.E), cancelled: () => Date.now() - t0 > limit }); }
+    try { m = meshShells(shellSource(compute), a.L, a.E, { maxD: a.maxD, budget: a.budget, critical: criticalRadii(a.feats || [], a.L, a.E), rMin: a.rMin, rMax: a.rMax, rows: a.rows, skyFixed, cancelled: () => Date.now() - t0 > limit }); }
     catch (e) { return { ok: false, why: String(e && e.message || e) }; }
-    if (!(m.nTri > 0)) return { ok: false, why: 'empty' };
-    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, rows: m.stat.rows, loose: m.stat.looseDeg, ms: Date.now() - t0 };
+    if (!(m.nTri > 0) && !m.focal.length) return { ok: false, why: 'empty' };
+    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, focal: m.focal, rows: m.stat.rows, loose: m.stat.looseDeg, ms: Date.now() - t0 };
   },
 
   shell1: a => {
@@ -257,9 +268,10 @@ function shellPack2(res, wantC) {
   }
   return {
     curves, kinds,
-    ends: f32of(res.endP), endDirs: f32of(res.endDir), folds: new Float32Array(0), foldDirs: new Float32Array(0),
+    // 末端点: 焦散的末端 (落在篱笆像上) + 篱笆像自己的角点末端 (入射掠射与出射临界等两条篱笆相交处)
+    ends: f32of(res.endP.concat(res.fenceEndP || [])), endDirs: f32of(res.endDir.concat(res.fenceEndDir || [])), folds: new Float32Array(0), foldDirs: new Float32Array(0),
     cusps: f32of(res.cuspP), ok: !res.note, note: res.note || '', wantC,
-    nArcs: curves.length, nCau, nFen, nEnds: res.endP.length,
+    nArcs: curves.length, nCau, nFen, nEnds: res.endP.length + (res.fenceEndP || []).length,
   };
 }
 

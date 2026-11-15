@@ -6,7 +6,7 @@
 //   每层球壳截出来的都是同一形状的线, 只是按半径缩放 —— 一直到 r → 0 都是正则的, 最里一层在天空里就是平行光弧.
 //   同一层上 "位置" 与 "视方向" 一一对应 (都在同一个球面上), 所以层间的对应、距离、容差全部按角度量, 没有随尺度变的长度阈值.
 //
-// 输入: shellAt(r) → { arcs: [{ p, d, closed }], cusps: [[x, y, z] …] }
+// 输入: shellAt(r) → { arcs: [{ p, d, closed }], cusps: [[x, y, z] …], focal: [[x, y, z] …] (焦点, 可无) }
 //   p / d = 这一层上一条弧各点的位置 / 单位视方向 (长度 3n 的数组, 或 [x, y, z] 的数组); 弧的两端是引擎给的精确末端点
 //   (落在入射掠射 / 出射临界 … 边界上), closed = 闭合环; cusps = 这一层上的尖点. 引擎: divshell.js 的 computeShell2Dof.
 // 做法:
@@ -20,7 +20,8 @@
 //   4) 配全了但两层在天空里隔得远 (> skyGap) 就在中间加层, 直到够密或到行数上限.
 //   灯在 r = D 的球壳上是晕面的另一个锥顶: 那里层线在天空里缩向灯的方向, 由 4) 自动加密.
 //   最大距离截断 (离灯 maxD): 弧在截断球面处截断, 截口当末端点.
-// 输出: { pos, dir, h, nrm (每个三角形三个顶点依次排), nTri, lines: [{ r, gap, curves: [{ p, d }] }] (各层的线, 画层线用), stat, rowR }
+// 输出: { pos, dir, h, nrm (每个三角形三个顶点依次排), nTri, lines: [{ r, gap, curves: [{ p, d }] }] (各层的线, 画层线用),
+//        focal: [{ p, d }] (焦线: 各层焦点连成的折线), stat, rowR }
 //   h = 各顶点的灯处仰角 (按位置算, 着色用).
 
 const DEG = Math.PI / 180;
@@ -30,14 +31,44 @@ export function meshShells(shellAt, L, E, opt = {}) {
   const Dx = L[0] - E[0], Dy = L[1] - E[1], Dz = L[2] - E[2], D = Math.hypot(Dx, Dy, Dz);
   const maxD = opt.maxD || 80, rMin = opt.rMin || 1e-3 * D, rMax = opt.rMax || maxD + D;
   const N0 = opt.rows || 72, EPS = opt.eps || 1e-5, MAXROWS = opt.maxRows || 900, MAXCALLS = opt.maxCalls || 1600;
+  const cancelled = opt.cancelled || null;
+  const PINL = opt.pinLamp || 1e-3;           // 灯所在的球壳 r = D 两侧各留这么宽 (相对) 不取层: 晕面在灯上是锥顶, 层线在这里线性地缩成一点
+  // ---- 初始层: 半径对数等距, 加上临界半径两侧、灯两侧各一层.
+  // 临界半径 (opt.critical): 层线的条数 / 连法只在这些半径上变 —— 弧的末端点落在三维边界线上, 边界线离眼的距离取极值
+  //   (边界线与球壳相切) 或边界线起止的地方, 末端点成对地出现 / 消失, 一条弧分成两条或两条并成一条. 调用方从已经解出来的
+  //   边界线直接算出这些半径 (criticalRadii), 这里在每个半径两侧各放一层 (相对 ± CRIT), 这一对层之间不再二分, 直接按
+  //   "配得上的缝、缩没的小段收口、其余逐点对应" 处理; 没有预先给出的变化 (面内部的极值、鞍点) 仍由二分去夹
+  const CRIT = 2e-4, crit = [];
+  for (const rc of (opt.critical || []).slice().sort((p, q) => p - q)) {
+    if (!(rc * (1 - 2 * CRIT) > rMin && rc * (1 + 2 * CRIT) < rMax) || Math.abs(rc / D - 1) < 2 * PINL) continue;   // 两侧那一对层都在范围里才算
+    if (crit.length && rc / crit[crit.length - 1] - 1 < 4 * CRIT) continue;
+    crit.push(rc);
+  }
+  const rs = [], allCrit = crit.concat([D]);
+  for (let k = 0; k < N0; k++) {
+    const r = rMin * Math.pow(rMax / rMin, k / (N0 - 1));
+    if (Math.abs(r / D - 1) > PINL && !crit.some(rc => Math.abs(r / rc - 1) < 2 * CRIT)) rs.push(r);
+  }
+  if (rMin < D * (1 - PINL) && rMax > D * (1 + PINL)) rs.push(D * (1 - PINL), D * (1 + PINL));
+  const critLo = new Set();
+  for (const rc of crit) { const lo = rc * (1 - CRIT); rs.push(lo, rc * (1 + CRIT)); critLo.add(Math.round(Math.log(lo) * 1e9)); }
+  rs.sort((p, q) => p - q);
+  // 锚层 (引擎全搜: 全球网格找种子): 每 ANCH 层一个, 临界半径两侧, 灯两侧; 其余的层从已算的邻层沿半径搬过来 (shellSource).
+  //   先把锚层都算出来, 其余的层算的时候两侧都有锚层可依
+  const ANCH = opt.anchorEvery || 6, critSet = new Set();
+  for (const rc of crit) { critSet.add(Math.round(Math.log(rc * (1 - CRIT)) * 1e9)); critSet.add(Math.round(Math.log(rc * (1 + CRIT)) * 1e9)); }
+  // 最后一层也是锚层: 分段并行时相邻两段在交界的那层上都做全搜, 结果一致
+  const isAnchor = (r, k) => k % ANCH === 0 || k === rs.length - 1 || critSet.has(Math.round(Math.log(r) * 1e9)) || Math.abs(r / D - 1) < 2 * PINL;
+  const anchors = rs.filter((r, k) => isAnchor(r, k));
   // 预算 (顶点数): 天空里铺得大的曲面每层的线有几百度长, 按固定的 0.35° 取点、1.2° 加层会到几十万个三角形.
-  //   先算 7 层看线有多长, 步长放宽到 "平均每层的点数 × 约 200 层 ≤ 预算", 层间距跟着步长走 (≥ 3 倍)
+  //   按锚层的线有多长, 步长放宽到 "平均每层的点数 × 约 200 层 ≤ 预算", 层间距跟着步长走 (≥ 3 倍)
   const VBUDGET = opt.budget || 90000;
   let SKY = (opt.skyStep || 0.35) * DEG;
   {
     let tot = 0, cnt = 0;
-    for (let k = 0; k < 7; k++) {
-      const s0 = shellAt(rMin * Math.pow(rMax / rMin, (k + 0.5) / 7)) || { arcs: [] };
+    for (const ra of anchors) {
+      if (cancelled && cancelled()) throw new Error('cancelled');
+      const s0 = shellAt(ra, true) || { arcs: [] };
       let len = 0;
       for (const arc of s0.arcs || []) {
         const flat = !Array.isArray(arc.d[0]), n = flat ? arc.d.length / 3 : arc.d.length;
@@ -49,13 +80,13 @@ export function meshShells(shellAt, L, E, opt = {}) {
       if (len > 0) { tot += len; cnt++; }
     }
     if (cnt) SKY = Math.min(2 * DEG, Math.max(SKY, (tot / cnt) * 200 / VBUDGET));
+    if (opt.skyFixed > 0) SKY = opt.skyFixed;   // 分段并行: 各段用同一个点距 (调用方按平行光弧的长度定), 密度不在段间跳
   }
+  shellAt.sky = SKY;                            // 沿半径搬运时的点距 (shellSource)
   const GAPSKY = Math.max((opt.skyGap || 1.2) * DEG, 3 * SKY), TOLN = 10 * DEG, CAPMAX = 1 * DEG;
   // 半径方向也要够密: 天空里张角很小的曲面 (几乎顺着视线铺开), 天空间距判据不触发, 三维里相邻两层却隔得远, 曲率被长条三角形抹平
   const RSTEP = opt.rStep || Infinity;          // 默认不用 (试过 5%: 不解决问题, 三角形数翻几倍)
   const MAXEDGE = Math.max(4 * GAPSKY, 5 * DEG), UNCOK = 1.5 * SKY;
-  const PINL = opt.pinLamp || 1e-3;           // 灯所在的球壳 r = D 两侧各留这么宽 (相对) 不取层: 晕面在灯上是锥顶, 层线在这里线性地缩成一点
-  const cancelled = opt.cancelled || null;
   // ---- 顶点表
   let VP = new Float64Array(3 * 65536), VU = new Float64Array(3 * 65536), nv = 0;
   const addV = (x, y, z, ux, uy, uz) => {
@@ -77,14 +108,15 @@ export function meshShells(shellAt, L, E, opt = {}) {
   // ---- 一层: 引擎 → 抽稀 → 段 (两端是末端点的一条弧 / 一个闭合环) 与末端点
   let calls = 0;
   const cache = new Map();
-  const prep = r => {
+  const prep = (r, full = false) => {
     const key = Math.round(Math.log(r) * 1e9);
     let row = cache.get(key);
     if (row) return row;
     if (cancelled && cancelled()) throw new Error('cancelled');
     calls++;
-    const s = shellAt(r) || { arcs: [], cusps: [] };
-    row = { r, segs: [], nodes: [], raw: [], lmin: Infinity, lmax: -Infinity };
+    const s = shellAt(r, full) || { arcs: [], cusps: [] };
+    row = { r, segs: [], nodes: [], raw: [], lmin: Infinity, lmax: -Infinity, focal: [] };
+    for (const q of s.focal || []) { const x = q[0] - E[0], y = q[1] - E[1], z = q[2] - E[2], l = Math.hypot(x, y, z) || 1; if (Math.hypot(q[0] - L[0], q[1] - L[1], q[2] - L[2]) <= maxD) row.focal.push({ p: q, u: [x / l, y / l, z / l] }); }
     const cusp = (s.cusps || []).map(q => { const x = q[0] - E[0], y = q[1] - E[1], z = q[2] - E[2], l = Math.hypot(x, y, z) || 1; return [x / l, y / l, z / l]; });
     for (const arc of s.arcs || []) {
       const flat = !Array.isArray(arc.p[0]);
@@ -330,7 +362,7 @@ export function meshShells(shellAt, L, E, opt = {}) {
     const cs = corrOf(a, b, pr);
     // 半径只差 0.2% 以内的两层 (变化前后夹紧的那些) 弦高无从说起, 不另算中间层 —— 否则二分链上每一节都多算一层, 引擎调用数撑到上限
     if (!cs.length || b.r / a.r - 1 < 2e-3) return null;
-    const m = prep(Math.sqrt(a.r * b.r));
+    const m = prep(Math.sqrt(a.r * b.r)); stat.sagN = (stat.sagN || 0) + 1;
     if (!m.segs.length) return null;
     const near = (x, y, z) => {
       let bd = Infinity;
@@ -346,7 +378,7 @@ export function meshShells(shellAt, L, E, opt = {}) {
         const i = P[Math.round(k * (P.length - 1) / 8)], j = Q[Math.round(k * (Q.length - 1) / 8)];
         const x = 0.5 * (VP[3 * i] + VP[3 * j]), y = 0.5 * (VP[3 * i + 1] + VP[3 * j + 1]), z = 0.5 * (VP[3 * i + 2] + VP[3 * j + 2]);
         const rr = Math.min(Math.hypot(x - E[0], y - E[1], z - E[2]), Math.hypot(x - L[0], y - L[1], z - L[2]));
-        if (near(x, y, z) > 0.015 + 0.0015 * rr) return m;
+        if (near(x, y, z) > 0.015 + 0.0015 * rr) { stat.sagHit = (stat.sagHit || 0) + 1; return m; }
       }
     }
     return null;
@@ -436,7 +468,7 @@ export function meshShells(shellAt, L, E, opt = {}) {
     if (whole(a, b, pr)) {
       let m = null;
       if (depth < 12 && ratio > 4 * EPS && ((sep(a, b, pr) > GAPSKY || nearLamp(a, b) || ratio > RSTEP) || (m = sagCheck(a, b, pr)))) {
-        if (!m) m = prep(Math.sqrt(a.r * b.r));
+        if (!m) { m = prep(Math.sqrt(a.r * b.r)); stat.gapSplit = (stat.gapSplit || 0) + 1; }
         keep(m); stitch(a, m, depth + 1); stitch(m, b, depth + 1);
         return;
       }
@@ -448,7 +480,7 @@ export function meshShells(shellAt, L, E, opt = {}) {
     const chain = [a];
     let lo = a, hi = b, real = true;
     while (hi.r / lo.r - 1 > EPS && calls < MAXCALLS) {
-      let m = prep(Math.sqrt(lo.r * hi.r));
+      let m = prep(Math.sqrt(lo.r * hi.r)); stat.bis = (stat.bis || 0) + 1;
       if (suspect(m, lo) && !whole(lo, m, pair(lo, m))) m = redo(m);
       if (whole(lo, m, pair(lo, m))) { lo = m; chain.push(m); if (whole(lo, hi, pair(lo, hi))) { real = false; break; } } else hi = m;
     }
@@ -467,26 +499,8 @@ export function meshShells(shellAt, L, E, opt = {}) {
     if (real) sewPair(lo, hi, pair(lo, hi), true, false); else stitch(lo, hi, depth + 1);
     if (hi !== b) stitch(hi, b, depth + 1);
   };
-  // 临界半径 (opt.critical): 层线的条数 / 连法只在这些半径上变 —— 弧的末端点落在三维边界线上, 边界线离眼的距离取极值
-  //   (边界线与球壳相切) 或边界线起止的地方, 末端点成对地出现 / 消失, 一条弧分成两条或两条并成一条. 调用方从已经解出来的
-  //   边界线直接算出这些半径 (criticalRadii), 这里在每个半径两侧各放一层 (相对 ± CRIT), 这一对层之间不再二分, 直接按
-  //   "配得上的缝、缩没的小段收口、其余逐点对应" 处理; 没有预先给出的变化 (面内部的极值、鞍点) 仍由二分去夹
-  const CRIT = 2e-4, crit = [];
-  for (const rc of (opt.critical || []).slice().sort((p, q) => p - q)) {
-    if (!(rc > rMin * 1.01 && rc < rMax * 0.99) || Math.abs(rc / D - 1) < 2 * PINL) continue;
-    if (crit.length && rc / crit[crit.length - 1] - 1 < 4 * CRIT) continue;
-    crit.push(rc);
-  }
-  const init = [], rs = [], allCrit = crit.concat([D]);
-  for (let k = 0; k < N0; k++) {
-    const r = rMin * Math.pow(rMax / rMin, k / (N0 - 1));
-    if (Math.abs(r / D - 1) > PINL && !crit.some(rc => Math.abs(r / rc - 1) < 2 * CRIT)) rs.push(r);
-  }
-  if (rMin < D * (1 - PINL) && rMax > D * (1 + PINL)) rs.push(D * (1 - PINL), D * (1 + PINL));
-  const critLo = new Set();
-  for (const rc of crit) { const lo = rc * (1 - CRIT); rs.push(lo, rc * (1 + CRIT)); critLo.add(Math.round(Math.log(lo) * 1e9)); }
-  rs.sort((p, q) => p - q);
-  for (const r of rs) init.push(prep(r));
+  const init = [];
+  rs.forEach((r, k) => init.push(prep(r, isAnchor(r, k))));
   // 截断 (离灯 maxD) 也是一条边界: 截断球面开始切到曲面 (某层弧上离灯最远的点越过 maxD) 和把它整个切掉 (最近的点也越过)
   //   的半径, 同样是层线拓扑变的地方 (截口成对出现 / 一段弧被切没). 用各层离灯距离的最大 / 最小值二分出来 (只算球壳, 便宜),
   //   和边界线给的临界半径一样处理
@@ -512,7 +526,7 @@ export function meshShells(shellAt, L, E, opt = {}) {
       for (const rc of extra) { const lo = rc * (1 - CRIT); rs.push(lo, rc * (1 + CRIT)); critLo.add(Math.round(Math.log(lo) * 1e9)); allCrit.push(rc); }
       rs.sort((p, q) => p - q);
       init.length = 0;
-      for (const r of rs) init.push(prep(r));
+      rs.forEach((r, k) => init.push(prep(r, isAnchor(r, k))));
       if (opt.log) opt.log(`truncation critical radii: ${extra.map(x => x.toFixed(4)).join(' ')}`);
     }
   }
@@ -580,6 +594,7 @@ export function meshShells(shellAt, L, E, opt = {}) {
       hh[3 * t + k] = Math.asin((L[2] - VP[3 * v + 2]) / (Math.hypot(VP[3 * v] - L[0], VP[3 * v + 1] - L[1], VP[3 * v + 2] - L[2]) || 1)) / DEG;
     }
   }
+  if (shellAt.stats) { const st = shellAt.stats(); stat.full = st.full; stat.cont = st.cont; stat.move = st.move; stat.re = st.re; stat.again = st.again; stat.first = st.first; }
   stat.rows = rows.filter(r => r.segs.length).length; stat.calls = calls; stat.ms = Date.now() - t0; stat.skipped = nSkip;
   // 各层的线 (画层线用). gap = 这一层与里面一层在天空里隔多远 (弧度): 贴着眼睛的那些层在天空里几乎重合,
   //   画的时候按累计的 gap 挑着画, 免得平行光弧旁挤成一条粗带
@@ -590,7 +605,35 @@ export function meshShells(shellAt, L, E, opt = {}) {
     prevRow = row;
   }
   const lines = rows.filter(r => r.raw.length).map(r => ({ r: r.r, gap: r.gap === undefined ? GAPSKY : r.gap, curves: r.raw }));
-  return { pos, dir, h: hh, nrm, nTri: nT, lines, stat, rowR: rows.filter(r => r.segs.length).map(r => r.r) };
+  // 焦线: 各层 (含二分时算的) 的焦点按半径排, 相邻两层里视方向最近的连起来 (隔得太远的另起一条).
+  //   先加密: 相邻两层都有焦点、却在天空里隔得比层间距 GAPSKY 还远的, 中间加算一层 (只为焦线, 不进网格)
+  {
+    const gapF = (a, b) => { let m = 0; for (const f of a.focal) { let d = Infinity; for (const g of b.focal) d = Math.min(d, angU(f.u, g.u)); m = Math.max(m, d); } return m; };
+    for (let pass = 0; pass < 6 && calls < MAXCALLS; pass++) {
+      const fr0 = [...cache.values()].filter(r => r.focal && r.focal.length).sort((p, q) => p.r - q.r);
+      let added = 0;
+      for (let k = 0; k + 1 < fr0.length && calls < MAXCALLS; k++) {
+        const a = fr0[k], b = fr0[k + 1];
+        if (b.r / a.r - 1 < 4 * EPS || critBetween(a.r, b.r)) continue;
+        const g = gapF(a, b);
+        if (g > GAPSKY && g < 20 * GAPSKY) { prep(Math.sqrt(a.r * b.r)); added++; }
+      }
+      if (!added) break;
+    }
+  }
+  const fr = [...cache.values()].filter(r => r.focal && r.focal.length).sort((p, q) => p.r - q.r), focal = [], open = [];
+  for (const row of fr) {
+    const used = new Set(), next = [];
+    for (const f of row.focal) {
+      let bi = -1, bd = Math.max(4 * GAPSKY, 3 * DEG);
+      open.forEach((o, i) => { if (used.has(i)) return; const d = angU(o.u, f.u); if (d < bd) { bd = d; bi = i; } });
+      if (bi >= 0) { used.add(bi); const o = open[bi]; o.pts.push(f.p); o.dirs.push(f.u); o.u = f.u; next.push(o); }
+      else { const o = { pts: [f.p], dirs: [f.u], u: f.u }; focal.push(o); next.push(o); }
+    }
+    open.length = 0; open.push(...next);
+  }
+  const focalOut = focal.filter(o => o.pts.length >= 2).map(o => ({ p: Float32Array.from(o.pts.flat()), d: Float32Array.from(o.dirs.flat()) }));
+  return { pos, dir, h: hh, nrm, nTri: nT, lines, focal: focalOut, stat, rowR: rows.filter(r => r.segs.length).map(r => r.r) };
 }
 
 // 验收: 球壳引擎偶尔在某些半径上漏弧 (大半径处整条焦散找不到, 个别区间少一段), 那里网格就是洞. 拿另一套引擎算的
@@ -714,11 +757,16 @@ export function joinMeshes(a, b) {
 }
 
 
-// 球壳来源: 把 "算一层球壳" 包成 meshShells 要的 shellAt(r), 并做沿半径的延拓.
-//   每层先不带种子算一遍 (引擎自己的网格种子, 快); 这一层的线比里外两个已算邻层里长的那个短了 8% 以上 (疑似漏了弧) 时,
-//   拿里外两个邻层上各条弧的状态点 (每条取十几个, 总数不超过 60) 当额外种子再算一遍 (见 divshell.js traceCaustic), 线变长了才换.
-//   compute(r, seeds) → { arcs: [{ p, d, closed }], cusps, states: [[状态点 …] …] }  (边界像没有 states, 也就不延拓)
-//   返回的函数另带 again(r): 用现在的邻层带种子重算这一层, 线变长了才换, 返回换没换
+// 球壳来源: 把 "算一层球壳" 包成 meshShells 要的 shellAt(r, full), 并做沿半径的延拓.
+//   compute(r, o) → { arcs: [{ p, d, closed }], cusps, states: [[状态点 …] …] }, o = { seeds, noGrid, from }:
+//     seeds: 外来种子 (相邻球壳弧上的状态点) 或 null; noGrid: 不做引擎的全球网格找种子, 只追种子;
+//     from = { runs, sky }: 沿半径搬运 (二自由度引擎 computeShell2Dof 的 opts.from) —— 把较近的那个已算邻层的弧直接
+//       Newton 校正到这一层, 点距 = 网格要的天空间距 sky (meshShells 算出步长后写进 shellAt.sky). 搬不过去时引擎自己退回种子追踪.
+//   锚层 (full = true) 和没有邻层可延拓的层做全搜 (网格 + 种子); 其余的层从邻层延拓 (搬运 / 种子追踪).
+//     延拓看不到在两个已算邻层之间出生又消失的弧 —— 锚层隔几层一个, 新生的弧在锚层上露面, 二分时两侧的邻层都当种子.
+//   搬过来的线比按两侧邻层插值 (只有一侧就是那一侧) 的长度短了 8% 以上 (可能有弧丢了) 时用两侧的种子再追一遍, 线变长了才换.
+//   两侧邻层都没有线的非锚层不算 (空).
+//   返回的函数另带 again(r): 全搜 (带两侧邻层的种子) 重算这一层, 线变长了才换, 返回换没换
 export function shellSource(compute) {
   const done = [];                                    // { r, res, len } 按 r 排
   const lenOf = res => { let L = 0; for (const a of res.arcs) { const flat = !Array.isArray(a.d[0]), n = flat ? a.d.length / 3 : a.d.length; for (let i = 1; i < n; i++) { const p = flat ? [a.d[3 * i - 3], a.d[3 * i - 2], a.d[3 * i - 1]] : a.d[i - 1], q = flat ? [a.d[3 * i], a.d[3 * i + 1], a.d[3 * i + 2]] : a.d[i]; L += Math.acos(Math.max(-1, Math.min(1, p[0] * q[0] + p[1] * q[1] + p[2] * q[2]))); } } return L; };
@@ -731,29 +779,63 @@ export function shellSource(compute) {
     const runs = [];
     for (const e of nb) if (e && e.res.states) for (const run of e.res.states) if (run.length) runs.push(run);
     if (!runs.length) return null;
-    const per = Math.max(2, Math.min(16, Math.floor(60 / runs.length))), out = [];
-    for (const run of runs) { const st = Math.max(1, Math.floor(run.length / per)); for (let i = st >> 1; i < run.length; i += st) out.push(run[i]); }
+    const per = Math.max(3, Math.min(16, Math.floor(80 / runs.length))), out = [];
+    for (const run of runs) { const st = Math.max(1, Math.floor(run.length / per)); for (let i = st >> 1; i < run.length; i += st) out.push(run[i]); out.push(run[0], run[run.length - 1]); }
     return out;
   };
+  // 搬运的源: 两侧邻层里 (对数半径上) 较近的、有弧的那个
+  const fromOf = (nb, r) => {
+    let best = null, bd = Infinity;
+    for (const e of nb) if (e && e.res.states && e.res.states.length) { const d = Math.abs(Math.log(e.r / r)); if (d < bd) { bd = d; best = e; } }
+    return best ? { runs: best.res.states, sky: shellAt.sky || 0.5 * Math.PI / 180 } : null;
+  };
+  const expect = (nb, r) => {
+    const [a, b] = nb;
+    if (a && b) { const t = Math.log(r / a.r) / Math.log(b.r / a.r); return a.len + t * (b.len - a.len); }
+    return a ? a.len : b ? b.len : 0;
+  };
   const put = (r, res) => { const e = { r, res, len: lenOf(res) }; const i = done.findIndex(x => x.r >= r); if (i >= 0 && done[i].r === r) done[i] = e; else if (i < 0) done.push(e); else done.splice(i, 0, e); return e; };
-  const shellAt = r => {
+  let nFull = 0, nCont = 0, nMove = 0, nRe = 0, nAgain = 0, nFirst = 0;
+  const shellAt = (r, full = false) => {
     const old = done.find(x => x.r === r);
     if (old) return old.res;
-    let res = compute(r, null);
-    // 和里外两个邻层里长的那个比 (二分时离得近的那个邻层常常就是外面空着的一层, 和它比就永远不补)
-    const nb = near(r), len = lenOf(res), nl = Math.max(nb[0] ? nb[0].len : 0, nb[1] ? nb[1].len : 0);
-    if (len < 0.92 * nl) { const sd = seedsOf(nb); if (sd) { const r2 = compute(r, sd); if (lenOf(r2) > len * 1.001) res = r2; } }
+    const nb = near(r), sd = seedsOf(nb);
+    let res;
+    if (!full && sd) {
+      res = compute(r, { seeds: sd, noGrid: true, from: fromOf(nb, r) }); nCont++;
+      if (res.transported) nMove++;
+      // 搬过来的线比两侧邻层插值短了不少: 可能有弧没搬过来 (两层之间拓扑在变) —— 用两侧邻层的种子再追一遍 (不做全球网格)
+      if (res.transported && lenOf(res) < 0.92 * expect(nb, r)) { const r2 = compute(r, { seeds: sd, noGrid: true, from: null }); nRe++; if (lenOf(r2) > lenOf(res) * 1.001) res = r2; }
+    } else if (!full && nb[0] && nb[1] && !nb[0].res.arcs.length && !nb[1].res.arcs.length && !(nb[0].res.focal || []).length && !(nb[1].res.focal || []).length) {
+      res = { arcs: [], cusps: [], states: [] };      // 两侧邻层都没有线、自己又不是锚层: 新出生的弧由锚层发现
+    } else { res = compute(r, { seeds: sd, noGrid: false, from: null }); nFull++; if (!full) nFirst++; }
     return put(r, res).res;
   };
   shellAt.again = r => {
     const old = done.find(x => x.r === r), sd = seedsOf(near(r));
-    if (!sd) return false;
-    const res = compute(r, sd);
+    const res = compute(r, { seeds: sd, noGrid: false, from: null }); nFull++; nAgain++;
     if (old && lenOf(res) <= old.len * 1.001) return false;
     put(r, res);
     return true;
   };
+  shellAt.stats = () => ({ full: nFull, cont: nCont, move: nMove, re: nRe, again: nAgain, first: nFirst });
   return shellAt;
+}
+
+// 网格点距 (弧度): 平行光弧 (r → 0 时的层线; Float32Array 折线, 点在以眼为心的大球面上) 的天空长度 × 约 200 层 ≤ 预算 (顶点数),
+//   至少 0.35°、至多 maxDeg (默认 0.8°) —— 与 meshShells 里按锚层估的同一个公式, 只是改用平行光弧, 分段并行时各段算出来的一样
+export function skyStepOf(arcs, E, budget, maxDeg = 0.8) {
+  let len = 0;
+  for (const c of arcs || []) {
+    const p = c.p || c;
+    for (let i = 3; i + 2 < p.length; i += 3) {
+      const ax = p[i - 3] - E[0], ay = p[i - 2] - E[1], az = p[i - 1] - E[2], bx = p[i] - E[0], by = p[i + 1] - E[1], bz = p[i + 2] - E[2];
+      const la = Math.hypot(ax, ay, az), lb = Math.hypot(bx, by, bz);
+      if (la > 0 && lb > 0) len += Math.acos(Math.max(-1, Math.min(1, (ax * bx + ay * by + az * bz) / (la * lb))));
+    }
+  }
+  const DEG = Math.PI / 180;
+  return Math.min(maxDeg * DEG, Math.max(0.35 * DEG, len * 200 / Math.max(1, budget)));
 }
 
 // 临界半径: 三维边界线 / 脊线 (各是一条折线, 坐标数组长 3n) 上离眼距离 r 的局部极值, 以及每条线的两端.

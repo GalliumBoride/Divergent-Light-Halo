@@ -21,6 +21,12 @@ const STEP0 = 0.4 * DEG;
 const MAX_STEPS = 40000;
 const N_FENCE = 2400;
 const H6_MAX = 0.007, H6_0 = 0.002;
+// 有效区 = 裕度 ≥ MIN_IN (C# 原版是 ≥ 0). 焦散可以整段与一条篱笆重合: Lowitz 3-4-5 (3 → 5 隔着 4 反射, 等于平行板加一面镜子) 的
+//   Ĵ = 0 有一支就是入射掠射篱笆的像, 裕度只剩 Newton 误差 (±5e-8, 入射掠射处折射的导数发散). 按 ≥ 0 判, 这支弧被噪声切成
+//   一串碎段、在与真焦散的交叉处随机拐弯, 随半径忽有忽无 (缝网格时当成拓扑在变, 一个场景算上千层). 按 ≥ 1e-6 判: 重合的那支
+//   整段不算 (它在有效区的边上, 不是内部), 真焦散撞到篱笆的末端只往里挪 1e-6 (横截相交, 位置误差同量级).
+//   裕度浅浅地掉到 MIN_IN 以下 (> −MTOL) 时往前探 PEEK 步, 又回到 ≥ MIN_IN 就跨过去 (擦边而过), 否则才是末端
+const MIN_IN = 1e-6, MTOL = 1e-6, PEEK = 4;
 
 export class CancelledError extends Error {
   constructor() { super('cancelled'); this.name = 'CancelledError'; }
@@ -1066,6 +1072,25 @@ function traceArcs(cx, seeds) {
   const rank = (a, si) => a.Stop === 'end' && a.To >= 0 && a.To !== si && !seeds[a.To].missed ? 0 : a.Stop === 'closed' ? 1 : a.Stop === 'missed_end' ? 2 : 3;
   // 冲过了已知末端: 出射临界的末端是相切地到达的, 追踪偶尔从它旁边滑过去, 贴着篱笆再走一段才停, 停处造一个漏端.
   //   已知末端 (findEnds 精确解出的) 若离弧上某点很近 (w 上 < 2e-3, σ 差 < DSIG), 就在最近处截断, 收在这个已知末端上
+  //   另: 追踪在末端前一点点校正失败 (correct_fail 等; 出射临界的末端相切地到达, 近眼的小球壳上偶见) —— 弧停在离已知末端
+  //   很近的地方 (最后一点 w 上 < 5e-3). 不收的话另一头再追一遍, 同一条弧出来两条 (各缺一小截), 层线的段数忽多忽少.
+  //   收在这个末端上 (中间那一小截按直线连)
+  const fail = a => a.Stop !== 'end' && a.Stop !== 'closed' && a.Stop !== 'missed_end';
+  const snapFail = (a, si, n0) => {
+    if (!fail(a) || a.W.length < 2) return;
+    const i = a.W.length - 1;
+    let bk = -1, bd = 5e-3;
+    for (let k = 0; k < n0; k++) {
+      const q = seeds[k];
+      if (k === si || q.isLoop || q.dead || q.missed) continue;
+      if (Math.abs(a.Sig[i] - q.sigma) > DSIG) continue;
+      const d = dist(a.W[i], q.w);
+      if (d < bd) { bd = d; bk = k; }
+    }
+    if (bk < 0) return;
+    a.W.push(seeds[bk].w.slice()); a.Sig.push(seeds[bk].sigma); a.Xi.push(cx.xi(seeds[bk].w, seeds[bk].sigma));
+    a.To = bk; a.Stop = 'end';
+  };
   const snapBack = (a, si, n0) => {
     if (a.Stop !== 'missed_end' || a.W.length < 6) return;
     let bk = -1, bi = -1, bd = 2e-3;
@@ -1096,6 +1121,7 @@ function traceArcs(cx, seeds) {
     for (const d of dirs) {
       const n0 = seeds.length, a = tr.trace(si, d);
       snapBack(a, si, n0);
+      snapFail(a, si, n0);
       const rk = rank(a, si);
       if (rk < bestR) {
         if (best && best.To >= best.n0) seeds[best.To].dead = true;     // 换下来的那条造的漏端作废
@@ -1114,9 +1140,9 @@ function traceArcs(cx, seeds) {
 // 没有末端点的闭环: 网格 Φ 变号 → 远离已追踪弧的候选 → 双向追踪并合并
 // extra (C# 原版没有): 别处拿来的候选点 w (一般取自相邻半径球壳上的弧), 排在网格变号点后面, 同样先校正到曲线上再追.
 //   0.5° 网格上两个相邻节点都得落在有效区里才看得到变号 —— 比一格还窄的闭环 (贴着地平线的一圈) 一个候选也没有
-function findLoops(cx, seeds, arcs, extra = null) {
-  const d = 0.5;
-  const nLat = roundEven(180.0 / d), nLon = roundEven(360.0 / d) + 1;
+function findLoops(cx, seeds, arcs, extra = null, noGrid = false) {
+  const d = noGrid ? 0 : 0.5;
+  const nLat = noGrid ? 0 : roundEven(180.0 / d), nLon = noGrid ? 0 : roundEven(360.0 / d) + 1;
   const W = new Array(nLat * nLon), F = new Float64Array(nLat * nLon);
   const cLon = new Array(nLon), sLon = new Array(nLon);
   for (let j = 0; j < nLon; j++) { const lon = (-180.0 + j * d) * DEG; cLon[j] = Math.cos(lon); sLon[j] = Math.sin(lon); }
@@ -1348,7 +1374,10 @@ class Ctx2 {
 }
 
 // ------------------------------------------------------------------ 篱笆像 (显式)
-function fenceCuts(cx, fen, outRuns) {
+// outEnds (C# 原版没有): 篱笆像的真末端 —— 段在这里撞上另一条篱笆 (晕面的角点: 入射掠射与出射临界相交 …).
+//   段也会因为 "这一支 (a, c) 的 σ 解没了" 而断: 两支在此汇合, 篱笆像在这里折回、接着走另一支, 不是末端, 不记.
+//   每个末端 { state, fence: 本篱笆名, other: 撞上的那条篱笆名 }
+function fenceCuts(cx, fen, outRuns, outEnds = null) {
   const onExit = fen === cx.P.Exit;
   for (const comp of fenceSamples(cx.P, fen, 1200)) {
     ckCancel(cx);
@@ -1373,7 +1402,16 @@ function fenceCuts(cx, fen, outRuns) {
           let j0 = i0;
           while (j0 + 1 < n && st[j0 + 1] !== null) j0++;
           const run = [];
-          if (i0 > 0) { const e = refineRunEnd(cx, fen, comp[i0], comp[i0 - 1], stateAt); if (e !== null) run.push(e); }
+          const endOf = (e, wBad) => {
+            if (!outEnds || e === null) return;
+            const wb = fenceFootP(cx.P, fen, wBad);
+            if (wb !== null && cx.othersOk(wb, fen, 1e-9)) return;                // 只是这一支没了: 折回, 不是末端
+            const w = [e[0], e[1], e[2]];
+            let other = '', mv = Infinity;
+            for (const g of cx.P.AllFences) { if (g === fen) continue; const v = Math.abs(cx.P.fval(g, unit(w))); if (v < mv) { mv = v; other = g.name; } }
+            outEnds.push({ state: e, fence: fen.name, other });
+          };
+          if (i0 > 0) { const e = refineRunEnd(cx, fen, comp[i0], comp[i0 - 1], stateAt); if (e !== null) run.push(e); endOf(e, comp[i0 - 1]); }
           for (let k = i0; k <= j0; k++) {
             if (run.length > 0) subdivide(cx, fen, run[run.length - 1], st[k], stateAt, run, 0);
             run.push(st[k]);
@@ -1381,6 +1419,7 @@ function fenceCuts(cx, fen, outRuns) {
           if (j0 + 1 < n) {
             const e = refineRunEnd(cx, fen, comp[j0], comp[j0 + 1], stateAt);
             if (e !== null) { subdivide(cx, fen, run[run.length - 1], e, stateAt, run, 0); run.push(e); }
+            endOf(e, comp[j0 + 1]);
           }
           if (run.length >= 2) outRuns.push(run);
           i0 = j0 + 1;
@@ -1482,9 +1521,10 @@ function correct6(cx, x0, t) {
   const E = new Array(5), J = new Array(30);
   const A = new Array(36), b = [0, 0, 0, 0, 0, 0], d = [0, 0, 0, 0, 0, 0];
   for (let it = 0; it < 12; it++) {
-    if (!evalE(cx, x, E, J)) return null;
+    if (!evalE(cx, x, E, null)) return null;
     let mx = 0; for (let i = 0; i < 5; i++) mx = Math.max(mx, Math.abs(E[i]));
     if (mx < 1e-11) return x;
+    if (!evalE(cx, x, E, J)) return null;
     for (let i = 0; i < 5; i++) { for (let j = 0; j < 6; j++) A[i * 6 + j] = J[i * 6 + j]; b[i] = -E[i]; }
     for (let j = 0; j < 6; j++) A[30 + j] = t[j];
     b[5] = 0;
@@ -1525,14 +1565,15 @@ function dist6(a, b) {
 }
 
 // 从 x0 沿 t0 方向追一支。→ { pts (含 x0), endWhich (≥0 撞边界, −1 闭合, −2 失败/步数用尽), stop }
-function traceDir6(cx, x0, t0) {
+function traceDir6(cx, x0, t0, maxPts = 30000) {
   const pts = [x0.slice()];
   let x = x0.slice(), t = t0, dirPrev;
   const out = { pts, endWhich: -2, stop: 'max_steps' };
   dirPrev = cx.world(x);
   if (!fin3(dirPrev)) { out.stop = 'world_fail'; return out; }
+  const mxS = cx.maxSky || MAX_SKY, mnS = cx.minSky || MIN_SKY, hMx = cx.h6max || H6_MAX;
   let h = H6_0, armed = false;
-  for (let it = 0; it < 30000; it++) {
+  for (let it = 0; it < maxPts; it++) {
     if ((it & 63) === 0) ckCancel(cx);
     const tn = tangent6(cx, x, t);
     if (tn === null) { out.stop = 'tangent_fail'; return out; }
@@ -1547,15 +1588,31 @@ function traceDir6(cx, x0, t0) {
         continue;
       }
       const mm = minMargin6(cx, xc);
-      if (mm.m < 0) {
+      let dip = false;
+      if (mm.m < MIN_IN && mm.m > -MTOL) {
+        let y = xc, ty = tn;
+        for (let k = 0; k < PEEK && !dip; k++) {
+          const t2 = tangent6(cx, y, ty);
+          if (t2 === null) break;
+          const yp = new Array(6);
+          for (let j = 0; j < 6; j++) yp[j] = y[j] + h * t2[j];
+          const yc = correct6(cx, yp, t2);
+          if (yc === null) break;
+          const m2 = minMargin6(cx, yc).m;
+          if (m2 >= MIN_IN) dip = true;
+          else if (m2 < -MTOL) break;
+          y = yc; ty = t2;
+        }
+      }
+      if (mm.m < MIN_IN && !dip) {
         // 越界: 在步长上二分出边界点 (亮缘的末端)
         let lo = 0, hi = h, xlo = x;
-        for (let q = 0; q < 44; q++) {
+        for (let q = 0; q < 26; q++) {          // C# 原版 44 次; 26 次已到 h·1.5e-8 (≤ 2e-10)
           const mid = 0.5 * (lo + hi);
           const xm = new Array(6);
           for (let j = 0; j < 6; j++) xm[j] = x[j] + mid * tn[j];
           const xmc = correct6(cx, xm, tn);
-          if (xmc === null || minMargin6(cx, xmc).m < 0) hi = mid; else { lo = mid; xlo = xmc; }
+          if (xmc === null || minMargin6(cx, xmc).m < MIN_IN) hi = mid; else { lo = mid; xlo = xmc; }
         }
         pts.push(xlo);
         out.endWhich = mm.which; out.stop = 'end';
@@ -1564,16 +1621,16 @@ function traceDir6(cx, x0, t0) {
       dir = cx.world(xc);
       if (!fin3(dir)) { h *= 0.5; if (h < 1e-8) { out.stop = 'world_fail'; return out; } continue; }
       ch = ang(dir, dirPrev);
-      if (ch > MAX_SKY && h > 1e-7) { h *= 0.5; continue; }
+      if (ch > mxS && h > 1e-7) { h *= 0.5; continue; }
       break;
     }
     x = xc; t = tn; dirPrev = dir;
     pts.push(x);
-    if (ch < MIN_SKY) h = Math.min(1.5 * h, H6_MAX);
-    if (dist6(x, x0) > 4 * H6_MAX) armed = true;
+    if (ch < mnS) h = Math.min(1.5 * h, hMx);
+    if (dist6(x, x0) > 4 * hMx) armed = true;
     if (armed && dist6(x, x0) < 1.5 * h) {
       const d0 = cx.world(x0);
-      if (ang(dir, d0) > MAX_SKY && h > 1e-7) h *= 0.5;
+      if (ang(dir, d0) > mxS && h > 1e-7) h *= 0.5;
       else { pts.push(x0.slice()); out.endWhich = -1; out.stop = 'closed'; return out; }
     }
   }
@@ -1655,8 +1712,9 @@ function causticSeeds(cx) {
 // extraSeeds (C# 原版没有): 别处拿来的状态点 (w, T, τ, σ), 排在网格种子后面, 同样先校正到这一层的曲线上再追.
 //   网格种子靠 1° 网格上 Ĵ 的变号, 两个相邻节点都得有效 —— 这一叶的有效区比一格还窄时 (大 ρ 处常见) 一个种子也落不进去,
 //   整条弧就没了; 相邻球壳上已经追到的弧的状态点离这一层的曲线只差一点 (沿 ρ 延拓), 校正几步就在线上
-function traceCaustic(cx, res, outCurves, outEnds, extraSeeds = null) {
-  const cs = causticSeeds(cx);
+// noGrid: 不做全球 1° 网格找种子, 只用外来种子 (相邻球壳上延拓过来的弧; 一层球壳的大半时间花在网格上)
+function traceCaustic(cx, res, outCurves, outEnds, extraSeeds = null, noGrid = false) {
+  const cs = noGrid ? { seeds: [], degenerate: false } : causticSeeds(cx);
   if (cs.degenerate) { res.note = '该光路在这个族里 J≡0 (出射方向恒等于入射方向, 或不随第二个转角变): 二自由度退化, 没有焦散'; return; }
   if (extraSeeds && extraSeeds.length) cs.seeds = cs.seeds.concat(extraSeeds);
   const have = [];
@@ -1675,7 +1733,7 @@ function traceCaustic(cx, res, outCurves, outEnds, extraSeeds = null) {
     for (const ax of axes) { t0 = tangent6(cx, s0, ax); if (t0 !== null) break; }
     if (t0 === null) continue;
     const x0 = correct6(cx, s0, t0);
-    if (x0 === null || minMargin6(cx, x0).m < 0 || covered(x0)) continue;
+    if (x0 === null || minMargin6(cx, x0).m < MIN_IN || covered(x0)) continue;
     t0 = tangent6(cx, x0, t0);
     if (t0 === null) continue;
     const a1 = traceDir6(cx, x0, t0);
@@ -1697,13 +1755,236 @@ function traceCaustic(cx, res, outCurves, outEnds, extraSeeds = null) {
   }
 }
 
+// ================================================================== 沿半径搬运 (C# 原版没有)
+// 相邻球壳上的焦散弧 (状态点序列) 直接 Newton 校正到这一层, 不找种子、不重新追. 同一条弧在相邻两层上的状态点只差 O(Δρ):
+//   每个点在过 "预测点" (前一个点的位移外推)、法向为原弧切向的超平面里校正 (correct6), 一两次迭代就收敛. 点距按 sky
+//   (网格要的天空间距, 弧度) 抽稀 / 加密 —— 原来的追踪步长多数时候卡在状态空间的步长上限上, 天空里比网格要的密几倍.
+//   末端: 末端点落在篱笆上, 搬过来后可能出界 (弧缩了) 或在界内 (弧伸长了): 去掉出界的点, 从最后一个界内点往外追到边界
+//     (traceDir6, 二分到裕度 = MIN_IN, 与追踪同一个判据).
+//   尖点: 天空切向 T = d(视方向)/ds 在尖点处过零反号 (T ≈ (s − s₀)·v), 与取样疏密无关: 相邻两点的 T 反号 → 在两点之间的
+//     状态弦上二分到 T 反号处, 插进弧里. 转角加密 (相邻两弦夹角 > 15° 就在两弦中点各插一点) 保证非尖点的弯不会让 T 在一步里反号.
+//   出问题 (Newton 失败、弧中间出界 = 这两层之间拓扑在变、闭环出界、往外追不到边界) → 返回 false, 调用方改用种子追踪.
+// src: 邻层的状态点序列 (闭环首尾同一点); 输出 outRuns (状态点序列, 闭环首尾同一点), outEnds (末端状态点), outCusps ([弧序号, 点序号])
+const TR_DSTATE = 0.06, TR_TURN = 15 * DEG;
+function tauDiff(a, b, j) { const d = b[j] - a[j]; return j === 4 ? ieeeRemainder(d, 2 * Math.PI) : d; }
+function chordUnit(a, b) {
+  const c = new Array(6);
+  let l = 0;
+  for (let j = 0; j < 6; j++) { c[j] = tauDiff(a, b, j); l += c[j] * c[j]; }
+  l = Math.sqrt(l);
+  if (!(l > 0)) return null;
+  for (let j = 0; j < 6; j++) c[j] /= l;
+  return c;
+}
+// a、b 之间 (状态弦上参数 u) 校正到曲线上的点
+function pointOnChord(cx, a, b, u) {
+  const c = chordUnit(a, b);
+  if (c === null) return null;
+  const z = new Array(6);
+  for (let j = 0; j < 6; j++) z[j] = a[j] + u * tauDiff(a, b, j);
+  return correct6(cx, z, c);
+}
+// 天空切向 (未归一): 状态切向 t (沿 dirGuess 定向) 上的视方向导数
+function skyTangent(cx, x, dirGuess) {
+  const t = tangent6(cx, x, dirGuess);
+  if (t === null) return null;
+  const e = 1e-6, xp = new Array(6), xm = new Array(6);
+  for (let j = 0; j < 6; j++) { xp[j] = x[j] + e * t[j]; xm[j] = x[j] - e * t[j]; }
+  const a = cx.world(xp), b = cx.world(xm);
+  if (!fin3(a) || !fin3(b)) return null;
+  return [(a[0] - b[0]) / (2 * e), (a[1] - b[1]) / (2 * e), (a[2] - b[2]) / (2 * e)];
+}
+// 尖点 (C# 原版没有这个判据): 天空切向 T = d(视方向)/ds 在尖点处过零反号 (T ≈ (s − s₀)·v), 与取样疏密无关 —— 相邻两点的 T 反号,
+//   就在两点之间的状态弦上二分到反号处, 把这个点插进弧里. T 只在天球弦向反转 (相邻或隔一的两弦点积 < 0) 的点附近算: 别处相邻两弦
+//   转角很小 (追踪 / 搬运的取样都限住了), T 不会在一步里反号. 只是转了个急弯的 (T 转向但不变短) 不算; 同一个尖点被相邻两对点
+//   各认一次的 (上一层的尖点搬过来, 正落在尖点旁边, 那里 T ≈ 0 的符号是噪声) 并成一个, 插入点与现有点几乎重合的就顶替它.
+// pts: 状态点 (不含闭环重复的末点), D: 对应的视方向 (同步修改); okPt(y): 点是否在有效区. → 尖点在 pts 里的序号
+function cuspsTflip(cx, pts, D, okPt) {
+  const n = pts.length, T = new Array(n).fill(undefined);
+  if (n < 3) return [];
+  const Tat = k => {
+    if (T[k] === undefined) { const g = chordUnit(pts[Math.max(0, k - 1)], pts[Math.min(n - 1, k + 1)]); T[k] = g === null ? null : skyTangent(cx, pts[k], g); }
+    return T[k];
+  };
+  const ch = new Array(n - 1);
+  for (let k = 0; k + 1 < n; k++) ch[k] = sub(D[k + 1], D[k]);
+  const cand = new Uint8Array(n), cl = ch.map(nrm), tiny = 1e-9;
+  for (let k = 1; k + 1 < n; k++) {
+    if (cl[k - 1] < tiny) continue;
+    const rv = (cl[k] > tiny && dot(ch[k - 1], ch[k]) < 0) || (k + 1 < n - 1 && cl[k + 1] > tiny && dot(ch[k - 1], ch[k + 1]) < 0);
+    if (rv) for (let q = Math.max(0, k - 2); q <= Math.min(n - 2, k + 2); q++) cand[q] = 1;
+  }
+  const found = [];                       // [k, z, dz, |Tz|]
+  for (let k = 0; k + 1 < n; k++) {
+    if (!cand[k]) continue;
+    const Tk = Tat(k), Tk1 = Tat(k + 1);
+    if (Tk === null || Tk1 === null || dot(Tk, Tk1) >= 0) continue;
+    const g = chordUnit(pts[k], pts[k + 1]);
+    if (g === null) continue;
+    // g(u) = T(u)·T̂k 从正变负; T 在尖点附近近似线性 → 割线 (Illinois 法, 保持括住), 十几步内到 1e-10
+    const tk = scl(Tk, 1 / nrm(Tk));
+    let lo = 0, hi = 1, flo = dot(Tk, tk), fhi = dot(Tk1, tk), z = null, side = 0;
+    for (let it = 0; it < 24 && hi - lo > 1e-10; it++) {
+      let u = (lo * fhi - hi * flo) / (fhi - flo);
+      if (!(u > lo && u < hi)) u = 0.5 * (lo + hi);
+      const y = pointOnChord(cx, pts[k], pts[k + 1], u);
+      if (y === null) break;
+      const Ty = skyTangent(cx, y, g);
+      if (Ty === null) break;
+      z = y;
+      const fu = dot(Ty, tk);
+      if (fu > 0) { lo = u; flo = fu; if (side === 1) fhi *= 0.5; side = 1; } else { hi = u; fhi = fu; if (side === -1) flo *= 0.5; side = -1; }
+    }
+    if (z === null) continue;
+    const Tz = skyTangent(cx, z, g), dz = cx.world(z);
+    if (Tz === null || !fin3(dz) || nrm(Tz) > 0.2 * Math.max(nrm(Tk), nrm(Tk1))) continue;
+    if (!okPt(z)) continue;
+    const f = found[found.length - 1];
+    if (f && k - f[0] <= 2 && ang(f[2], dz) < 1e-4) { if (nrm(Tz) < f[3]) found[found.length - 1] = [k, z, dz, nrm(Tz)]; continue; }
+    found.push([k, z, dz, nrm(Tz)]);
+  }
+  // 插入 (从后往前, 序号不乱); 与 k 或 k+1 几乎重合的顶替那个点
+  const at = [];
+  for (let q = found.length - 1; q >= 0; q--) {
+    const [k, z, dz] = found[q];
+    if (ang(dz, D[k]) < 1e-6) { pts[k] = z; D[k] = dz; at.push([k, 0]); }
+    else if (ang(dz, D[k + 1]) < 1e-6) { pts[k + 1] = z; D[k + 1] = dz; at.push([k + 1, 0]); }
+    else { pts.splice(k + 1, 0, z); D.splice(k + 1, 0, dz); at.push([k + 1, 1]); }
+  }
+  // at 是从后往前记的: 后面的插入不影响前面的序号, 前面的插入让后面的都后移
+  const idx = [];
+  let shift = 0;
+  for (let q = at.length - 1; q >= 0; q--) { idx.push(at[q][0] + shift); shift += at[q][1]; }
+  return idx;
+}
+
+function transportCaustic(cx, src, sky, outRuns, outEnds, outCusps) {
+  const runsOut = [], endsOut = [], cuspsOut = [];
+  const okPt = y => y !== null && minMargin6(cx, y).m >= MIN_IN && fin3(cx.world(y));
+  for (const run0 of src) {
+    ckCancel(cx);
+    const n0 = run0.length;
+    if (n0 < 2) continue;
+    const closed = n0 > 3 && dist6(run0[0], run0[n0 - 1]) < 1e-9;
+    // 1) 抽稀源弧 (向前看): 跳过一个点后弦长会超过 0.9 sky 或状态距离超过 TR_DSTATE 的才留, 首末总留 —— 搬过来稍有伸长也不必再插点
+    const run = [run0[0]];
+    let dl = cx.world(run0[0]), xl = run0[0];
+    if (!fin3(dl)) return false;
+    const last = closed ? n0 - 2 : n0 - 1;
+    let dNext = last >= 1 ? cx.world(run0[1]) : null;
+    for (let i = 1; i < last; i++) {
+      const d = dNext;
+      dNext = cx.world(run0[i + 1]);
+      if (!fin3(d)) continue;
+      if (!fin3(dNext) || ang(dNext, dl) > 0.9 * sky || dist6(run0[i + 1], xl) > TR_DSTATE) { run.push(run0[i]); dl = d; xl = run0[i]; }
+    }
+    if (last > 0) run.push(run0[last]);
+    const m = run.length;
+    if (m < 2) return false;
+    // 2) 搬: 预测 = 源点 + 上一个点的位移; 超平面法向 = 源弧在该点的弦向
+    const Y = new Array(m);
+    let disp = null;
+    for (let i = 0; i < m; i++) {
+      const a = run[i > 0 ? i - 1 : (closed ? m - 1 : 0)], b = run[i < m - 1 ? i + 1 : (closed ? 0 : m - 1)];
+      const c = chordUnit(a, b);
+      if (c === null) return false;
+      let y = null;
+      if (disp !== null) { const xp = new Array(6); for (let j = 0; j < 6; j++) xp[j] = run[i][j] + disp[j]; y = correct6(cx, xp, c); }
+      if (y === null) y = correct6(cx, run[i], c);
+      // 跳支: 搬过来的两点比源上的两点隔得远得多
+      if (y !== null && i > 0 && Y[i - 1] !== null && dist6(y, Y[i - 1]) > 3 * dist6(run[i], run[i - 1]) + 0.03) y = null;
+      Y[i] = y;
+      if (y !== null) { disp = new Array(6); for (let j = 0; j < 6; j++) disp[j] = tauDiff(run[i], y, j); }
+    }
+    // 3) 有效性: 闭环要全在界内; 开弧只许两头出界 (缩短), 中间出界 = 拓扑在变
+    const ok = Y.map(okPt);
+    let pts;
+    if (closed) {
+      if (!ok.every(Boolean)) return false;
+      pts = Y.slice();
+    } else {
+      const i0 = ok.indexOf(true), i1 = ok.lastIndexOf(true);
+      if (i0 < 0) return false;
+      for (let i = i0; i <= i1; i++) if (!ok[i]) return false;
+      // 往外追到边界 (末端点在界内时弧伸长了, 出界时缩了 —— 都从最后一个界内点往外追)
+      const cap = 60 + 2 * m;
+      const outward = (k, kIn) => {
+        const g = new Array(6);
+        if (kIn !== k) for (let j = 0; j < 6; j++) g[j] = tauDiff(Y[kIn], Y[k], j);
+        else {
+          const c = chordUnit(run[Math.max(0, k - 1)], run[Math.min(m - 1, k + 1)]);
+          if (c === null) return null;
+          for (let j = 0; j < 6; j++) g[j] = k === 0 ? -c[j] : c[j];
+        }
+        const t0 = tangent6(cx, Y[k], g);
+        if (t0 === null) return null;
+        const a = traceDir6(cx, Y[k], t0, cap);
+        return a.endWhich >= 0 ? a.pts : null;
+      };
+      const head = outward(i0, i0 < i1 ? i0 + 1 : i0), tail = outward(i1, i1 > i0 ? i1 - 1 : i1);
+      if (head === null || tail === null) return false;
+      pts = [];
+      for (let q = head.length - 1; q >= 1; q--) pts.push(head[q]);
+      for (let i = i0; i <= i1; i++) pts.push(Y[i]);
+      for (let q = 1; q < tail.length; q++) pts.push(tail[q]);
+    }
+    // 4) 加密: 天空弦 > sky 的二分; 转角 > TR_TURN 的两弦各插中点 (弦太短的不管: 尖点处弦长趋于零、方向反转)
+    const D = pts.map(x => cx.world(x));
+    if (!D.every(fin3)) return false;
+    const segAt = k => closed ? (k + 1) % pts.length : k + 1;
+    const nSeg = () => closed ? pts.length : pts.length - 1;
+    const split = k => {           // 在 k → k+1 之间插一点; 返回是否成功
+      const k1 = segAt(k), z = pointOnChord(cx, pts[k], pts[k1], 0.5);
+      if (z === null || !okPt(z)) return false;
+      pts.splice(k + 1, 0, z); D.splice(k + 1, 0, cx.world(z));
+      return true;
+    };
+    for (let k = 0, guard = 0; k < nSeg() && guard < 20000; guard++) {
+      if (ang(D[k], D[segAt(k)]) > sky && dist6(pts[k], pts[segAt(k)]) > 1e-7) { if (!split(k)) return false; continue; }
+      k++;
+    }
+    const mnC = 0.1 * sky;
+    for (let pass = 0; pass < 4; pass++) {
+      let any = false;
+      for (let k = 1; k < nSeg(); k++) {
+        const a = D[k - 1], b = D[k], c = D[segAt(k)];
+        const u = sub(b, a), v = sub(c, b), lu = nrm(u), lv = nrm(v);
+        if (lu < mnC || lv < mnC) continue;
+        if (dot(u, v) >= Math.cos(TR_TURN) * lu * lv) continue;
+        if (dist6(pts[k - 1], pts[k]) < 1e-7 || dist6(pts[k], pts[segAt(k)]) < 1e-7) continue;
+        if (!split(k)) return false;
+        if (!split(k - 1)) return false;
+        k += 2; any = true;
+      }
+      if (!any) break;
+    }
+    const cu = cuspsTflip(cx, pts, D, okPt);
+    if (closed) pts.push(pts[0].slice());
+    const ri = runsOut.length;
+    runsOut.push(pts);
+    for (const k of cu) cuspsOut.push([ri, k]);
+    if (!closed) endsOut.push(pts[0], pts[pts.length - 1]);
+  }
+  // 两条弧在这两层之间并成了一条: 各自往外追末端都会穿过汇合点、追到对方的远端, 同一条弧出来两遍. 末端点有重合的 → 拓扑在变
+  for (let i = 0; i < endsOut.length; i++) for (let j = i + 1; j < endsOut.length; j++) if (((i ^ j) !== 1 || (i >> 1) !== (j >> 1)) && dist6(endsOut[i], endsOut[j]) < 1e-6) return false;
+  for (const r of runsOut) outRuns.push(r);
+  for (const e of endsOut) outEnds.push(e);
+  for (const c of cuspsOut) outCusps.push(c);
+  return true;
+}
+
 /**
  * 二自由度族在一层球壳上的轮廓: 焦散 (亮缘) 与各条篱笆的像 (= DivShell.Compute2Dof)。
  * fam='column': R = Rz(α)·Ry(fixedDeg)·Rz(τ), τ=θ 自由;  fam='lowitz': R = Rz(α)·Ry(τ)·Rz(fixedDeg), τ=ζ 自由。
  * wantFence(name): 要不要画名为 name 的篱笆 ('entry'/'exit'/'seam1'/'blue1'…), 可为 null。
  * opts.cancelled(): 返回 true 则抛 CancelledError;  opts.verify: 独立 snell 核对 (填 maxVerifyErr/maxJfdErr/worstJInfo)。
  * opts.seeds: 额外的焦散种子 (状态点 [w0,w1,w2,T,τ,σ], 一般取自相邻半径的 states);  opts.keepStates: 返回 states (各条焦散弧的状态点)。
- * 返回 { curves:[{kind,name,p,dir,closed}], endP, endDir, cuspP, cuspDir, rho, kappa, baseDist, lampElevDeg, radius,
+ * opts.noGrid (要同时给 seeds): 不做全球网格找种子, 只追外来种子 —— 相邻球壳之间的延拓用, 快几倍; 新出生的弧看不到。
+ * opts.from = { runs, sky }: 沿半径搬运 (transportCaustic) —— runs = 相邻球壳的 states, sky = 要的天空点距 (弧度); 比种子追踪
+ *   再快几倍, 尖点精确定位. 搬不过去 (两层之间拓扑在变 …) 时自动退回种子追踪 (opts.seeds / 网格); res.transported 记着用的哪种。
+ * 返回 { curves:[{kind,name,p,dir,closed,ends}] (ends: 焦散开弧两端落在哪条边界上), endP, endDir (焦散末端), fenceEndP, fenceEndDir, fenceEndKind ('本篱笆|撞上的篱笆', 篱笆像的角点末端),
+ *        focalP, focalDir (焦点: 整段焦散映到天上同一点的退化弧, 只报这一点),
+ *        cuspP, cuspDir, rho, kappa, baseDist, lampElevDeg, radius,
  *        nPoints, nCaustic, nFence, badArcs, note, maxVerifyErr, maxJfdErr, worstJInfo }  (点 = [x,y,z])
  */
 export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, radius, partial,
@@ -1711,6 +1992,7 @@ export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, ra
   const verify = !!opts.verify;
   const res = {
     curves: [], endP: [], endDir: [], cuspP: [], cuspDir: [],
+    fenceEndP: [], fenceEndDir: [], fenceEndKind: [], focalP: [], focalDir: [],
     rho: 0, kappa: 0, baseDist: 0, lampElevDeg: 0, radius,
     nPoints: 0, nCaustic: 0, nFence: 0,
     badArcs: [], note: '', maxVerifyErr: NaN, maxJfdErr: NaN, worstJInfo: '',
@@ -1735,6 +2017,9 @@ export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, ra
   cx.Sl = bz / D; cx.Rho = rho; cx.Eye = eye.slice(); cx.Radius = radius;
   cx.AzL = Math.atan2(by, bx);
   if (typeof opts.cancelled === 'function') cx.cancelled = opts.cancelled;
+  // opts.skyStep (C# 原版没有): 焦散追踪的天球步长放大倍数 (默认 1 = 原版 0.12°–0.5°). 网格用不着这么密 —— 点都是 Newton
+  //   校正到曲线上的精确点, 步长只管取样间距; 2 倍时点数减半
+  if (opts.skyStep > 0 && opts.skyStep !== 1) { cx.maxSky = MAX_SKY * opts.skyStep; cx.minSky = MIN_SKY * opts.skyStep; cx.h6max = H6_MAX * opts.skyStep; }
   if (cx.column) {
     // ν(θ) = (−sinζ0 cosθ, sinζ0 sinθ, cosζ0);  θ 的转轴 = 晶体 c 轴
     cx.C0 = [0.0, 0.0, Math.cos(fx)];
@@ -1750,7 +2035,7 @@ export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, ra
     cx.Gen = [Math.sin(fx), Math.cos(fx), 0.0];
   }
 
-  const emit = (run, kind, name, closed) => {
+  const emit = (run, kind, name, closed, ends = null) => {
     const Pw = [], Dw = [];
     for (const x of run) {
       const xi = cx.world(x);
@@ -1759,7 +2044,7 @@ export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, ra
       Pw.push([eye[0] + radius * xi[0], eye[1] + radius * xi[1], eye[2] + radius * xi[2]]);
     }
     if (Pw.length < 2) return;
-    res.curves.push({ kind, name, p: Pw, dir: Dw, closed });
+    res.curves.push(ends ? { kind, name, p: Pw, dir: Dw, closed, ends } : { kind, name, p: Pw, dir: Dw, closed });
     res.nPoints += Pw.length;
     if (kind === 0) res.nCaustic++; else res.nFence++;
   };
@@ -1767,44 +2052,82 @@ export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, ra
   if (wantFence != null)
     for (const f of cx.P.AllFences) {
       if (!wantFence(f.name)) continue;
-      const runs = [];
-      fenceCuts(cx, f, runs);
+      const runs = [], ends = [];
+      fenceCuts(cx, f, runs, ends);
       for (const r of runs) emit(r, fenceKind(f.name), f.name, false);
+      for (const e of ends) {
+        const xi = cx.world(e.state);
+        if (!fin3(xi)) continue;
+        // 两条篱笆像在同一个角点相遇, 各报一次: 合并
+        const p = [eye[0] + radius * xi[0], eye[1] + radius * xi[1], eye[2] + radius * xi[2]];
+        if (res.fenceEndP.some(q => Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) < 1e-6 * radius)) continue;
+        res.fenceEndP.push(p); res.fenceEndDir.push(xi); res.fenceEndKind.push(f.name + '|' + e.other);
+      }
     }
 
   const cRuns = [], cEnds = [];
   if (wantCaustic) {
-    traceCaustic(cx, res, cRuns, cEnds, opts.seeds || null);
-    if (opts.keepStates) res.states = cRuns;
-    for (const r of cRuns) {
-      const closed = r.length > 2 && dist6(r[0], r[r.length - 1]) < 1e-9;
-      emit(r, 0, 'caustic', closed);
-      // 尖点 (与 C# 原版不同): 在延拓参数里找天球像的速度降到零的点. 原版只看相邻两段弦是否反向 —— 尖点恰好落在取样点上才认得出,
-      //   落在两个取样点之间时 (相邻两段弦夹角不到 90°) 就漏了, 对称的一对尖点常常只认出一个. 这里: 每一步的天球弦长 ÷ 状态空间步长
-      //   = 天球像的速度; 尖点处它趋于零 (半立方抛物线), 而状态空间的步长照常. 取速度的局部极小 (小于两侧 ±8 步里最大值的 1/6),
-      //   且前后各走 3 步的弦方向反转 (夹角 > 120°), 两段都走出了舍入噪声 (> 1e-8 rad)
-      const cu = res.curves[res.curves.length - 1];
-      if (cu === undefined) throw new RangeError('Index was out of range');   // 同 C# (空表取 [−1])
-      if (cu.kind === 0 && cu.dir.length >= 7 && cu.dir.length === r.length) {
-        const n = r.length, v = new Float64Array(n - 1);
-        for (let i = 0; i + 1 < n; i++) { const st = dist6(r[i], r[i + 1]); v[i] = st > 1e-15 ? nrm(sub(cu.dir[i + 1], cu.dir[i])) / st : Infinity; }
-        const chordSum = (i0, i1) => { const o = [0, 0, 0]; for (let i = Math.max(0, i0); i < Math.min(n - 1, i1); i++) { const c = sub(cu.dir[i + 1], cu.dir[i]); o[0] += c[0]; o[1] += c[1]; o[2] += c[2]; } return o; };
-        let last = -10;
-        for (let i = 1; i + 1 < n - 1; i++) {
-          if (!(v[i] <= v[i - 1] && v[i] <= v[i + 1])) continue;
-          let mx = 0;
-          for (let j = Math.max(0, i - 8); j < Math.min(n - 1, i + 9); j++) if (v[j] < Infinity && v[j] > mx) mx = v[j];
-          if (!(v[i] < mx / 6)) continue;
-          const A = chordSum(i - 3, i), B = chordSum(i + 1, i + 4), la = nrm(A), lb = nrm(B);
-          // 前后两段都得真的在天上走 (一整段焦散映到天上同一点的退化处, 弦长只剩 1e-14 的舍入噪声, 噪声里的 "反转" 不算)
-          if (!(la > 1e-8 && lb > 1e-8) || dot(A, B) > -0.5 * la * lb) continue;
-          if (i - last <= 3) continue;
-          last = i;
-          // 尖点在第 i 段弦 (i → i+1) 上: 取两端里离两侧来向更远的那个 (尖端)
-          const k = dot(sub(cu.dir[i + 1], cu.dir[i]), A) > 0 ? i + 1 : i;
-          res.cuspP.push(cu.p[k]); res.cuspDir.push(cu.dir[k]);
-        }
+    let cuspK = null;
+    if (opts.from && opts.from.runs && opts.from.runs.length) {
+      const tr = [], te = [], tc = [];
+      if (transportCaustic(cx, opts.from.runs, opts.from.sky || 0.5 * DEG, tr, te, tc)) { cRuns.push(...tr); cEnds.push(...te); cuspK = tc; res.transported = true; }
+    }
+    if (cuspK === null) {
+      traceCaustic(cx, res, cRuns, cEnds, opts.seeds || null, !!opts.noGrid && !!(opts.seeds && opts.seeds.length));
+    }
+    // 退化弧: 整段焦散映到天上同一点 (σ 不变, 天空直径 ~1e-6° —— 搬运后的数值噪声到 3e-7 rad, 门槛取 1e-5 rad; 如 3-5 column ζ−90 的一支, column 3-4-5 ζ−90 整个焦散都是).
+    //   一整条取向曲线上的光都射向同一点 —— 焦点, 比焦散还亮; 各层的焦点连起来是三维里的一条焦线 (不是面). 不当弧 (它的两个
+    //   末端点在相邻层间时有时无, 让缝网格的配对乱套), 只报这一点: res.focalP / focalDir
+    //   退化弧仍留在 states 里 (沿半径搬运 / 当种子时它照样跟着走, 相邻各层上都有这个焦点)
+    const degRuns = [];
+    {
+      const keep = cRuns.map(r => { const d0 = cx.world(r[0]); if (!fin3(d0)) return true; for (const x of r) { const d = cx.world(x); if (fin3(d) && ang(d, d0) > 1e-5) return true; } return false; });
+      if (!keep.every(Boolean)) {
+        cRuns.forEach((r, i) => {
+          if (keep[i]) return;
+          const xi = cx.world(r[0]);
+          if (!fin3(xi)) return;
+          const p = [eye[0] + radius * xi[0], eye[1] + radius * xi[1], eye[2] + radius * xi[2]];
+          if (res.focalP.some(q => Math.hypot(q[0] - p[0], q[1] - p[1], q[2] - p[2]) < 1e-6 * radius)) return;
+          res.focalP.push(p); res.focalDir.push(xi);
+        });
+        const gone = [];
+        cRuns.forEach((r, i) => { if (!keep[i]) gone.push(r[0], r[r.length - 1]); });
+        const remap = new Int32Array(cRuns.length).fill(-1);
+        let j = 0; cRuns.forEach((_, i) => { if (keep[i]) remap[i] = j++; });
+        const kept = cRuns.filter((_, i) => keep[i]);
+        cRuns.forEach((r, i) => { if (!keep[i]) degRuns.push(r); });
+        cRuns.length = 0; cRuns.push(...kept);
+        const ce = cEnds.filter(e => !gone.some(g => g === e || dist6(g, e) < 1e-12));
+        cEnds.length = 0; cEnds.push(...ce);
+        if (cuspK !== null) cuspK = cuspK.filter(([i]) => remap[i] >= 0).map(([i, k]) => [remap[i], k]);
       }
+    }
+    if (!res.transported) {
+      // 尖点: 与搬运同一个判据 (天空切向反号, cuspsTflip), 相邻层不管是追出来的还是搬过来的, 尖点一致且精确落在尖点上.
+      //   (之前的速度极小判据要取样够密, C# 原版只看相邻两弦是否反向, 对称的一对尖点常只认出一个)
+      cuspK = [];
+      const okPt = y => y !== null && minMargin6(cx, y).m >= MIN_IN && fin3(cx.world(y));
+      for (let ri = 0; ri < cRuns.length; ri++) {
+        const r = cRuns[ri], closed = r.length > 3 && dist6(r[0], r[r.length - 1]) < 1e-9;
+        const pts = closed ? r.slice(0, -1) : r.slice(), D = pts.map(x => cx.world(x));
+        if (!D.every(fin3)) continue;
+        const idx = cuspsTflip(cx, pts, D, okPt);
+        if (!idx.length) continue;
+        if (closed) pts.push(pts[0].slice());
+        cRuns[ri] = pts;
+        for (const k of idx) cuspK.push([ri, k]);
+      }
+    }
+    if (opts.keepStates) res.states = degRuns.length ? cRuns.concat(degRuns) : cRuns;
+    // 末端落在哪条边界上 (C# 原版没有): 'T' (出射临界) / 'σ' / 篱笆名 (两条边界都几乎为零的角点旁, 种类会在两者间跳)
+    const endKind = x => { const mm = minMargin6(cx, x); return mm.which === 0 ? 'T' : mm.which === 1 ? 'σ' : cx.P.Fences[mm.which - 2].name; };
+    for (let ri = 0; ri < cRuns.length; ri++) {
+      const r = cRuns[ri];
+      const closed = r.length > 2 && dist6(r[0], r[r.length - 1]) < 1e-9;
+      emit(r, 0, 'caustic', closed, closed ? null : [endKind(r[0]), endKind(r[r.length - 1])]);
+      const cu = res.curves[res.curves.length - 1];
+      if (cu && cu.kind === 0 && cu.dir.length === r.length) for (const [i, k] of cuspK) if (i === ri) { res.cuspP.push(cu.p[k]); res.cuspDir.push(cu.dir[k]); }
     }
     for (const x of cEnds) {
       const xi = cx.world(x);
@@ -1935,7 +2258,7 @@ export function computeShell(faceNormals, zetaDeg, thetaDeg, refN, lamp, eye, ra
 
   const seeds = findEnds(cx);
   const raw = traceArcs(cx, seeds);
-  for (const a of findLoops(cx, seeds, raw, opts.seeds || null)) raw.push(a);
+  for (const a of findLoops(cx, seeds, raw, opts.seeds || null, !!opts.noGrid && !!(opts.seeds && opts.seeds.length))) raw.push(a);
 
   // ---------------- 输出: 世界坐标
   for (const s of seeds) {

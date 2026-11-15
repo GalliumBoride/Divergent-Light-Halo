@@ -13,8 +13,8 @@ const PH = await import('./phys.mjs');
 export function shellMesh1(code, el, D, zeta, theta, opt = {}) {
   CR.setApex(56, 56);
   const nr = CR.parsePath(code).map(CR.baseNormalFromCompact), er = el * Math.PI / 180, L = [D * Math.cos(er), 0, D * Math.sin(er)], E = [0, 0, 0];
-  const compute = (r, seeds) => {
-    const res = DS.computeShell(nr, zeta, theta, 1.31, L, E, r, true, 0, 360, { seeds: process.env.NOSEED ? null : seeds });
+  const compute = (r, o) => {
+    const res = DS.computeShell(nr, zeta, theta, 1.31, L, E, r, true, 0, 360, { seeds: process.env.NOSEED ? null : o.seeds, noGrid: !process.env.GRID && o.noGrid });
     const cusps = res.cuspP.slice();
     for (const a of res.arcs) for (const q of a.foldP) cusps.push(q);
     return { arcs: res.arcs.filter(a => a.p.length >= 2).map(a => ({ p: a.p, d: a.dir, closed: a.closed })), cusps, states: res.arcs.map(a => a.w) };
@@ -44,7 +44,7 @@ export function check1(code, el, D, zeta, theta) {
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const [code = '3-5', el = '10.5', D = '15', zeta = '-138', theta = '60'] = process.argv.slice(2);
   const r = check1(code, +el, +D, +zeta, +theta), m = r.m;
-  console.log(`${code} Σ${el} D${D} ζ${zeta} θ${theta}: 球壳法 ${m.nTri} 三角形 ${r.f.area.toFixed(2)} m², ${m.stat.rows} 层 (引擎算了 ${m.stat.calls} 层), 变化 ${m.stat.events}, 没缝上 ${m.stat.loose} (${m.stat.looseDeg.toFixed(1)}°), ${m.stat.ms} ms`);
+  console.log(`${code} Σ${el} D${D} ζ${zeta} θ${theta}: 球壳法 ${m.nTri} 三角形 ${r.f.area.toFixed(2)} m², ${m.stat.rows} 层 (引擎算了 ${m.stat.calls} 层: 全搜 ${m.stat.full}, 延拓 ${m.stat.cont}), 变化 ${m.stat.events}, 没缝上 ${m.stat.loose} (${m.stat.looseDeg.toFixed(1)}°), ${m.stat.ms} ms`);
   console.log(`  网格→晕面: 偏差 > 3 cm + 0.3% r 的面积 ${r.f.bad2.toFixed(3)} m², > 10 cm + 1% r 的 ${r.f.bad10.toFixed(3)} m²`);
   console.log(`  晕面→网格: (h, α) 网格 ${r.refTri} 三角形的顶点抽 ${r.cv.n} 个, 离球壳网格 > 5 cm + 1% r 的 ${r.cv.miss} 个 (${(100 * r.cv.frac).toFixed(2)}%)`);
 }
