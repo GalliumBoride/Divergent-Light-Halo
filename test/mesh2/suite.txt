@@ -26,3 +26,5 @@
 4-1-8 column 3 15 caustic -45
 3-5 column 25 8 caustic -75
 3-1-5 lowitz 9.5 15 caustic 30
+4-1-8 column 3.5 15 caustic -90
+4-1-8 column 30 15 caustic -90

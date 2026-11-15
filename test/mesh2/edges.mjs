@@ -39,7 +39,7 @@ if (fs.existsSync(cname) && !process.env.NOCACHE) {
 }
 const useFeat = process.env.FEAT !== '0';
 const t0 = Date.now();
-const res = PG.pageMesh(EP, ST, lp, +el, D, low, z, th, surf, L, layers, useFeat ? feats.map(f => ({ p: f.p })) : null, !!process.env.HF);
+const res = PG.pageMesh(EP, ST, lp, +el, D, low, z, th, surf, L, layers, useFeat ? feats.map(f => ({ p: f.p, g: f.g })) : null, !!process.env.HF);
 const m = res.m, tS = Date.now() - t0;
 layers = res.layers;
 
@@ -50,7 +50,18 @@ const vid = new Map(), edges = new Set();
 const vpos = [], adj = [];
 const idOf = o => { const k = vkey(P[o], P[o + 1], P[o + 2]); let i = vid.get(k); if (i === undefined) { vid.set(k, i = vid.size); vpos.push([P[o], P[o + 1], P[o + 2]]); adj.push([]); } return i; };
 for (let t = 0; t < nT; t++) { const a = idOf(9 * t), b = idOf(9 * t + 3), c = idOf(9 * t + 6); for (const [u, v] of [[a, b], [b, c], [c, a]]) { const k = u < v ? u * 4194304 + v : v * 4194304 + u; if (!edges.has(k)) { edges.add(k); adj[u].push(v); adj[v].push(u); } } }
-const hasEdge = (pa, pb) => { const a = vid.get(vkey(...pa)), b = vid.get(vkey(...pb)); if (a === undefined || b === undefined) return -1; if (a === b) return 1; return edges.has(a < b ? a * 4194304 + b : b * 4194304 + a) ? 1 : 0; };
+// 路标是按引擎给的原始层线找的; 缝合器会去掉同层重复的线段、把首尾相接的曲线接成一条 (接头只留一个点),
+//   路标所在的那个点可能不在网格里, 但近旁 (特征线容差之内) 有等价的网格顶点: 也算
+const VG = new Map(), vgk = (x, y, z) => Math.floor(x / 0.05) + ',' + Math.floor(y / 0.05) + ',' + Math.floor(z / 0.05);
+vpos.forEach((q, i) => { const k = vgk(...q); let a = VG.get(k); if (!a) VG.set(k, a = []); a.push(i); });
+const vidOf = q => {
+  const i = vid.get(vkey(...q)); if (i !== undefined) return i;
+  const tl = 2 * (1.5e-4 * D + 3e-4 * Math.hypot(q[0] - L[0], q[1] - L[1], q[2] - L[2]));
+  let best, bd = tl;
+  for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) for (const j of VG.get(vgk(q[0] + 0.05 * a, q[1] + 0.05 * b, q[2] + 0.05 * c)) || []) { const d = Math.hypot(vpos[j][0] - q[0], vpos[j][1] - q[1], vpos[j][2] - q[2]); if (d < bd) { bd = d; best = j; } }
+  return best;
+};
+const hasEdge = (pa, pb) => { const a = vidOf(pa), b = vidOf(pb); if (a === undefined || b === undefined) return -1; if (a === b) return 1; return edges.has(a < b ? a * 4194304 + b : b * 4194304 + a) ? 1 : 0; };
 const CELL = Math.max(0.25, D / 15), grid = new Map(), key = (i, j, k) => (i + 512) * 1048576 + (j + 512) * 1024 + (k + 512);
 for (let t = 0; t < nT; t++) {
   const o = 9 * t, lo = [0, 1, 2].map(a => Math.floor(Math.min(P[o + a], P[o + 3 + a], P[o + 6 + a]) / CELL)), hi = [0, 1, 2].map(a => Math.floor(Math.max(P[o + a], P[o + 3 + a], P[o + 6 + a]) / CELL));
@@ -120,8 +131,20 @@ const nearF = (q, tl) => {
   return out.size ? out : null;
 };
 const marks = feats.map(() => []);       // 每条特征线: [{ t, row, pos }]
+// 引擎偶尔把同一段层线给出两遍 (一条短的整条落在同层同支的另一条上, 相距不到 0.1 mm): 重复的那条不算数 ——
+//   它上面的路标与长的那条上的是同一处, 位置差几毫米 (取样不同); 缝合器也只留一条
+const dsegP = (q, p, i) => { const o = 3 * i, b = [p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]], w = [q[0] - p[o], q[1] - p[o + 1], q[2] - p[o + 2]], l2 = dot(b, b); let u = l2 > 0 ? dot(w, b) / l2 : 0; u = Math.max(0, Math.min(1, u)); return Math.hypot(w[0] - u * b[0], w[1] - u * b[1], w[2] - u * b[2]); };
+const onCurve = (q, k) => { for (let i = 0; i + 1 < k.p.length / 3; i++) if (dsegP(q, k.p, i) < 1e-5 * D) return true; return false; };
+const uniq = cs => {
+  const kept = [];
+  for (const c of cs.slice().sort((x, y) => y.p.length - x.p.length)) {
+    const n = c.p.length / 3, pt = a => [c.p[3 * a], c.p[3 * a + 1], c.p[3 * a + 2]];
+    if (!kept.some(k => (k.b || 0) === (c.b || 0) && [0, n >> 1, n - 1].every(a => onCurve(pt(a), k)) && Array.from({ length: n }, (_, a) => a).every(a => onCurve(pt(a), k)))) kept.push(c);
+  }
+  return kept;
+};
 layers.forEach((l, row) => {
-  for (const c of l.curves) {
+  for (const c of uniq(l.curves)) {
     const p = c.p, n = p.length / 3, hit = new Array(n);
     for (let j = 0; j < n; j++) { const q = [p[3 * j], p[3 * j + 1], p[3 * j + 2]]; hit[j] = nearF(q, tolAt(rl(q))); }
     const lm = [];
@@ -174,7 +197,7 @@ feats.forEach((f, fi) => {
     for (const pa of A.all) for (const pb of Bm.all) he = Math.max(he, hasEdge(pa, pb));
     // 没有直接的边: 沿特征线插了点 (边界线在两个路标之间是弯的) —— 从 A 沿网格的边走, 只走落在这条特征线这一段上的顶点, 走得到 B 也算
     if (he === 0) {
-      const tgt = new Set(Bm.all.map(q => vid.get(vkey(...q))).filter(x => x !== undefined)), seen = new Set(A.all.map(q => vid.get(vkey(...q))).filter(x => x !== undefined));
+      const tgt = new Set(Bm.all.map(vidOf).filter(x => x !== undefined)), seen = new Set(A.all.map(vidOf).filter(x => x !== undefined));
       let fr = [...seen];
       for (let it = 0; it < 400 && fr.length && he === 0; it++) {
         const nx = [];

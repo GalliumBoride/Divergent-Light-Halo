@@ -382,7 +382,7 @@ function runFill(myR, round = 1) {
 //   在 Worker 里做 (engine/stitch2.js). 层数据随任务复制过去 (主线程还要画线). 加密还在跑时先不缝, 等它完.
 function runMesh2(myR) {
   if (!myR || myR.dof !== 2 || R !== myR || S.lay.style2 === 'lines' || busy.dense || busy.main) return;
-  const { L } = scene(), D = baseline(), tasks = [], route = [];
+  const { L, E } = scene(), D = baseline(), tasks = [], route = [];
   myR.paths.forEach((P, ip) => {
     if (P.mesh2 && P.mesh2.lver === P.lver) return;
     const all = [];
@@ -393,9 +393,9 @@ function runMesh2(myR) {
     // 特征线 (精确边界线、转折缝、尖点脊线、外缘) 一并送去: 层线落在它们上面的点是 "路标", 相邻两层的路标强制连成网格的边,
     //   曲面的边和折痕才贴着这些线走 (不然折回处一排锯齿、折痕被三角形抄近路)
     const feats = [];
-    for (const k of ['entry', 'tir', 'seam', 'turn', 'cusp']) for (const c of (P.edges && P.edges[k]) || []) { const p = c.p || c; if (p.length >= 6) feats.push({ p, d: c.d || null }); }
-    for (const c of rimsOf(P) || []) { const p = c.p || c; if (p.length >= 6) feats.push({ p, d: c.d || null }); }
-    tasks.push({ kind: 'mesh2', args: { layers: all.map(l => ({ h: l.h, curves: l.curves.map(c => ({ p: c.p, d: c.d, x: c.x, b: c.b })) })), L, D, feats } });
+    for (const k of ['entry', 'tir', 'seam', 'turn', 'cusp']) for (const c of (P.edges && P.edges[k]) || []) { const p = c.p || c; if (p.length >= 6) feats.push({ p, d: c.d || null, edge: k === 'entry' || k === 'tir' }); }
+    for (const c of rimsOf(P) || []) { const p = c.p || c; if (p.length >= 6) feats.push({ p, d: c.d || null, edge: true }); }
+    tasks.push({ kind: 'mesh2', args: { layers: all.map(l => ({ h: l.h, curves: l.curves.map(c => ({ p: c.p, d: c.d, x: c.x, b: c.b })) })), L, D, feats, eye: E, maxD: S.maxDist } });
     route.push([ip, P.lver]);
   });
   if (!tasks.length) return;

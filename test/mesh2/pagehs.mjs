@@ -43,11 +43,11 @@ export function pageLayers(EP, lp, el, D, low, z, th, surf, nH = 72, total = 150
 // 缝合 + 页面那一轮补层 (bad 层对的中点). feats: 特征线 (给缝合器); fixed: 不补层 (HF 给定的 h 列表已含补的层)
 export function pageMesh(EP, ST, lp, el, D, low, z, th, surf, L, layers = null, feats = null, fixed = false) {
   layers = layers || pageLayers(EP, lp, el, D, low, z, th, surf);
-  let m = ST.stitchLayers2(layers, L, D, feats);
+  let m = ST.stitchLayers2(layers, L, D, feats, { maxD: 80 });
   if (m.bad.length && !fixed) {
     for (const [a, b] of m.bad) { const h = 0.5 * (a + b), c = EP.lightCone2DofLayers(lp, el, D, 0, 1, 101, 80, low, z, th, surf, 0, 1, h, true)[0].curves; if (c.length) layers.push({ h, curves: c }); }
     layers.sort((a, b) => a.h - b.h);
-    m = ST.stitchLayers2(layers, L, D, feats);
+    m = ST.stitchLayers2(layers, L, D, feats, { maxD: 80 });
   }
   return { m, layers };
 }
