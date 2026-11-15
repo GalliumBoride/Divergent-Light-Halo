@@ -955,6 +955,13 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         NF[w.f].push({ t: w.t, n: v });
         for (const e2 of ends) if (e2.f === w.f && e2.J < 0 && Math.abs(e2.t - w.t) < JT) e2.J = v;
       }
+      // 端点对端点再放宽到离灯距离的 1%: 几条边界线收在同一个顶点 (晕面的尖顶) 时, 各自算出来的端点能差二十厘米
+      //   (在 30 m 外; 超过上面的容差), 顶点处合不上, 首末层之外那块帽就补不了
+      for (const e2 of ends) {
+        if (e2.J >= 0 || e2.f === e.f) continue;
+        const g = FT.F[e2.f];
+        if (Math.hypot(g.p[3 * e2.i] - x, g.p[3 * e2.i + 1] - y, g.p[3 * e2.i + 2] - z) < 0.01 * r) { e2.J = v; NF[e2.f].push({ t: e2.t, n: v }); }
+      }
     }
     // 自由弧: 每条特征线上沿线挨着的两个结点 (沿线相距不到 4 倍容差的并成一组, 组内不连: 折回的两臂各自的尖点各走各的)
     NF.forEach((a, fi) => {
