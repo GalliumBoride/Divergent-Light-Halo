@@ -23,6 +23,7 @@ import { fold2DofFine, fold1DofFine, seam1DofFine } from './engine/obsfine.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
 import { trimFill } from './app/spacing.js';
 import { stitchLayers2 } from './engine/stitch2.js';
+import { meshShells, shellSource, criticalRadii } from './engine/mesh2s.js';
 
 function transferOf(obj, list = []) {
   if (obj && typeof obj === 'object') {
@@ -79,6 +80,26 @@ const RUN = {
   coneH: a => lightConeH(a.fp, a.el, a.dist, a.eye, a.n, a.nH, a.nA, a.maxD, a.zeta, a.theta, a.from, a.to),
   coneS: a => lightConeSwap(a.fp, a.el, a.dist, a.eye, a.n, a.nA, a.nPsi, a.maxD, a.zeta, a.theta, a.from, a.to),
   mesh1: a => surfaceMesh1(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta, { budget: a.budget }),
+  // 一自由度晕面, 球壳法: 层 = 发散度球壳上的弧 (computeShell, 闭式), 相邻两层在视方向里对应着缝 (engine/mesh2s.js).
+  //   临界半径取自三维边界线 (入射掠射 / 镜面掠射 / 出射临界, 光锥法的边界引擎, 几十毫秒) 离眼距离的极值与端点.
+  //   超时 / 出错 → { ok: false }, 调用方留着 (h, α) 网格 (mesh1)
+  mesh1s: a => {
+    const er = a.el * Math.PI / 180, L = [a.dist * Math.cos(er), 0, a.dist * Math.sin(er)], E = [0, 0, a.eye];
+    const nr = a.fp.map(baseNormalFromCompact), t0 = Date.now(), limit = a.maxMs || 30000;
+    const b = lightConeBoundaries(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta);
+    const critical = criticalRadii([...b.entry, ...b.mirror, ...b.tir].map(c => c.p || c), L, E);
+    const compute = (r, seeds) => {
+      const res = computeShell(nr, a.zeta, a.theta, a.n, L, E, r, true, 0, 360, { seeds, cancelled: () => Date.now() - t0 > limit });
+      const cusps = res.cuspP.slice();
+      for (const q of res.arcs) for (const f of q.foldP) cusps.push(f);
+      return { arcs: res.arcs.filter(q => q.p.length >= 2).map(q => ({ p: q.p, d: q.dir, closed: q.closed })), cusps, states: res.arcs.map(q => q.w) };
+    };
+    let m;
+    try { m = meshShells(shellSource(compute), L, E, { maxD: a.maxD, budget: a.budget, critical, cancelled: () => Date.now() - t0 > limit }); }
+    catch (e) { return { ok: false, why: String(e && e.message || e) }; }
+    if (!(m.nTri > 0)) return { ok: false, why: 'empty' };
+    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, rows: m.stat.rows, ms: Date.now() - t0 };
+  },
 
   bdry1: a => {
     const b = lightConeBoundaries(a.fp, a.el, a.dist, a.eye, a.n, a.maxD, a.zeta, a.theta);
@@ -170,6 +191,27 @@ const RUN = {
     const surf = resolveSurface(lp, a.surf);
     const h = Math.max(-89.99, Math.min(89.99, a.h));
     return lightCone2DofLayers(lp, a.el, a.dist, a.eye, 1, a.nG, a.maxD, a.lowitz, a.zeta, a.theta, surf, 0, 1, h, true)[0];
+  },
+
+  // 二自由度的晕面与层线, 球壳法 (engine/mesh2s.js): 层 = 发散度球壳上的轮廓 (computeShell2Dof), 相邻两层在视方向里对应着缝.
+  //   a.feats: 已经解出来的三维边界线 / 脊线 —— 它们离眼距离的极值与端点就是层线拓扑会变的半径 (criticalRadii).
+  //   引擎的网格种子在有效区很窄处会漏弧, 由 shellSource 沿半径延拓补上 (相邻球壳上的状态点当种子).
+  //   返回网格 (pos / dir / h / nrm) 和各层的线 lines: [{ r, curves: [{ p, d }] }]; 超时或出错 → { ok: false }
+  mesh2s: a => {
+    const nr = a.fp.map(baseNormalFromCompact);
+    let sf = a.surfFence;
+    if (sf && sf.length > 4 && /^\d+$/.test(sf.substring(4)) && parseInt(sf.substring(4), 10) > nr.length - 2) sf = null;
+    const wantC = sf === null, fam = a.lowitz ? 'lowitz' : 'column', fixed = a.lowitz ? a.theta : a.zeta;
+    const t0 = Date.now(), limit = a.maxMs || 60000;
+    const compute = (r, seeds) => {
+      const res = computeShell2Dof(nr, fam, fixed, a.n, a.L, a.E, r, true, wantC, nm => nm === sf, { seeds, keepStates: true });
+      return { arcs: res.curves.filter(c => (wantC ? c.kind === 0 : c.name === sf) && c.p.length >= 2).map(c => ({ p: c.p, d: c.dir, closed: c.closed })), cusps: res.cuspP, states: res.states || null };
+    };
+    let m;
+    try { m = meshShells(shellSource(compute), a.L, a.E, { maxD: a.maxD, budget: a.budget, critical: criticalRadii(a.feats || [], a.L, a.E), cancelled: () => Date.now() - t0 > limit }); }
+    catch (e) { return { ok: false, why: String(e && e.message || e) }; }
+    if (!(m.nTri > 0)) return { ok: false, why: 'empty' };
+    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, rows: m.stat.rows, loose: m.stat.looseDeg, ms: Date.now() - t0 };
   },
 
   shell1: a => {

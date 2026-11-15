@@ -470,31 +470,76 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
       open = next;
     }
   }
-  const lenOf = ch => {                                   // 链上最长一行的三维长度与天空张角
-    let L = 0, A = 0;
-    ch.rows.forEach((k, m) => { const [l, a] = extentOf(rows[k], ch.b, ch.src[m]); L = Math.max(L, l); A = Math.max(A, a); });
-    return [L, A];
+  // 每条链沿行方向的取点: 按 "看得见的长度" 等分, 不按参数 τ 等分.
+  //   一行的三维弧长 / 天空张角沿 τ 可以极不均匀: 层线在很窄的一段方位角里甩出去几十米再回来 (出射光几乎平行于灯光线,
+  //   落点趋于无穷远), 或者光锥过眼睛的那一层附近区间的大半段 α 全缩在眼睛上、正常的那一段只占 τ 的五分之一 —— 按 τ 均匀
+  //   取点, 远处那一段只落到几个点 (弦长二三十米, 弦高几米), 缩成一点的那一段却堆满了点.
+  //   做法: 链上取至多 8 行, 每行在 192 个等距的 τ 上求值, 每个 τ 小段记下各行里最大的 max(三维长度 / L3, 天空张角 / A3)
+  //   (密度); 点数 = 各行里最大的密度总和; 取点位置 = 密度 (加一成半的均匀底, 免得哪一段一个点都没有) 的累积量等分.
+  //   同一条链各行共用这组 τ, 相邻两行仍按序号一一对齐.
+  const MD = 192;
+  const dens = chains.map(ch => {
+    const nr = ch.rows.length, K = Math.min(8, nr), pick = new Set(), b = ch.b, o = 2 + 3 * b, q = 8 + 3 * b;
+    for (let i = 0; i < K; i++) pick.add(K === 1 ? 0 : Math.round(i * (nr - 1) / (K - 1)));
+    const mon = new Float64Array(MD);
+    let tot = 0;
+    for (const m of pick) {
+      const I = ch.ints[m], h = rows[ch.rows[m]].h;
+      let ok0 = false, x0 = 0, y0 = 0, z0 = 0, dx0 = 0, dy0 = 0, dz0 = 0, sum = 0;
+      for (let k = 0; k <= MD; k++) {
+        const r = at(h, alphaAt(I, k / MD)), ok = r[b] > 0;
+        if (ok && ok0) {
+          const w = Math.max(Math.hypot(r[o] - x0, r[o + 1] - y0, r[o + 2] - z0) / L3, Math.acos(Math.max(-1, Math.min(1, r[q] * dx0 + r[q + 1] * dy0 + r[q + 2] * dz0))) / A3);
+          if (w > mon[k - 1]) mon[k - 1] = w;
+          sum += w;
+        }
+        ok0 = ok;
+        if (ok) { x0 = r[o]; y0 = r[o + 1]; z0 = r[o + 2]; dx0 = r[q]; dy0 = r[q + 1]; dz0 = r[q + 2]; }
+      }
+      if (sum > tot) tot = sum;
+    }
+    return { mon, tot };
+  });
+  const want = dens.map(d => d.tot);
+  // 链 c 取 n 个点的 τ (区间: 含两端; 整圈: τ ∈ [0, 1))
+  const tausOf = (c, n, full) => {
+    const mon = dens[c].mon, cum = new Float64Array(MD + 1);
+    let mean = 0;
+    for (let k = 0; k < MD; k++) mean += mon[k];
+    const floor = 0.15 * mean / MD + 1e-12;
+    for (let k = 0; k < MD; k++) cum[k + 1] = cum[k] + mon[k] + floor;
+    const out = new Float64Array(n), T = cum[MD];
+    let k = 0;
+    for (let j = 0; j < n; j++) {
+      const t = T * (full ? j / n : j / (n - 1));
+      while (k + 1 < MD && cum[k + 1] < t) k++;
+      out[j] = Math.min(1, (k + (t - cum[k]) / (cum[k + 1] - cum[k])) / MD);
+    }
+    if (!full) { out[0] = 0; out[n - 1] = 1; }
+    return out;
   };
-  const want = chains.map(ch => { const [L, A] = lenOf(ch); return Math.max(L / L3, A / A3); });
   const nodesFor = sc => chains.reduce((s, ch, c) => s + ch.rows.length * Math.min(600, Math.max(6, Math.ceil(want[c] / sc) + 1)), 0);
   let sc = 1;
   if (nodesFor(1) > budget) { let lo = 1, hi = 2; while (nodesFor(hi) > budget && hi < 1e6) hi *= 2; for (let it = 0; it < 30; it++) { const md = Math.sqrt(lo * hi); if (nodesFor(md) > budget) lo = md; else hi = md; } sc = hi; }
 
   // ---- 5) 节点 + 四边形带
   const pos = [], dirv = [], hv = [], vids = [];
-  let nid = 0, nDrop = 0, nodes = 0;
+  let nid = 0, nDrop = 0, nodes = 0, nJump = 0;
+  const RHO2 = (L3 / A3) ** 2;
   for (let c = 0; c < chains.length; c++) {
     const ch = chains[c], b = ch.b, o = 2 + 3 * b, q = 8 + 3 * b;
     const N = Math.min(600, Math.max(6, Math.ceil(want[c] / sc) + 1));
     const ncol = ch.full ? N : N;                          // 整圈: N 个点首尾相接; 区间: N 个点含两端
+    const taus = tausOf(c, N, ch.full);
     const grid = ch.rows.map((k, m) => {
       const I = ch.ints[m], h = rows[k].h, row = [];
       for (let j = 0; j < ncol; j++) {
-        let r = at(h, alphaAt(I, ch.full ? j / N : j / (N - 1)));
+        const al = alphaAt(I, taus[j]);
+        let r = at(h, al);
         // 端点就是根, 舍入 (α 平移 2π 等) 可能让它落到无效那一侧: 往区间里挪一点点, 别把边界节点丢了
         if (!(r[b] > 0) && !ch.full && (j === 0 || j === ncol - 1))
           for (let e = 1e-13, sg = j === 0 ? 1 : -1; e < 1e-6 && !(r[b] > 0); e *= 2) r = at(h, (j === 0 ? I.a : I.b) + sg * e);
-        row.push(r[b] > 0 ? { id: nid++, P: [r[o], r[o + 1], r[o + 2]], d: [r[q], r[q + 1], r[q + 2]], h: flat ? 0 : h / DEG } : null);
+        row.push(r[b] > 0 ? { id: nid++, P: [r[o], r[o + 1], r[o + 2]], d: [r[q], r[q + 1], r[q + 2]], h: flat ? 0 : h / DEG, a: al } : null);
       }
       nodes += ncol;
       return row;
@@ -504,8 +549,53 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
       vids.push(A.id, B.id, C.id);
     };
     const d2 = (A, B) => (A.P[0] - B.P[0]) ** 2 + (A.P[1] - B.P[1]) ** 2 + (A.P[2] - B.P[2]) ** 2;
+    // 位置 + 视方向的合并距离 (视方向夹角按 L3 / A3 折成长度): 贴着眼睛的那一段在三维里缩成一点, 天空里却是铺开的
+    const dc2 = (A, B) => d2(A, B) + RHO2 * ((A.d[0] - B.d[0]) ** 2 + (A.d[1] - B.d[1]) ** 2 + (A.d[2] - B.d[2]) ** 2);
+    // 区间端点在两行之间跳变 (不是连续挪动) 的一对行: 按 τ 对齐会把一行的中段连到另一行的端头上.
+    //   出在光锥过眼睛的那一层 (h = Σ) 两侧: 晕面在眼睛处是一个以眼为顶点的锥 (平行光晕弧上的锥), ψ 的一个根在 h = Σ 时
+    //   对所有 α 都落在眼睛上 (s = 0), 它的 s ∝ (h − Σ)/(α − α*), 所以只在 Σ 的一侧有效 —— 这一侧区间里除了正常的那一段
+    //   还接着一大段 α 全缩在眼睛上, 另一侧没有 (在另一支上, 另一个 α 段). 行距缩到底也是跳变, 加行夹不紧.
+    //   判别: 两行区间的公共 α 段明显短于其中一行, 按 τ 对齐的最大错位 (合并距离) 超过 4·L3, 而公共段里按 α 对齐的错位
+    //   不到它的 1/4. 这时只在公共 α 段上连 (两行各取落在公共段里的节点, 按较短对角线拉链), 多出来的那一段不连 ——
+    //   它的那条边就是晕面在眼睛处的真边界 (s = 0).
+    const jumpOf = (r0, r1, I0, I1) => {
+      const lo = Math.max(I0.a, I1.a), hi = Math.min(I0.b, I1.b), wc = hi - lo;
+      if (!(wc > 0) || wc > 0.98 * Math.max(I0.b - I0.a, I1.b - I1.a)) return null;
+      let mis = 0;
+      for (let j = 0; j < ncol; j++) { if (!r0[j] || !r1[j]) return null; const d = dc2(r0[j], r1[j]); if (d > mis) mis = d; }
+      if (!(mis > 16 * L3 * L3)) return null;
+      // 端点基本一样的那一头两行都从头 (尾) 开始; 不一样的那一头, 长的一行取刚好盖住公共段的节点
+      const sameA = Math.abs(I0.a - I1.a) <= 0.02 * wc, sameB = Math.abs(I0.b - I1.b) <= 0.02 * wc;
+      const first = (r, own) => { if (sameA || own) return 0; let j = 0; while (j + 1 < ncol && r[j + 1].a <= lo) j++; return j; };
+      const last = (r, own) => { if (sameB || own) return ncol - 1; let j = ncol - 1; while (j > 0 && r[j - 1].a >= hi) j--; return j; };
+      const R = [first(r0, I0.a >= I1.a), last(r0, I0.b <= I1.b), first(r1, I1.a >= I0.a), last(r1, I1.b <= I0.b)];
+      if (R[1] <= R[0] || R[3] <= R[2]) return null;
+      // 按 α 对齐的错位: 区间短的那一行的节点, 对另一行同一 α 处 (线性插值)
+      const S = (I0.b - I0.a) <= (I1.b - I1.a) ? r0 : r1, G = S === r0 ? r1 : r0;
+      const s0 = S === r0 ? R[0] : R[2], s1 = S === r0 ? R[1] : R[3], g0 = S === r0 ? R[2] : R[0], g1 = S === r0 ? R[3] : R[1];
+      let alt = 0, pg = g0;
+      for (let i = s0; i <= s1; i++) {
+        const a = Math.min(Math.max(S[i].a, G[g0].a), G[g1].a);
+        while (pg + 1 < g1 && G[pg + 1].a < a) pg++;
+        const A = G[pg], B = G[pg + 1], f = B.a > A.a ? (a - A.a) / (B.a - A.a) : 0, X = S[i];
+        let d = 0;
+        for (let c = 0; c < 3; c++) d += (X.P[c] - (A.P[c] + f * (B.P[c] - A.P[c]))) ** 2 + RHO2 * (X.d[c] - (A.d[c] + f * (B.d[c] - A.d[c]))) ** 2;
+        if (d > alt) alt = d;
+      }
+      return 16 * alt < mis ? R : null;
+    };
     for (let m = 0; m + 1 < grid.length; m++) {
       const r0 = grid[m], r1 = grid[m + 1];
+      const J = ch.full ? null : jumpOf(r0, r1, ch.ints[m], ch.ints[m + 1]);
+      if (J) {
+        let i = J[0], j = J[2];
+        nJump++;
+        while (i < J[1] || j < J[3]) {
+          if (j >= J[3] || (i < J[1] && dc2(r0[i + 1], r1[j]) <= dc2(r0[i], r1[j + 1]))) { put(r0[i], r0[i + 1], r1[j]); i++; }
+          else { put(r0[i], r1[j + 1], r1[j]); j++; }
+        }
+        continue;
+      }
       for (let j = 0; j < (ch.full ? ncol : ncol - 1); j++) {
         const j1 = (j + 1) % ncol;
         const A = r0[j], B = r0[j1], C = r1[j1], D = r1[j];   // (τ, h) 平面里逆时针
@@ -556,7 +646,7 @@ export function surfaceMesh1(facePath, lampElev, lampDist, eyeHeight, refN, maxD
   }
   return {
     pos: Float32Array.from(pos), dir: Float32Array.from(dirv), h: Float32Array.from(hv), nrm: vertexNormals(pos, vids, nid),
-    nTri: hv.length / 3, ms: Date.now() - t0, nh: rows.length, na: Math.round(nodes / Math.max(1, rows.length)), nDrop, nSub, flat, sky, outline,
+    nTri: hv.length / 3, ms: Date.now() - t0, nh: rows.length, na: Math.round(nodes / Math.max(1, rows.length)), nDrop, nSub, nJump, flat, sky, outline,
   };
 }
 

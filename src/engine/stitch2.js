@@ -139,7 +139,7 @@ function featIndex(feats, L, D) {
   const F = feats.map(f => {
     const p = f.p || f, n = p.length / 3, t = new Float64Array(n);
     for (let i = 1; i < n; i++) t[i] = t[i - 1] + Math.hypot(p[3 * i] - p[3 * i - 3], p[3 * i + 1] - p[3 * i - 2], p[3 * i + 2] - p[3 * i - 1]);
-    return { p, t, d: f.d || null, edge: f.edge !== undefined ? !!f.edge : /^(entry|tir|rim)$/.test(f.g || '') };
+    return { p, t, d: f.d || null, edge: f.edge !== undefined ? !!f.edge : /^(entry|tir|rim)$/.test(f.g || ''), fold: f.fold !== undefined ? !!f.fold : f.g === 'cusp' };
   });
   F.forEach((f, fi) => {
     const p = f.p;
@@ -230,7 +230,10 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
   for (const r of rows) for (const o of r.cs) for (let j = 1; j < o.n; j++) ARC[o.base + j] = ARC[o.base + j - 1] + d3(o.base + j - 1, o.base + j);
   // 层间允许的三维距离 (只挡荒唐的远距对应): 层距大致 ∝ 离灯距离, 远处一瓣锥映射沿层线方向拉得很长, 斜着的对应也合法
   //   (拉链按三维较短的对角线走, 自己把斜切补正), 所以放得很宽: 0.5 r + 0.05 D
-  const gap = i => 0.5 * Math.hypot(VP[3 * i] - L[0], VP[3 * i + 1] - L[1], VP[3 * i + 2] - L[2]) + 0.05 * D;
+  //   眼睛旁另有一个尺度: 晕面在眼睛处也收成一点 (光锥过眼睛的那一层前后, 层线贴着眼睛的那一截离眼的距离 ∝ |h − Σ|),
+  //   相邻两层的对应点相距不会超过离眼的距离; 而同一个取向在 Σ 两侧的两层上一个在眼前几十厘米、一个在几米外
+  //   (中间隔着眼睛这个捏合点), 按离灯的距离放宽到七八米就把它们连上了. 所以再按离眼的距离限: 1.5 r_眼 + 0.05 D
+  const gap = i => Math.min(0.5 * Math.hypot(VP[3 * i] - L[0], VP[3 * i + 1] - L[1], VP[3 * i + 2] - L[2]), 1.5 * Math.hypot(VP[3 * i] - EYE[0], VP[3 * i + 1] - EYE[1], VP[3 * i + 2] - EYE[2])) + 0.05 * D;
   const tris = [];
   // 三角形都从 emit 进: 同一个三角形只收一次 (正向缝、反向补缝会把同一个三角形各给一遍).
   //   试过更严的 (每条边至多两个三角形、层线每侧至多一个, 撞了就不收): 两张面在三维里重合的地方两臂抢邻层的同一臂,
@@ -298,6 +301,19 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
   // 路标配对: 每条特征线上, 两层的路标按沿线弧长排, 挨着的一对 (一层一个) 就是同一条边界线在相邻两层上的两个点.
   //   同一层同一位置的几个 (两条曲线在这里收头) 并成一组. 一个路标前后各可配一个 (特征线在这一层上折返时).
   //   返回 [A 顶点 → B 成员们, B 顶点 → A 成员们], 成员 { ci, j, v }
+  const PIN = 0.02 * D;
+  const pinned = v => Math.hypot(VP[3 * v] - L[0], VP[3 * v + 1] - L[1], VP[3 * v + 2] - L[2]) < PIN || Math.hypot(VP[3 * v] - EYE[0], VP[3 * v + 1] - EYE[1], VP[3 * v + 2] - EYE[2]) < PIN;
+  const throughPinch = (fi, ta, tb) => {
+    const f = FT.F[fi], lo = Math.min(ta, tb), hi = Math.max(ta, tb);
+    let a0 = 0, b0 = f.t.length - 1;
+    while (b0 - a0 > 1) { const m = (a0 + b0) >> 1; if (f.t[m] <= lo) a0 = m; else b0 = m; }
+    for (let i = a0; i < f.t.length && f.t[i] <= hi; i++) {
+      if (f.t[i] < lo) continue;
+      const x = f.p[3 * i], y = f.p[3 * i + 1], z = f.p[3 * i + 2];
+      if (Math.hypot(x - L[0], y - L[1], z - L[2]) < PIN || Math.hypot(x - EYE[0], y - EYE[1], z - EYE[2]) < PIN) return true;
+    }
+    return false;
+  };
   const pairMarks = (A, B) => {
     const byF = new Map();
     const add = (row, side) => row.cs.forEach((o, ci) => {
@@ -328,6 +344,10 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         if (x.side === y.side) return;
         const ga = x.side === 0 ? x : y, gb = x.side === 0 ? y : x;
         if (Math.abs(y.t - x.t1) > Math.max(gap(ga.m[0].v), gap(gb.m[0].v))) return;
+        // 两个路标之间这段特征线穿过眼睛 / 灯 (捏合点): 晕面在那里收成一点, 两层在这条线上不是 "挨着" 的 —— 光锥过眼睛的
+        //   那一层前后, 一层的线头在眼睛这一侧, 另一层的在另一侧几米外, 硬配上就从那个线头扇出几米长的三角形横在两张面之间.
+        //   各自到捏合点的那一块留给补空当 (环可以经过灯 / 眼). 路标自己就在捏合点上的照配
+        if (!pinned(ga.m[0].v) && !pinned(gb.m[0].v) && throughPinch(fid, x.t1, y.t)) return;
         link(fw, ga, gb, fid); link(bw, gb, ga, fid);
       };
       for (let i = 0; i + 1 < g.length; i++) {
@@ -422,13 +442,23 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
   // (u, v) 选定曲线之后, 沿这条曲线走到三维最近点 (局部下降). 取向 → 位置的映射可以剪切得很厉害: 层线落在折叠线上时
   //   u 只差 2° 就从灯旁走到 80 m 外, 相邻两层 u 又整体挪了 0.7°, "同一取向" 在两层上隔几十米. (u, v) 管选哪条线、哪一支,
   //   沿线位置交给三维
+  //   两个方向各走到头 (距离不再减小为止), 取近的那个: 起点落在灯上的捏合点时 (层线的 (u, v) 沿灯旁那一截几乎不动,
+  //   (u, v) 最近的点常常就是灯), 两臂从这里对称地分开, 朝哪边走距离都在减小 —— 只挑头一步更陡的一边, 会顺着对面那一臂
+  //   走到镜像点上停住 (对面臂上的局部极小), 这一臂就整段缝到对面去了. 闭合线 (首尾同一点) 跨过接头接着走
   const descend = (row, f, q) => {
-    const o = row.cs[f.ci];
-    let j = f.j, dj = d3(q, o.base + j);
-    for (;;) {
-      const a = j > 0 ? d3(q, o.base + j - 1) : Infinity, b = j < o.n - 1 ? d3(q, o.base + j + 1) : Infinity;
-      if (a < dj && a <= b) { j--; dj = a; } else if (b < dj) { j++; dj = b; } else break;
-    }
+    const o = row.cs[f.ci], n = o.n;
+    if (o.closed === undefined) o.closed = n > 3 && d3(o.base, o.base + n - 1) < 1e-4 * D;
+    const walk = dir => {
+      let j = f.j, dj = d3(q, o.base + j);
+      for (let it = 0; it < n; it++) {
+        let k = j + dir;
+        if (k < 0 || k >= n) { if (!o.closed) break; k = dir > 0 ? 1 : n - 2; }
+        const d = d3(q, o.base + k);
+        if (d < dj || (d === dj && d3(o.base + j, o.base + k) === 0)) { j = k; dj = d; } else break;
+      }
+      return [j, dj];
+    };
+    const a = walk(-1), b = walk(1), j = a[1] < b[1] ? a[0] : b[0];
     return j === f.j ? f : { ci: f.ci, j };
   };
   // (u, v) 里找不到时的后备: 三维最近. 取向平面里的层线可能整段换到对称的另一组取向 (如 Lowitz 太阳过水平面,
@@ -555,6 +585,100 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
     }
   };
 
+  // 折帽: R 层的一条曲线先后两次穿过同一条尖点脊线 (两个路标 A、B 沿这条曲线相邻, 沿脊线也相邻 —— 中间没有别的路标;
+  //   脊线在交汇点接着另一条脊线的, 过交汇点算同一条), 两个路标之间这段脊线的 h 都在 R、S 两层之间: 脊线在这里朝 S 层
+  //   鼓出去一段 (h 沿脊线有极值; 脊线几乎顺着层线走时这一段可以有好几米长), R 层在 A、B 之间那一臂是折回去的那张面上的.
+  //   只按取向平面里的对应去缝, S 层对着的那一段会直接连到这一臂上 —— 三角形横跨折痕, 两张面各自伸到脊线的那一条月牙
+  //   (脊线与这一臂之间) 谁也没盖, 脊线悬在网格外面, 而且哪条边都有两个三角形, 开口边检查也看不出来. 做法: 这段脊线的点
+  //   插进网格, (1) 与 R 层 A、B 之间那一臂拉链缝上 (折回去的那张面), (2) 与 S 层对着的那一段拉链缝上 (另一张面; A、B 在
+  //   S 层上的对应点记成强制对应, S 层这一段和 R 层那一臂都不再参加这一对层的缝合). S 层没有对着的线 (两张面都朝 R 这边
+  //   去, 层线是绕着脊线的一圈) 时只做 (1), 两臂各缝一次.
+  //   markS / markR: S、R 两层里不再参加缝合的顶点
+  const foldDone = new Set(), foldArc = new Map();
+  const foldCaps = (R, side, S, byF, pairRS, pairSR, idxS, markS, markR) => {
+    const hlo = Math.min(R.h, S.h), hhi = Math.max(R.h, S.h), dh = 0.05 * (hhi - hlo) + 1e-3;
+    const hAtI = (f, i) => Math.asin((L[2] - f.p[3 * i + 2]) / (Math.hypot(f.p[3 * i] - L[0], f.p[3 * i + 1] - L[1], f.p[3 * i + 2] - L[2]) || 1)) * 180 / Math.PI;
+    R.cs.forEach((o, ci) => {
+      const ms = o.lm.filter(m => m.fs.some(e => FT.F[e.f].fold));
+      for (let q = 0; q + 1 < ms.length; q++) {
+        const m1 = ms[q], m2 = ms[q + 1], va = o.base + m1.j, vb = o.base + m2.j;
+        if (m2.j - m1.j < 2 || foldDone.has(ekey(va, vb))) continue;
+        const ra = Math.hypot(VP[3 * va] - L[0], VP[3 * va + 1] - L[1], VP[3 * va + 2] - L[2]), tolg = 8 * FT.tol(ra);
+        let pcs = null;
+        for (const e1 of m1.fs) for (const e2 of m2.fs) {
+          if (pcs || !FT.F[e1.f].fold || !FT.F[e2.f].fold) continue;
+          if (e1.f === e2.f) { if (Math.abs(e2.t - e1.t) > tolg) pcs = [[e1.f, e1.t, e2.t]]; continue; }
+          for (const end of [0, 1]) {
+            const mem = endMem[e1.f][end], w = mem && mem.find(x => x.f === e2.f);
+            if (!w) continue;
+            const F1 = FT.F[e1.f];
+            pcs = [[e1.f, e1.t, end ? F1.t[F1.t.length - 1] : 0], [e2.f, w.t, e2.t]];
+            break;
+          }
+        }
+        if (!pcs) continue;
+        // 这段脊线上没有别的路标, h 都在两层之间; 离这一臂最远多少 (不到两倍容差就没有月牙可补)
+        let ok = true, sag = 0;
+        for (const [fi, ta, tb] of pcs) {
+          const f = FT.F[fi], lo = Math.min(ta, tb), hi = Math.max(ta, tb), a = byF.get(fi);
+          if (a && a.some(e => e.t > lo + tolg && e.t < hi - tolg)) { ok = false; break; }
+          for (let i = 0; i < f.t.length && ok; i++) {
+            if (f.t[i] <= lo || f.t[i] >= hi) continue;
+            const h = hAtI(f, i);
+            if (h < hlo - dh || h > hhi + dh) { ok = false; break; }
+            let d = Infinity;
+            for (let j = m1.j; j <= m2.j; j++) { const v = o.base + j, e = Math.hypot(f.p[3 * i] - VP[3 * v], f.p[3 * i + 1] - VP[3 * v + 1], f.p[3 * i + 2] - VP[3 * v + 2]); if (e < d) d = e; }
+            if (d > sag) sag = d;
+          }
+          if (!ok) break;
+        }
+        const len = pcs.reduce((x, p) => x + Math.abs(p[2] - p[1]), 0);
+        if (!ok || sag < 2 * FT.tol(ra) || len > 4 * gap(va) || ARC[vb] - ARC[va] > 3 * gap(va) + 2 * len) continue;
+        // 脊线点 (同一段只插一次: 一圈层线的两臂共用)
+        const kf = pcs.map(p => p[0] + ':' + p[1].toFixed(5) + ':' + p[2].toFixed(5)).join('|');
+        const kr = pcs.slice().reverse().map(p => p[0] + ':' + p[2].toFixed(5) + ':' + p[1].toFixed(5)).join('|');
+        let mid = foldArc.get(kf);
+        if (!mid) { const r = foldArc.get(kr); if (r) mid = r.slice().reverse(); }
+        if (!mid) {
+          mid = [];
+          pcs.forEach((p, i) => {
+            for (const v of featVerts(p[0], p[1], p[2])) mid.push(v);
+            if (i + 1 < pcs.length && nvT < nvCap) {
+              const F1 = FT.F[p[0]], k = p[2] > p[1] ? F1.t.length - 1 : 0, v = nvT++;
+              VP[3 * v] = F1.p[3 * k]; VP[3 * v + 1] = F1.p[3 * k + 1]; VP[3 * v + 2] = F1.p[3 * k + 2];
+              if (F1.d) { VD[3 * v] = F1.d[3 * k]; VD[3 * v + 1] = F1.d[3 * k + 1]; VD[3 * v + 2] = F1.d[3 * k + 2]; }
+              else { const ex = VP[3 * v] - EYE[0], ey = VP[3 * v + 1] - EYE[1], ez = VP[3 * v + 2] - EYE[2], l = Math.hypot(ex, ey, ez) || 1; VD[3 * v] = ex / l; VD[3 * v + 1] = ey / l; VD[3 * v + 2] = ez / l; }
+              VH[v] = hOf(v); arcVF.push(v, p[0], F1.t[k]); mid.push(v);
+            }
+          });
+          foldArc.set(kf, mid);
+        }
+        if (!mid.length) continue;
+        foldDone.add(ekey(va, vb));
+        const P = [va, ...mid, vb], Qr = [];
+        for (let j = m1.j; j <= m2.j; j++) Qr.push(o.base + j);
+        zip(P, Qr, sag + len);
+        if (LOG) LOG(`fold cap: row h ${R.h.toFixed(3)} c${ci} [${m1.j}..${m2.j}] ridge ${len.toFixed(2)} m, sag ${sag.toFixed(3)} m, toward h ${S.h.toFixed(3)}`);
+        // S 层对着的那一段: 两个路标在 S 层上的对应点要在同一条曲线上
+        const ft = (j, v) => { const f0 = foot(S, idxS, o.c.x[2 * j], o.c.x[2 * j + 1], v), f = f0 ? descend(S, f0, v) : foot3(S, v); return f && d3(v, S.cs[f.ci].base + f.j) < gap(v) + len ? f : null; };
+        const f1 = ft(m1.j, va), f2 = ft(m2.j, vb);
+        if (!f1 || !f2 || f1.ci !== f2.ci) continue;
+        const os = S.cs[f1.ci];
+        if (Math.abs(ARC[os.base + f2.j] - ARC[os.base + f1.j]) > 3 * gap(va) + 2 * len) continue;
+        const Q = [], st = f2.j >= f1.j ? 1 : -1;
+        for (let j = f1.j; j !== f2.j + st; j += st) { Q.push(os.base + j); if (markS && j !== f1.j && j !== f2.j) markS[os.base + j] = 1; }
+        zip(P, Q, Math.max(d3(va, os.base + f1.j), d3(vb, os.base + f2.j)) + len);
+        if (markR) for (let j = m1.j + 1; j < m2.j; j++) markR[o.base + j] = 1;
+        const tie = (v, cj, f) => {
+          const vs = os.base + f.j;
+          let m = pairRS.get(v); if (!m) pairRS.set(v, m = []); if (!m.some(x => x.v === vs)) m.push({ ci: f.ci, j: f.j, v: vs });
+          m = pairSR.get(vs); if (!m) pairSR.set(vs, m = []); if (!m.some(x => x.v === v)) m.push({ ci, j: cj, v });
+        };
+        tie(va, m1.j, f1); tie(vb, m2.j, f2);
+      }
+    });
+  };
+
   // 把 A 层一条曲线 (或其中 [k0, k1] 一段) 对到 B 层上, 一段段缝起来; covered: B 层被盖到的顶点
   let miss = 0;                       // 这一对层里找不到对应的点数 (多了就在中间补一层, 见 bad)
   const sew = (A, oa, k0, k1, B, idxB, covered, orph = null, lim = gap, pair = null, capA = null) => {
@@ -635,12 +759,22 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         const m1 = ca >= 0 ? fR[ca] : null, m2 = fL[c];
         if (m1 && c - ca > 1 && m1.ci === m2.ci && m1.j !== m2.j) {
           const ob = B.cs[m1.ci], lo = Math.min(m1.j, m2.j), hi = Math.max(m1.j, m2.j), va = oa.base + k0 + ca, vb = oa.base + k0 + c;
-          // B 上这一段与 A 上这一段长短得相称 (闭合线上两个对应点之间有两条路, 按序号取的那条可能是绕远的一条)
-          if (ARC[ob.base + hi] - ARC[ob.base + lo] <= 4 * (ARC[vb] - ARC[va]) + 2 * (d3(va, m1.v) + d3(vb, m2.v))) for (let i = ca + 1; i < c; i++) {
+          // 闭合线上两个对应点之间有两条路: 序号 lo..hi 那一条, 和绕过首尾接头的另一条. 走哪一条看中间这些点自己找到的
+          //   脚点多数落在哪边 —— 这条约束是把少数串到另一张面上的脚点拉回来, 不能反过来把多数改掉: 两层都是对称的 U 形环
+          //   (首尾在灯上相接, 接头不在灯上) 时两条路一样长, 按序号取到对面那一臂, 整臂的脚点都被改到对面去, 拉链就在
+          //   U 形里面横着缝出一整片假面. 不闭合的线只有一条路, 多数脚点在区间外时就不管
+          let nin = 0, nout = 0;
+          for (let i = ca + 1; i < c; i++) { const f = ft[i]; if (f && f.ci === m1.ci) { if (f.j >= lo && f.j <= hi) nin++; else nout++; } }
+          const wrap = nout > nin;
+          if (wrap && d3(ob.base, ob.base + ob.n - 1) > 1e-4 * D) { ca = c; continue; }
+          const arcB = wrap ? ARC[ob.base + ob.n - 1] - ARC[ob.base] - (ARC[ob.base + hi] - ARC[ob.base + lo]) : ARC[ob.base + hi] - ARC[ob.base + lo];
+          // B 上这一段与 A 上这一段长短得相称
+          if (arcB <= 4 * (ARC[vb] - ARC[va]) + 2 * (d3(va, m1.v) + d3(vb, m2.v))) for (let i = ca + 1; i < c; i++) {
             const f = ft[i], v = oa.base + k0 + i;
-            if (f && f.ci === m1.ci && f.j >= lo && f.j <= hi) continue;
+            if (f && f.ci === m1.ci && (wrap ? f.j <= lo || f.j >= hi : f.j >= lo && f.j <= hi)) continue;
             let bj = -1, bd = lim(v);
-            for (let j = lo; j <= hi; j++) { const d = d3(v, ob.base + j); if (d < bd) { bd = d; bj = j; } }
+            if (wrap) { for (let j = 0; j < ob.n; j++) { if (j > lo && j < hi) { j = hi - 1; continue; } const d = d3(v, ob.base + j); if (d < bd) { bd = d; bj = j; } } }
+            else for (let j = lo; j <= hi; j++) { const d = d3(v, ob.base + j); if (d < bd) { bd = d; bj = j; } }
             if (bj >= 0) { if (!f) miss--; ft[i] = { ci: m1.ci, j: bj }; }
           }
         }
@@ -668,9 +802,9 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
     const fan = (ks, ke, f) => {
       const ob = B.cs[f.ci];
       if (f.j !== 0 && f.j !== ob.n - 1) return;
-      const apex = ob.base + f.j, rl = v => Math.hypot(VP[3 * v] - L[0], VP[3 * v + 1] - L[1], VP[3 * v + 2] - L[2]);
+      const apex = ob.base + f.j;
       for (let k = ks; k < ke; k++) {
-        const a = oa.base + k0 + k, b = a + 1, g = 0.5 * Math.max(rl(a), rl(b), rl(apex)) + 0.05 * D;
+        const a = oa.base + k0 + k, b = a + 1, g = Math.max(gap(a), gap(b));
         if (d3(a, b) <= g && d3(b, apex) <= g && d3(apex, a) <= g) emit(a, b, apex);
       }
     };
@@ -775,7 +909,10 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
     {
       const idxB = idxOf(r + 1), idxA = idxOf(r), covered = new Uint8Array(nv), capped = new Uint8Array(nv), [tipF, tipB, byF] = pairMarks(A, B);
       pairTips(A, B, tipF, tipB);
-      if (FT) { capsOf(A, 0, B, byF, tipF, tipB, idxB, covered); capsOf(B, 1, A, byF, tipB, tipF, idxA, capped); }
+      if (FT) {
+        capsOf(A, 0, B, byF, tipF, tipB, idxB, covered); capsOf(B, 1, A, byF, tipB, tipF, idxA, capped);
+        foldCaps(A, 0, B, byF, tipF, tipB, idxB, covered, capped); foldCaps(B, 1, A, byF, tipB, tipF, idxA, capped, covered);
+      }
       for (const oa of A.cs) {
         const orph = [];
         sew(A, oa, 0, oa.n - 1, B, idxB, covered, orph, gap, tipF, capped);
@@ -1138,6 +1275,21 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
     for (let i = 0; i < tris.length; i++) tris[i] = Wd[tris[i]];
   };
   if (FT) fillClefts();
+
+  // 贴着眼睛的三角形: 三维里只有几厘米, 从眼睛看出去却可以横跨几十度 (晕面在眼睛处是锥顶, 跨过锥顶连的、补空当时
+  //   借眼睛当枢纽连的都是这样) —— 天空视图里是一大片没有层线的假面. 顶点在捏合半径之内、三个顶点的视方向两两夹角
+  //   超过 10° 的不要 (三维里少的是眼睛上几厘米的一小片)
+  {
+    const C10 = Math.cos(10 * Math.PI / 180), near = v => Math.hypot(VP[3 * v] - EYE[0], VP[3 * v + 1] - EYE[1], VP[3 * v + 2] - EYE[2]) < 0.02 * D;
+    const wide = (a, b) => VD[3 * a] * VD[3 * b] + VD[3 * a + 1] * VD[3 * b + 1] + VD[3 * a + 2] * VD[3 * b + 2] < C10;
+    let k = 0;
+    for (let i = 0; i < tris.length; i += 3) {
+      const a = tris[i], b = tris[i + 1], c = tris[i + 2];
+      if ((near(a) || near(b) || near(c)) && (wide(a, b) || wide(b, c) || wide(c, a))) continue;
+      tris[k++] = a; tris[k++] = b; tris[k++] = c;
+    }
+    tris.length = k;
+  }
 
   // 法向: 相邻三角形面积加权; 三角形的绕向不统一 (上下两遍缝的方向相反), 按与已累加的同号再加 (NA: 每顶点一个, 只用来定正反).
   //   每个三角形的每个角再各算一个 (折痕角, 60°): 只与法向夹角 60° 以内的相邻三角形平均 —— 折叠处两张面共用一条层线上的顶点,

@@ -830,7 +830,7 @@ class Tracer {
     const Seeds = this.Seeds;
     for (let k = 0; k < Seeds.length; k++) {
       const s = Seeds[k];
-      if (k === exclude || s.isLoop) continue;
+      if (k === exclude || s.isLoop || s.dead) continue;
       if (fence != null && !s.fences.has(fence)) continue;
       if (Math.abs(s.sigma - sig) > DSIG) continue;
       const d = dist(w, s.w);
@@ -877,7 +877,7 @@ class Tracer {
   }
 
   // 先切向 GN 起步 (首段天球弦长 ≤ MAX_SKY); 出射端 (相切) GN 常因 √ 病态失败, 再退到贴壁起步
-  startDirs(s) {
+  startDirs(s, keepBoth = false) {
     const cx = this.cx, fenE = this.fenE;
     let outL = [];
     const w = s.w, sig = s.sigma;
@@ -905,7 +905,7 @@ class Tracer {
     if (!s.isLoop && outL.length === 2) {
       const d0 = ang(cx.xi(outL[0].W, outL[0].Sig), xi0), d1 = ang(cx.xi(outL[1].W, outL[1].Sig), xi0);
       let dd = 0; for (let j = 0; j < 4; j++) dd += outL[0].T[j] * outL[1].T[j];
-      if (dd < -0.5) outL = [d0 <= d1 ? outL[0] : outL[1]];
+      if (dd < -0.5) outL = keepBoth ? (d0 <= d1 ? outL : [outL[1], outL[0]]) : [d0 <= d1 ? outL[0] : outL[1]];
     }
     return outL;
   }
@@ -1057,27 +1057,64 @@ class Tracer {
   }
 }
 
+// 与 C# 原版不同: 一个末端两个方向都还在有效区里时 (原版按首段天球弦长挑一个就走), 两个方向都追, 留落在已知末端上的那条.
+//   原版挑错方向时, 弧顺着 Φ=0 的另一支走出去, 停在一个没找到过的 "漏端" 上 (假弧), 真正的弧要么没人追 (另一端
+//   落了 "未用"), 要么从另一端追回来 (这一端 "重用"). 丢掉的那条若造了漏端, 那个漏端一并作废 (dead)
 function traceArcs(cx, seeds) {
   const tr = new Tracer(cx, seeds);
   const arcs = [];
+  const rank = (a, si) => a.Stop === 'end' && a.To >= 0 && a.To !== si && !seeds[a.To].missed ? 0 : a.Stop === 'closed' ? 1 : a.Stop === 'missed_end' ? 2 : 3;
+  // 冲过了已知末端: 出射临界的末端是相切地到达的, 追踪偶尔从它旁边滑过去, 贴着篱笆再走一段才停, 停处造一个漏端.
+  //   已知末端 (findEnds 精确解出的) 若离弧上某点很近 (w 上 < 2e-3, σ 差 < DSIG), 就在最近处截断, 收在这个已知末端上
+  const snapBack = (a, si, n0) => {
+    if (a.Stop !== 'missed_end' || a.W.length < 6) return;
+    let bk = -1, bi = -1, bd = 2e-3;
+    for (let k = 0; k < n0; k++) {
+      const q = seeds[k];
+      if (k === si || q.isLoop || q.dead || q.missed) continue;
+      for (let i = 3; i < a.W.length - 1; i++) {
+        if (Math.abs(a.Sig[i] - q.sigma) > DSIG) continue;
+        const d = dist(a.W[i], q.w);
+        if (d < bd) { bd = d; bk = k; bi = i; }
+      }
+    }
+    if (bk < 0) return;
+    if (a.To >= n0) seeds[a.To].dead = true;
+    a.W.length = bi + 1; a.Sig.length = bi + 1; a.Xi.length = bi + 1;
+    a.W.push(seeds[bk].w.slice()); a.Sig.push(seeds[bk].sigma); a.Xi.push(cx.xi(seeds[bk].w, seeds[bk].sigma));
+    const keep = a.FoldIdx.map((f, q) => f <= bi ? q : -1).filter(q => q >= 0);
+    a.FoldIdx = keep.map(q => a.FoldIdx[q]); a.FoldW = keep.map(q => a.FoldW[q]); a.FoldSig = keep.map(q => a.FoldSig[q]);
+    a.To = bk; a.Stop = 'end';
+  };
   for (let si = 0; si < seeds.length; si++) {          // seeds 可能在追踪中增长 (漏端), 同 C#
     const s = seeds[si];
-    if (s.isLoop || s.used !== 0) continue;
-    const dirs = tr.startDirs(s);
+    if (s.isLoop || s.used !== 0 || s.dead) continue;
+    const dirs = tr.startDirs(s, true);
     if (dirs.length === 0) s.startFail = true;
+    if (!dirs.length) continue;
+    let best = null, bestR = 9;
     for (const d of dirs) {
-      if (s.used > 0) break;                          // 一个末端只发一条弧
-      const a = tr.trace(si, d);
-      s.used++;
-      if (a.To >= 0 && a.To !== si) seeds[a.To].used++;
-      arcs.push(a);
+      const n0 = seeds.length, a = tr.trace(si, d);
+      snapBack(a, si, n0);
+      const rk = rank(a, si);
+      if (rk < bestR) {
+        if (best && best.To >= best.n0) seeds[best.To].dead = true;     // 换下来的那条造的漏端作废
+        best = a; best.n0 = n0; bestR = rk;
+      } else if (a.To >= n0) seeds[a.To].dead = true;
+      if (bestR === 0) break;
     }
+    s.used++;
+    if (best.To >= 0 && best.To !== si) seeds[best.To].used++;
+    delete best.n0;
+    arcs.push(best);
   }
   return arcs;
 }
 
 // 没有末端点的闭环: 网格 Φ 变号 → 远离已追踪弧的候选 → 双向追踪并合并
-function findLoops(cx, seeds, arcs) {
+// extra (C# 原版没有): 别处拿来的候选点 w (一般取自相邻半径球壳上的弧), 排在网格变号点后面, 同样先校正到曲线上再追.
+//   0.5° 网格上两个相邻节点都得落在有效区里才看得到变号 —— 比一格还窄的闭环 (贴着地平线的一圈) 一个候选也没有
+function findLoops(cx, seeds, arcs, extra = null) {
   const d = 0.5;
   const nLat = roundEven(180.0 / d), nLon = roundEven(360.0 / d) + 1;
   const W = new Array(nLat * nLon), F = new Float64Array(nLat * nLon);
@@ -1103,6 +1140,7 @@ function findLoops(cx, seeds, arcs) {
       const a = F[i * nLon + j], b = F[i * nLon + j + 1];
       if (fin(a) && fin(b) && a * b < 0) cand.push(unitMid(W[i * nLon + j], W[i * nLon + j + 1]));
     }
+  if (extra) for (const w of extra) if (w && fin3(w)) cand.push(unit(w));
 
   const tr = new Tracer(cx, seeds);
   const found = [];
@@ -1614,9 +1652,13 @@ function causticSeeds(cx) {
   return { seeds, degenerate: nNormal === 0 && nFlat > 0 };
 }
 
-function traceCaustic(cx, res, outCurves, outEnds) {
+// extraSeeds (C# 原版没有): 别处拿来的状态点 (w, T, τ, σ), 排在网格种子后面, 同样先校正到这一层的曲线上再追.
+//   网格种子靠 1° 网格上 Ĵ 的变号, 两个相邻节点都得有效 —— 这一叶的有效区比一格还窄时 (大 ρ 处常见) 一个种子也落不进去,
+//   整条弧就没了; 相邻球壳上已经追到的弧的状态点离这一层的曲线只差一点 (沿 ρ 延拓), 校正几步就在线上
+function traceCaustic(cx, res, outCurves, outEnds, extraSeeds = null) {
   const cs = causticSeeds(cx);
   if (cs.degenerate) { res.note = '该光路在这个族里 J≡0 (出射方向恒等于入射方向, 或不随第二个转角变): 二自由度退化, 没有焦散'; return; }
+  if (extraSeeds && extraSeeds.length) cs.seeds = cs.seeds.concat(extraSeeds);
   const have = [];
   const covered = s => {
     for (const y of have)
@@ -1660,6 +1702,7 @@ function traceCaustic(cx, res, outCurves, outEnds) {
  * fam='column': R = Rz(α)·Ry(fixedDeg)·Rz(τ), τ=θ 自由;  fam='lowitz': R = Rz(α)·Ry(τ)·Rz(fixedDeg), τ=ζ 自由。
  * wantFence(name): 要不要画名为 name 的篱笆 ('entry'/'exit'/'seam1'/'blue1'…), 可为 null。
  * opts.cancelled(): 返回 true 则抛 CancelledError;  opts.verify: 独立 snell 核对 (填 maxVerifyErr/maxJfdErr/worstJInfo)。
+ * opts.seeds: 额外的焦散种子 (状态点 [w0,w1,w2,T,τ,σ], 一般取自相邻半径的 states);  opts.keepStates: 返回 states (各条焦散弧的状态点)。
  * 返回 { curves:[{kind,name,p,dir,closed}], endP, endDir, cuspP, cuspDir, rho, kappa, baseDist, lampElevDeg, radius,
  *        nPoints, nCaustic, nFence, badArcs, note, maxVerifyErr, maxJfdErr, worstJInfo }  (点 = [x,y,z])
  */
@@ -1731,22 +1774,35 @@ export function computeShell2Dof(faceNormals, fam, fixedDeg, refN, lamp, eye, ra
 
   const cRuns = [], cEnds = [];
   if (wantCaustic) {
-    traceCaustic(cx, res, cRuns, cEnds);
+    traceCaustic(cx, res, cRuns, cEnds, opts.seeds || null);
+    if (opts.keepStates) res.states = cRuns;
     for (const r of cRuns) {
       const closed = r.length > 2 && dist6(r[0], r[r.length - 1]) < 1e-9;
       emit(r, 0, 'caustic', closed);
-      // 尖点: 天球像弦方向反转的孤立点
+      // 尖点 (与 C# 原版不同): 在延拓参数里找天球像的速度降到零的点. 原版只看相邻两段弦是否反向 —— 尖点恰好落在取样点上才认得出,
+      //   落在两个取样点之间时 (相邻两段弦夹角不到 90°) 就漏了, 对称的一对尖点常常只认出一个. 这里: 每一步的天球弦长 ÷ 状态空间步长
+      //   = 天球像的速度; 尖点处它趋于零 (半立方抛物线), 而状态空间的步长照常. 取速度的局部极小 (小于两侧 ±8 步里最大值的 1/6),
+      //   且前后各走 3 步的弦方向反转 (夹角 > 120°), 两段都走出了舍入噪声 (> 1e-8 rad)
       const cu = res.curves[res.curves.length - 1];
       if (cu === undefined) throw new RangeError('Index was out of range');   // 同 C# (空表取 [−1])
-      if (cu.kind === 0 && cu.dir.length >= 7) {
-        const chd = new Array(cu.dir.length - 1);
-        for (let i = 0; i + 1 < cu.dir.length; i++) chd[i] = sub(cu.dir[i + 1], cu.dir[i]);
-        for (let i = 1; i < chd.length; i++) {
-          if (!(dot(chd[i], chd[i - 1]) < 0)) continue;
-          const l0 = Math.min(nrm(chd[i]), nrm(chd[i - 1]));
-          let wide = 0;
-          for (let j = Math.max(0, i - 4); j < Math.min(chd.length, i + 4); j++) wide = Math.max(wide, nrm(chd[j]));
-          if (wide > 20 * Math.max(l0, 1e-12)) { res.cuspP.push(cu.p[i]); res.cuspDir.push(cu.dir[i]); }
+      if (cu.kind === 0 && cu.dir.length >= 7 && cu.dir.length === r.length) {
+        const n = r.length, v = new Float64Array(n - 1);
+        for (let i = 0; i + 1 < n; i++) { const st = dist6(r[i], r[i + 1]); v[i] = st > 1e-15 ? nrm(sub(cu.dir[i + 1], cu.dir[i])) / st : Infinity; }
+        const chordSum = (i0, i1) => { const o = [0, 0, 0]; for (let i = Math.max(0, i0); i < Math.min(n - 1, i1); i++) { const c = sub(cu.dir[i + 1], cu.dir[i]); o[0] += c[0]; o[1] += c[1]; o[2] += c[2]; } return o; };
+        let last = -10;
+        for (let i = 1; i + 1 < n - 1; i++) {
+          if (!(v[i] <= v[i - 1] && v[i] <= v[i + 1])) continue;
+          let mx = 0;
+          for (let j = Math.max(0, i - 8); j < Math.min(n - 1, i + 9); j++) if (v[j] < Infinity && v[j] > mx) mx = v[j];
+          if (!(v[i] < mx / 6)) continue;
+          const A = chordSum(i - 3, i), B = chordSum(i + 1, i + 4), la = nrm(A), lb = nrm(B);
+          // 前后两段都得真的在天上走 (一整段焦散映到天上同一点的退化处, 弦长只剩 1e-14 的舍入噪声, 噪声里的 "反转" 不算)
+          if (!(la > 1e-8 && lb > 1e-8) || dot(A, B) > -0.5 * la * lb) continue;
+          if (i - last <= 3) continue;
+          last = i;
+          // 尖点在第 i 段弦 (i → i+1) 上: 取两端里离两侧来向更远的那个 (尖端)
+          const k = dot(sub(cu.dir[i + 1], cu.dir[i]), A) > 0 ? i + 1 : i;
+          res.cuspP.push(cu.p[k]); res.cuspDir.push(cu.dir[k]);
         }
       }
     }
@@ -1879,11 +1935,11 @@ export function computeShell(faceNormals, zetaDeg, thetaDeg, refN, lamp, eye, ra
 
   const seeds = findEnds(cx);
   const raw = traceArcs(cx, seeds);
-  for (const a of findLoops(cx, seeds, raw)) raw.push(a);
+  for (const a of findLoops(cx, seeds, raw, opts.seeds || null)) raw.push(a);
 
   // ---------------- 输出: 世界坐标
   for (const s of seeds) {
-    if (s.isLoop) continue;
+    if (s.isLoop || s.dead) continue;
     const wr = cx.world(s.w, s.sigma);
     if (wr !== null) {
       const xi = wr.xi;
