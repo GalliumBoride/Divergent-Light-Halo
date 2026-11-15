@@ -448,15 +448,22 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
     return best;
   };
   // 拉链: P、Q 两串顶点号 (同向), 每步走较短的对角线; 三角形边长超出层间允许距离的不要
-  const zip = (P, Q) => {
-    let i = 0, j = 0;
+  //   ext: 这一段两头的强制对应 (路标配对 / 帽的端点) 本身隔多远 —— 边界线几乎顺着层线走时, 层线的端点离邻层可以有
+  //   八九米 (超过 gap), 这是拓扑上确定的对应, 靠近它的三角形也就这么长, 不能按 gap 丢掉 (丢了就是边界线旁一道楔形缺口)
+  //   rungs: 必须经过的横档 [P 里的序号, Q 里的序号] (按序排好) —— 逐点找好的对应. 只按 "较短对角线" 贪心走会背离对应关系:
+  //   两层都是 U 形环、外层比内层大一圈时, 外层尖端那一段都对应内层的尖点, 贪心却从外层一个点扇形连到内层的另一臂
+  //   (盖住的是内层环的里面, 两环之间真正该盖的反而空着). 横档之间仍按较短对角线走
+  const zip = (P, Q, ext = 0, rungs = null) => {
+    let i = 0, j = 0, r = 0;
     const add = (a, b, c) => {
-      const g = Math.max(gap(a), gap(b), gap(c));
+      const g = Math.max(gap(a), gap(b), gap(c), ext);
       if (d3(a, b) > g || d3(b, c) > g || d3(c, a) > g) return;
       emit(a, b, c);
     };
     while (i < P.length - 1 || j < Q.length - 1) {
-      if (j === Q.length - 1 || (i < P.length - 1 && d3(P[i + 1], Q[j]) <= d3(P[i], Q[j + 1]))) { add(P[i], P[i + 1], Q[j]); i++; }
+      while (rungs && r < rungs.length && (rungs[r][0] < i || rungs[r][1] < j || (rungs[r][0] === i && rungs[r][1] === j))) r++;
+      const ti = rungs && r < rungs.length ? Math.min(rungs[r][0], P.length - 1) : P.length - 1, tj = rungs && r < rungs.length ? Math.min(rungs[r][1], Q.length - 1) : Q.length - 1;
+      if (j === tj || (i < ti && d3(P[i + 1], Q[j]) <= d3(P[i], Q[j + 1]))) { add(P[i], P[i + 1], Q[j]); i++; }
       else { add(P[i], Q[j + 1], Q[j]); j++; }
     }
   };
@@ -520,9 +527,9 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         }
         if (!E2 || !pcs.every(q => inBand(q[0], q[1], q[2]))) continue;
         const len = pcs.reduce((x, q) => x + Math.abs(q[2] - q[1]), 0);
-        if (len > 2 * gap(e.v)) continue;
+        if (len > 4 * gap(e.v)) continue;
         // 两个端点在 S 层上的对应点: 要在同一条曲线上
-        const ft = E => { const o = R.cs[E.ci], f0 = foot(S, idxS, o.c.x[2 * E.j], o.c.x[2 * E.j + 1], E.v), f = f0 ? descend(S, f0, E.v) : foot3(S, E.v); return f && d3(E.v, S.cs[f.ci].base + f.j) < gap(E.v) ? f : null; };
+        const ft = E => { const o = R.cs[E.ci], f0 = foot(S, idxS, o.c.x[2 * E.j], o.c.x[2 * E.j + 1], E.v), f = f0 ? descend(S, f0, E.v) : foot3(S, E.v); return f && d3(E.v, S.cs[f.ci].base + f.j) < gap(E.v) + len ? f : null; };
         const f1 = ft(e), f2 = ft(E2);
         if (!f1 || !f2 || f1.ci !== f2.ci) continue;
         const os = S.cs[f1.ci];
@@ -535,7 +542,7 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         P.push(E2.v);
         const Q = [], st = f2.j >= f1.j ? 1 : -1;
         for (let j = f1.j; j !== f2.j + st; j += st) { Q.push(os.base + j); if (mark && j !== f1.j && j !== f2.j) mark[os.base + j] = 1; }
-        zip(P, Q);
+        zip(P, Q, Math.max(d3(e.v, os.base + f1.j), d3(E2.v, os.base + f2.j)) + len);
         const tie = (E, f) => {
           const vs = os.base + f.j;
           let m = pairRS.get(E.v); if (!m) pairRS.set(E.v, m = []); if (!m.some(q => q.v === vs)) m.push({ ci: f.ci, j: f.j, v: vs });
@@ -551,11 +558,11 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
   // 把 A 层一条曲线 (或其中 [k0, k1] 一段) 对到 B 层上, 一段段缝起来; covered: B 层被盖到的顶点
   let miss = 0;                       // 这一对层里找不到对应的点数 (多了就在中间补一层, 见 bad)
   const sew = (A, oa, k0, k1, B, idxB, covered, orph = null, lim = gap, pair = null, capA = null) => {
-    const x = oa.c.x, ft = [];
+    const x = oa.c.x, ft = [], raw = [], forced = new Set();      // forced: 被夹到路标对应点上的 (不是它自己找到的对应, 不当横档)
     for (let k = k0; k <= k1; k++) {
-      if (capA && capA[oa.base + k]) { ft.push(null); continue; }      // 这一段对着的是边界线 (已由 capsOf 缝好), 不找对应
+      if (capA && capA[oa.base + k]) { ft.push(null); raw.push(null); continue; }      // 这一段对着的是边界线 (已由 capsOf 缝好), 不找对应
       const f0 = foot(B, idxB, x[2 * k], x[2 * k + 1], oa.base + k), f = f0 ? descend(B, f0, oa.base + k) : foot3(B, oa.base + k);
-      ft.push(f && d3(oa.base + k, B.cs[f.ci].base + f.j) < lim(oa.base + k) ? f : null);
+      ft.push(f && d3(oa.base + k, B.cs[f.ci].base + f.j) < lim(oa.base + k) ? f : null); raw.push(f);
       if (!f && orph) orph.push(k);
       if (!ft[ft.length - 1]) miss++;
     }
@@ -605,8 +612,19 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
           if (Math.abs(ARC[ob.base + fR[c].j] - ARC[ob.base + fL[c].j]) <= 3 * gap(va)) {
             const Q = [], st = fR[c].j > fL[c].j ? 1 : -1;
             for (let j = fL[c].j; j !== fR[c].j + st; j += st) { Q.push(ob.base + j); if (covered) covered[ob.base + j] = 1; }
-            zip([va], Q);
+            zip([va], Q, Math.max(d3(va, fL[c].v), d3(va, fR[c].v)));
           }
+        }
+      }
+      // 强制对应本身就超过了距离上限 (边界线几乎顺着层线走: 层线端点离邻层八九米): 它旁边那些因为超限被丢掉的对应点
+      //   放宽到这个强制对应距离的 1.5 倍再收回来, 不然端点连上了、端点旁边一小段层线却没人缝
+      if (cut) for (let c = 0; c < ft.length; c++) if (cut[c]) for (const sd of [-1, 1]) {
+        const m = sd < 0 ? fL[c] : fR[c], vc = oa.base + k0 + c, dm = d3(vc, m.v);
+        if (dm <= lim(vc)) continue;
+        for (let i = c + sd; i >= 0 && i < ft.length && !cut[i] && !ft[i]; i += sd) {
+          const f = raw[i];
+          if (!f || f.ci !== m.ci || d3(oa.base + k0 + i, B.cs[f.ci].base + f.j) > 1.5 * dm) break;
+          ft[i] = f; miss--;
         }
       }
       // 相邻两个路标的对应点在 B 的同一条曲线上: 中间这些点的对应点必须落在那两个对应点之间 (特征线把两层的曲线切成
@@ -639,9 +657,9 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
       if (cut) for (let c = 0; c < ft.length; c++) if (cut[c]) {
         const vc = oa.base + k0 + c, far = (i, m) => Math.abs(ARC[oa.base + k0 + i] - ARC[vc]) > 3 * (d3(vc, m.v) + d3(vc, oa.base + k0 + (i < c ? c - 1 : c + 1)));
         let m = fL[c], sg = trend(c - 12, c - 1, m.ci);
-        for (let i = c - 1; i >= 0 && !cut[i] && ft[i] && ft[i].ci === m.ci && sg * (ft[i].j - m.j) > 0 && !far(i, m); i--) ft[i] = m;
+        for (let i = c - 1; i >= 0 && !cut[i] && ft[i] && ft[i].ci === m.ci && sg * (ft[i].j - m.j) > 0 && !far(i, m); i--) { ft[i] = m; forced.add(i); }
         m = fR[c]; sg = trend(c + 1, c + 12, m.ci);
-        for (let i = c + 1; i < ft.length && !cut[i] && ft[i] && ft[i].ci === m.ci && sg * (ft[i].j - m.j) < 0 && !far(i, m); i++) ft[i] = m;
+        for (let i = c + 1; i < ft.length && !cut[i] && ft[i] && ft[i].ci === m.ci && sg * (ft[i].j - m.j) < 0 && !far(i, m); i++) { ft[i] = m; forced.add(i); }
       }
     }
     const fAt = (i, asEnd) => cut && cut[i] ? (asEnd ? fL[i] : fR[i]) : ft[i];
@@ -702,6 +720,7 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         const ob = B.cs[f0.ci], P = [], Q = [];
         for (let k = s; k <= e; k++) P.push(oa.base + k0 + k);
         const j0 = f0.j, j1 = fe.j, st = j1 >= j0 ? 1 : -1;
+        let offP = 0, offQ = 0;
         for (let j = j0; j !== j1 + st; j += st) { Q.push(ob.base + j); if (covered) covered[ob.base + j] = 1; }
         if (cut && (cut[s] || cut[e])) {
           // 起头 / 收尾在路标上: 两个路标之间那段特征线上插的点接到哪一串 —— 它顺着谁的走向就接在对面那串上
@@ -715,10 +734,16 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
           };
           const onQ = (ta, tb, an, bn) => cosAt(ta, tb, an) > (bn < 0 ? -2 : cosAt(tb, ta, bn));
           if (cut[e]) { const a = arcOf(ta1, tb1); if (a.length) { if (onQ(ta1, tb1, an1, bn1)) for (let i = a.length - 1; i >= 0; i--) Q.push(a[i]); else P.push(...a); } }
-          if (cut[s]) { const a = arcOf(ta0, tb0); if (a.length) { if (onQ(ta0, tb0, an0, bn0)) Q.unshift(...a); else P.unshift(...a.slice().reverse()); } }
+          if (cut[s]) { const a = arcOf(ta0, tb0); if (a.length) { if (onQ(ta0, tb0, an0, bn0)) { Q.unshift(...a); offQ = a.length; } else { P.unshift(...a.slice().reverse()); offP = a.length; } } }
         }
         if (cut) { if (cut[s]) doneR[s] = 1; if (cut[e]) doneL[e] = 1; }
-        zip(P, Q);
+        // 三角形边长的上限跟着这一段自己的对应距离走 (每个点到它对应点的距离已经过了 lim 这一关): 曲面贴着光锥的地方
+        //   (U 形尖端一带) 相邻两层隔好几米, 接近 gap, 拉链里稍斜一点的边就超了, 整片尖端被丢掉留一个透镜形的洞
+        let ext = 0;
+        for (let k = s; k <= e; k++) { const f = fAt(k, k > s); if (f) { const d = d3(oa.base + k0 + k, ob.base + f.j); if (d > ext) ext = d; } }
+        const rungs = [];
+        for (let k = s + 1; k < e; k++) if (ft[k] && !forced.has(k) && !(cut && cut[k])) rungs.push([offP + k - s, offQ + Math.abs(ft[k].j - j0)]);
+        zip(P, Q, 1.5 * ext, rungs);
       }
       s = cut && cut[e] && e > s ? e : e + 1;
     }
@@ -734,7 +759,7 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         if (Math.abs(ARC[ob.base + f.j] - ARC[ob.base + m.j]) > 3 * (d3(va, vn) + gap(va))) continue;
         const Q = [], st = m.j >= f.j ? 1 : -1;
         for (let j = f.j; j !== m.j + st; j += st) { Q.push(ob.base + j); if (covered) covered[ob.base + j] = 1; }
-        zip([vn, va], Q);
+        zip([vn, va], Q, d3(va, ob.base + m.j));
       }
     }
   };
