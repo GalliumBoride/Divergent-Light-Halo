@@ -852,6 +852,27 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
       if (isB[b] && isB[c]) { const k = ekey(b, c); if (cnt0(k) === 1) E3.set(k, a); }
       if (isB[c] && isB[a]) { const k = ekey(c, a); if (cnt0(k) === 1) E3.set(k, b); }
     }
+    // 层线上的边: 上、下两侧各该有一个三角形 (层线是 h 的等值线). 两个三角形都在同一侧 (正向缝与反向补缝重叠) 而另一侧
+    //   一个也没有的, 数出来是 "两个", 其实另一侧开着 —— 最里一圈闭合层线之内的帽就被这样的边挡住合不成环.
+    //   按一侧一个来算: 当成开口边 (只属于一个三角形), 往空着的那一侧补
+    {
+      const upN = new Uint8Array(nv), dnN = new Uint8Array(nv), th3 = new Int32Array(nv).fill(-1);
+      for (let t = 0; t < tris.length; t += 3) for (let q = 0; q < 3; q++) {
+        const x = tris[t + q], y = tris[t + (q + 1) % 3], z = tris[t + (q + 2) % 3];
+        if (x >= nv || y >= nv || CV[x] !== CV[y] || (x - y !== 1 && y - x !== 1)) continue;
+        const e = x < y ? x : y, dh = VH[z] - VH[x];
+        if (dh > 0) { if (upN[e] < 255) upN[e]++; } else if (dh < 0) { if (dnN[e] < 255) dnN[e]++; } else continue;
+        th3[e] = z;
+      }
+      for (let e = 0; e + 1 < nv; e++) {
+        if (CV[e] !== CV[e + 1] || upN[e] + dnN[e] < 2 || (upN[e] > 0 && dnN[e] > 0)) continue;
+        const u = Wd[e], v = Wd[e + 1];
+        if (u === v) continue;
+        const k = ekey(u, v);
+        if (cnt0(k) !== upN[e] + dnN[e]) continue;      // 焊接后这条边上还有别的三角形 (别的曲线也走这条边): 不动
+        EX.set(k, 1); E3.set(k, Wd[th3[e]]); single.push(k);
+      }
+    }
     const addT = (a, b, c) => {
       for (let q = 0; q < 3; q++) { const u = q === 0 ? a : q === 1 ? b : c, v = q === 0 ? b : q === 1 ? c : a, w = q === 0 ? c : q === 1 ? a : b, k = ekey(u, v), n = cntOf(k); EX.set(k, n + 1); if (!n) E3.set(k, w); }
     };
@@ -873,7 +894,35 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
       const o = { arc: false, feat: false, k, u, v, len, done: false, dead: false };
       defect.push(o); link(u, v, o);
     }
+    // 一个三角形也没有的层线边 (这一小段层线两侧都没缝上: 闭合层线的首尾接头旁常有几条): 开口边里数不到它,
+    //   可它正是空当的边界 —— 最里一圈闭合层线之内的帽, 环就断在这几条边上. 也当缺陷边, 两侧各可以补一次
+    for (const r of rows) for (const o of r.cs) for (let j = 0; j + 1 < o.n; j++) {
+      const u = Wd[o.base + j], v = Wd[o.base + j + 1];
+      if (u === v || pinch(u) || pinch(v) || cnt0(ekey(u, v)) > 0) continue;
+      const g = { arc: false, feat: false, ghost: true, k: ekey(u, v), u, v, len: d3(u, v), done: false, dead: false };
+      defect.push(g); link(u, v, g);
+    }
     if (!defect.length) return;
+    // 捏合点 (灯 / 眼) 旁的连线: 缺陷边的链走到捏合点跟前就断了 (捏合点旁的边不算缺陷). 光锥过眼睛的那一层 (h ≈ Σ) 前后,
+    //   相邻两层的层线都从灯走到眼、分别从灯眼连线的两侧绕过去, 中间夹一条透镜形的窄带没缝上 (近眼处两条线从眼看隔十几度,
+    //   过不了 "天空里相隔 < 2°" 那一关): 这条带两头就收在灯和眼上. 同一个捏合点旁 (3 倍捏合半径内) 的链端两两连上,
+    //   环才合得拢; 只当通路, 不当起点
+    //   灯 / 眼各取一个已有的网格顶点 (各层层线在这里的公共端点) 当枢纽: 链端连到它, 在这里起止的特征线也以它为端点 ——
+    //   最末一层之外的帽常常一头收在灯上 (外缘线从灯出发绕过 h 的极值再回到最末一层的端点)
+    const hub = new Set(), hubOf = [L, EYE].map(C0 => {
+      let bv = -1, bd = 0.02 * D;
+      for (const r of rows) for (const o of r.cs) for (const j of [0, o.n - 1]) { const v = Wd[o.base + j], d = Math.hypot(VP[3 * v] - C0[0], VP[3 * v + 1] - C0[1], VP[3 * v + 2] - C0[2]); if (d < bd) { bd = d; bv = v; } }
+      if (bv >= 0) hub.add(bv);
+      return bv;
+    });
+    [L, EYE].forEach((C0, ci) => {
+      const T = [], hv = hubOf[ci];
+      for (const [v, es] of G) if (v !== hv && es.length % 2 === 1 && Math.hypot(VP[3 * v] - C0[0], VP[3 * v + 1] - C0[1], VP[3 * v + 2] - C0[2]) < 0.06 * D) T.push(v);
+      if (!T.length || T.length > 40) return;
+      const mk = (a, b) => link(a, b, { arc: false, feat: true, k: -1, u: a, v: b, len: d3(a, b), done: false, dead: false });
+      if (hv >= 0) for (const t of T) mk(t, hv);
+      if (T.length <= 12) for (let i = 0; i < T.length; i++) for (let j = i + 1; j < T.length; j++) mk(T[i], T[j]);
+    });
     // 特征线上的结点: 层线的路标、第一遍插进来的特征线点、缺陷边里落在特征线上的端点、特征线的端点 (交汇点)
     const NF = FT.F.map(() => []);
     const addNode = (f, t, n) => { if (!pinch(n)) NF[f].push({ t, n }); };
@@ -896,7 +945,8 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
     for (const e of ends) {
       if (e.J >= 0) continue;
       const f = FT.F[e.f], x = f.p[3 * e.i], y = f.p[3 * e.i + 1], z = f.p[3 * e.i + 2], r = Math.hypot(x - L[0], y - L[1], z - L[2]);
-      if (r < 0.02 * D || Math.hypot(x - EYE[0], y - EYE[1], z - EYE[2]) < 0.02 * D) continue;
+      const pc = r < 0.02 * D ? 0 : Math.hypot(x - EYE[0], y - EYE[1], z - EYE[2]) < 0.02 * D ? 1 : -1;
+      if (pc >= 0) { if (hubOf[pc] >= 0) { e.J = hubOf[pc]; NF[e.f].push({ t: e.t, n: hubOf[pc] }); } continue; }
       const JT = 10 * FT.tol(r), v = newVert(x, y, z, f.d, e.i);
       if (v < 0) break;
       e.J = v; NF[e.f].push({ t: e.t, n: v });
@@ -950,7 +1000,7 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
         for (const e of G.get(u) || []) {
           const o = e.o, w = e.to;
           if (o === skip || o.done || o.dead || fin.has(w) || (o.arc && !arcFree(o))) continue;
-          if (RV[w] >= 0 && (RV[w] < rlo || RV[w] > rhi)) continue;
+          if (!hub.has(w) && RV[w] >= 0 && (RV[w] < rlo || RV[w] > rhi)) continue;
           const nd = d + o.len;
           if (!(nd >= dist.get(w))) { dist.set(w, nd); prev.set(w, [u, o]); push([nd, w]); }
         }
@@ -1076,7 +1126,7 @@ export function stitchLayers2(layers, L, D, feats = null, opt = null) {
       if (bad || fold > 0.5 * tot) { e.dead = true; if (LOG) LOG.push([bad ? 'clash' : 'fold', e.u, e.v, poly.length, fold, tot, poly.slice(), why]); continue; }
       if (LOG) LOG.push(['fill', e.u, e.v, poly.length, used.filter(o => o.arc).length]);
       for (let t = 0; t < T.length; t += 3) { const a = T[t], b = T[t + 1], c = T[t + 2]; if (a === b || b === c || c === a) continue; addT(a, b, c); tris.push(a, b, c); }
-      for (const o of used) { if (o.arc) o.uses++; else o.done = true; }
+      for (const o of used) { if (o.arc) o.uses++; else if (o.ghost) o.ghost = false; else o.done = true; }
     }
     for (let i = 0; i < tris.length; i++) tris[i] = Wd[tris[i]];
   };

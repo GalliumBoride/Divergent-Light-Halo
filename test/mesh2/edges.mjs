@@ -4,7 +4,7 @@
 //     在同一层上 → 特征线在这一层外鼓出去一段 (极值帽 cap), 网格够不到, 单列;
 //     隔了层 → skip (中间的层在这里没有线), 单列.
 // node test/mesh2/edges.mjs code mode el D surf fix   (例: 4-1-8 lowitz 3.5 15 caustic 0; mode = column | lowitz)
-//   env: STITCH (换一个 stitch2.js 来比), FEAT=0 (不给缝合器特征线), DUMP=n [GRP=cusp] (打印明细), KINK=n, NOCACHE=1
+//   env: STITCH (换一个 stitch2.js 来比), FEAT=0 (不给缝合器特征线), DUMP=n [GRP=cusp] (打印明细), KINK=n, NOCACHE=1, RELAYER=1 (只重算层线)
 //   层与特征线算一次后存在 test/mesh2/cache/ (已 gitignore)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -28,6 +28,10 @@ if (fs.existsSync(cname) && !process.env.NOCACHE) {
   const j = JSON.parse(fs.readFileSync(cname, 'utf8'));
   feats = j.feats.map(f => ({ g: f.g, p: dec(f.p) }));
   layers = j.layers.map(l => ({ h: l.h, curves: l.curves.map(c => ({ p: dec(c.p), d: dec(c.d), x: dec(c.x), b: c.b })) }));
+  if (process.env.RELAYER) {      // 层线按现在的引擎重算 (精确边界线照用缓存里的: 那一步慢, 而且没变)
+    layers = PG.pageLayers(EP, lp, +el, D, low, z, th, surf);
+    fs.writeFileSync(cname, JSON.stringify({ feats: j.feats, layers: layers.map(l => ({ h: l.h, curves: l.curves.map(c => ({ p: enc(c.p), d: enc(c.d), x: enc(c.x), b: c.b || 0 })) })) }));
+  }
 } else {
   const e = EP.edges2Dof(lp, +el, D, 0, 80, low, z, th, surf, null, true);
   const rimsC = surf === 'caustic' ? (EP.causticRims2Dof(lp, +el, D, 0, 80, low, z, th, 101) || []) : [];

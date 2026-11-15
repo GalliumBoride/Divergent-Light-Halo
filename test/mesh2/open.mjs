@@ -3,7 +3,7 @@
 //     layer —— 沿一条层线的开口边: 这条层线的一侧没有三角形 (极值帽: 边界线在最末一层之外鼓出去的一段; 或面中间的洞);
 //     cross —— 跨两层的开口边, 不在特征线上: 楔形缺口 / 洞的侧边.
 //   同一位置的顶点先焊接. 输出两类缺陷的条数与总长, 及最长的几个连通分量的位置 (三维坐标 + 从眼看的方位 / 仰角).
-// node test/mesh2/open.mjs code mode el D surf fix      env: STITCH, FEAT=0, N=明细条数 (默认 6)
+// node test/mesh2/open.mjs code mode el D surf fix      env: STITCH, FEAT=0, N=明细条数 (默认 6), NOGROW=1 (不做页面那一轮补层)
 //   读 test/mesh2/cache/ 里 edges.mjs 存下的场景 (没有就先跑 edges.mjs)
 import fs from 'node:fs';
 import path from 'node:path';
@@ -22,7 +22,7 @@ let layers = j.layers.map(l => ({ h: l.h, curves: l.curves.map(c => ({ p: dec(c.
 const L = [D * Math.cos(el * Math.PI / 180), 0, D * Math.sin(el * Math.PI / 180)];
 const useFeat = process.env.FEAT !== '0';
 let m = ST.stitchLayers2(layers, L, D, useFeat ? feats.map(f => ({ p: f.p, g: f.g })) : null, { maxD: MAXD });
-if (m.bad.length && process.env.GROW) {       // 页面那一轮补层 (要重算层, 慢; 默认只缝缓存里的层)
+if (m.bad.length && !process.env.NOGROW) {       // 页面那一轮补层 (对不上的相邻两层中间补算一层再缝; NOGROW=1 关掉)
   const CR = await import(B + 'crystal.js'), LPm = await import(B + 'lp.js'), EP = await import(B + 'epdiv.js');
   CR.setApex(56, 56); LPm.LP.partial = true; LPm.LP.upperApexDeg = 56; LPm.LP.lowerApexDeg = 56; LPm.setIndex(1.31);
   const lp = CR.parsePath(code).map(CR.lpFaceFromCompact), surf = EP.resolveSurface(lp, surfName), low = mode === 'lowitz', z = low ? 0 : +fixAng, th = low ? +fixAng : 0;

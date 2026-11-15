@@ -194,6 +194,53 @@ function insertFolds(samples, foldAt, mid, iters = 40) {
   return out;
 }
 
+// 极点: 平行光的天空方向 D 经过太阳 / 反日方向 (偏折 0° 或 180°) 时, 灯光线与出射光线平行, 锥映射的落点沿灯–眼连线
+//   (或它在灯后的延长线) 跑到无穷远. 层线在这里有一段从灯旁一直伸到最大距离, 却只占曲线参数上极窄的一段:
+//   D 离极点方向 δ 处的落点在 ~(灯眼距离)/δ 远, 要落在最大距离以内 δ 只能在零点几度里. 相邻两个样本都落在这一段
+//   之外时它两头都是 "无效", refineBranch 看不见, 整段就丢了; h → ∓Σ (光锥过灯眼连线) 时这段越来越窄, 连着几层没有
+//   (晕面在灯后方留一道几十米长的缺口). 样本里 g = sin²(D 与太阳方向的夹角) 的离散极小 (且在 thr 以内) 处:
+//   三分找到真正的最近点, 再朝两侧各插一串逐次减半的样本 (几何阶梯) —— 再窄的窗口里也落进几个,
+//   余下的交给 refineBranch 的加密与端点二分.
+function insertPoles(samples, gAt, mid, thr = 7.6e-3, levels = 12) {
+  const n = samples.length;
+  if (n < 3) return samples;
+  const g = samples.map(gAt);
+  let any = false;
+  for (let i = 0; i < n && !any; i++) if (g[i] < thr) any = true;
+  if (!any) return samples;
+  // 每一段连续的 "g < thr" 样本里只取 g 最小的那一个 (g 沿线有小起伏, 逐个局部极小都做的话一条线上触发十几次)
+  const pick = new Uint8Array(n);
+  for (let i = 0; i < n;) {
+    if (!(g[i] < thr)) { i++; continue; }
+    let j = i, b = i;
+    while (j + 1 < n && g[j + 1] < thr) { j++; if (g[j] < g[b]) b = j; }
+    pick[b] = 1; i = j + 1;
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const gi = g[i];
+    if (!pick[i]) { out.push(samples[i]); continue; }
+    let l = i > 0 ? samples[i - 1] : null, c = samples[i], r = i < n - 1 ? samples[i + 1] : null, gc = gi;
+    for (let it = 0; it < 16; it++) {
+      const a = l ? mid(l, c) : null, b = r ? mid(c, r) : null;
+      if (!a && !b) break;
+      const ga = a ? gAt(a) : NaN, gb = b ? gAt(b) : NaN;
+      if (ga < gc && !(gb < ga)) { r = c; c = a; gc = ga; }
+      else if (gb < gc) { l = c; c = b; gc = gb; }
+      else { if (a) l = a; if (b) r = b; }
+    }
+    const ladder = (from) => {                 // 从邻样本朝 c 逐次减半, 由远及近
+      const q = [];
+      for (let k = 0, x = from; k < levels; k++) { x = mid(x, c); if (!x) break; q.push(x); }
+      return q;
+    };
+    if (i > 0) out.push(...ladder(samples[i - 1]));
+    out.push(c);
+    if (i < n - 1) out.push(...ladder(samples[i + 1]).reverse());
+  }
+  return out;
+}
+
 // 折叠点上两支本应重合, 但两支的差 ∝ √(折叠量), 折叠量的舍入噪声 (出射掠射面上出射方向本身 ∝ √0, 噪声 ~1e-8) 被开方放大,
 //   二分到底两支仍差几毫米到一厘米, 层线在折叠处断开. 两支的平均里 √ 项正负相消, 随参数光滑 → 两支都取平均, 误差只剩线性的舍入.
 function foldMerge(v) {
@@ -1076,7 +1123,19 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
       const Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
       return Dn > 1e-12 ? coneFold([ch.Dx / Dn, ch.Dy / Dn, ch.Dz / Dn], hRad, L, E) : null;
     };
-    const smp = insertFolds(run, foldAt, mid);
+    // g = sin²(天空方向与太阳方向的夹角): 接近 0 = 偏折接近 0° / 180° (见 insertPoles)
+    const sunX = Math.cos(hRad), sunZ = Math.sin(hRad);
+    const gAt = x => {
+      const ch = Chain3(x[0], x[1], m, fx, P, graze), Dn = Math.sqrt(ch.Dx * ch.Dx + ch.Dy * ch.Dy + ch.Dz * ch.Dz);
+      if (!(Dn > 1e-12)) return NaN;
+      const c = (ch.Dx * sunX + ch.Dz * sunZ) / Dn;
+      return 1 - c * c;
+    };
+    // 只在光锥离灯眼连线几度之内的层做: 离得远时那一段从灯出发就偏开一个大角, 在参数上不窄, 原有的加密够用
+    //   (找最近点要反复把中点校正回曲线上, 每层都做的话层线计算慢近一倍)
+    const sig = Math.atan2(L[2] - E[2], Math.hypot(L[0] - E[0], L[1] - E[1])) * 180 / Math.PI;
+    const smp0 = insertFolds(run, foldAt, mid);
+    const smp = Math.min(Math.abs(hDeg + sig), Math.abs(hDeg - sig)) < 6 ? insertPoles(smp0, gAt, mid) : smp0;
     const n = run.length, closed = n > 3 && Math.hypot(wd2(run[0][0] - run[n - 1][0]), wd2(run[0][1] - run[n - 1][1])) < 1e-3;
     for (let b = 0; b < 2; b++) {
       const pcs = refineBranch(smp, x => branches(x)[b], mid, Lden);
