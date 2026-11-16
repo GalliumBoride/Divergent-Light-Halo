@@ -17,7 +17,7 @@ import { LP, setIndex } from './engine/lp.js';
 import { lightConeH, lightConeSwap, parallelArc, divergentOnCone } from './engine/cone.js';
 import { lightConeBoundaries } from './engine/bdry4.js';
 import { surfaceMesh1 } from './engine/mesh1.js';
-import { lightCone2DofLayers, parallelArc2Dof, edges2Dof, resolveSurface, causticRims2Dof } from './engine/epdiv.js';
+import { lightCone2DofLayers, parallelArc2Dof, edges2Dof, resolveSurface, causticRims2Dof, rank1Fences } from './engine/epdiv.js';
 import * as OC from './engine/obscaustic.js';
 import { fold2DofFine, fold1DofFine, seam1DofFine } from './engine/obsfine.js';
 import { computeShell, computeShell2Dof } from './engine/divshell.js';
@@ -132,6 +132,20 @@ const RUN = {
   obs2: a => {
     const er = a.el * Math.PI / 180;
     const dvec = [a.dist * Math.cos(er), 0.0, a.dist * Math.sin(er) - a.eye];
+    // 降自由度 (epdiv.js orientRank1): 二自由度观测者焦散的方程 χ_内 = 0 处处成立, 追线只在噪声里打转 (几分钟).
+    //   柱晶族 = 绕 c 轴各个角度下一自由度 (绕竖直轴) 族的并, 晕面是这些一自由度晕面 (同一个几何曲面, 有效范围不同) 的并,
+    //   从眼看过去的轮廓也就是各自轮廓的并: 绕 c 轴每 30° 取一个, 各算一自由度观测者焦散合在一起. Lowitz 族只给说明
+    if (rank1Fences(a.fp.map(lpFaceFromCompact), !!a.lowitz, a.zeta, a.theta)) {
+      const en = a.lang === 'en';
+      if (a.lowitz) return obsPack([], null, null, en ? 'This path drops to one degree of freedom with this orientation family; no 2-DOF observer caustic is computed.' : '这条光路在此取向族下降为一自由度, 不算二自由度观测者焦散.');
+      const fold = [];
+      for (let k = 0; k < 12; k++) {
+        const c = OC.make1Dof(a.fp, baseNormalTable(), a.n, 'alpha', 0, a.zeta * Math.PI / 180, k * Math.PI / 6, dvec, [0, 0, a.eye], a.maxD);
+        if (!chiDegenerate(c)) fold.push(...fold1DofFine(c, 0.008));
+      }
+      shift(fold, a.eye);
+      return obsPack(fold, null, null, fold.length ? '' : (en ? 'Drops to one degree of freedom: no fold caustic for any spin.' : '降为一自由度: 各个绕 c 角下都没有折叠焦散.'));
+    }
     const c2 = new OC.Ctx2({
       faces: a.fp, baseN: baseNormalTable(), n: a.n,
       mode: a.lowitz ? OC.Mode2.Lowitz : OC.Mode2.Column,
@@ -205,14 +219,18 @@ const RUN = {
     const nr = a.fp.map(baseNormalFromCompact);
     let sf = a.surfFence;
     if (sf && sf.length > 4 && /^\d+$/.test(sf.substring(4)) && parseInt(sf.substring(4), 10) > nr.length - 2) sf = null;
-    const wantC = sf === null, fam = a.lowitz ? 'lowitz' : 'column', fixed = a.lowitz ? a.theta : a.zeta;
+    let wantC = sf === null;
+    const fam = a.lowitz ? 'lowitz' : 'column', fixed = a.lowitz ? a.theta : a.zeta;
     const t0 = Date.now(), limit = a.maxMs || 60000;
     const lp = a.fp.map(lpFaceFromCompact), surf = resolveSurface(lp, a.surf || 'caustic');
+    // 降自由度 (见 epdiv.js orientRank1): 焦散 = 整个晕面 = 各条边界曲线的像之并 (重合的弧在 shellmesh 里去重、首尾相接的接起来)
+    const allF = wantC && !!rank1Fences(lp, !!a.lowitz, a.zeta, a.theta);
+    if (allF) wantC = false;
     const sky = skyStepOf(parallelArc2Dof(lp, a.el, a.eye, 101, !!a.lowitz, a.zeta, a.theta, surf, true), a.E, a.budgetAll || a.budget || 60000);
     // 每层直接算 (引擎全搜 + 相邻层的状态点当种子)
     const compute = (r, o) => {
-      const res = computeShell2Dof(nr, fam, fixed, a.n, a.L, a.E, r, true, wantC, nm => nm === sf, { seeds: o.seeds, keepStates: true, skyStep: 2 });
-      return { arcs: res.curves.filter(c => (wantC ? c.kind === 0 : c.name === sf) && c.p.length >= 1).map(c => ({ p: c.p, d: c.dir, closed: c.closed })), focal: wantC ? res.focalP : [], states: res.states || null };
+      const res = computeShell2Dof(nr, fam, fixed, a.n, a.L, a.E, r, true, wantC, nm => allF || nm === sf, { seeds: o.seeds, keepStates: true, skyStep: 2 });
+      return { arcs: res.curves.filter(c => (wantC ? c.kind === 0 : allF ? c.kind !== 0 : c.name === sf) && c.p.length >= 1).map(c => ({ p: c.p, d: c.dir, closed: c.closed })), focal: wantC ? res.focalP : [], states: res.states || null };
     };
     let m;
     try { m = meshShellSurface(compute, a.L, a.E, { maxD: a.maxD, lines: a.lines || [], skyStep: sky, budget: a.budget, rMin: a.rMin, rMax: a.rMax, rows: a.rows, cancelled: () => Date.now() - t0 > limit }); }

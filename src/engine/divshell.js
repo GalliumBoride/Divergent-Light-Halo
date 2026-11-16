@@ -1076,6 +1076,15 @@ function traceArcs(cx, seeds) {
   //   很近的地方 (最后一点 w 上 < 5e-3). 不收的话另一头再追一遍, 同一条弧出来两条 (各缺一小截), 层线的段数忽多忽少.
   //   收在这个末端上 (中间那一小截按直线连)
   const fail = a => a.Stop !== 'end' && a.Stop !== 'closed' && a.Stop !== 'missed_end';
+  // 收到已知末端上之前看天空: 晕面快到最远处时球壳上的轮廓缩成几个小弧, 所有末端在晶体系里挤在一起 (w 上 < 5e-3),
+  //   却在天上相隔很远 —— 收错了就是一步跨过天空一大截的假弧 (3-1-5 Parry Σ34.5 r≈16.73: 3 个点的弧跳了 125°).
+  //   收的那一步在天上超过 2° (正常的收尾只差零点零几度) 就不收
+  const skyOk = (w0, s0, w1, s1) => {
+    const a = cx.world(w0, s0), b = cx.world(w1, s1);
+    if (!a || !b) return true;
+    const c = a.xi[0] * b.xi[0] + a.xi[1] * b.xi[1] + a.xi[2] * b.xi[2];
+    return c > Math.cos(2 * DEG);
+  };
   const snapFail = (a, si, n0) => {
     if (!fail(a) || a.W.length < 2) return;
     const i = a.W.length - 1;
@@ -1084,6 +1093,7 @@ function traceArcs(cx, seeds) {
       const q = seeds[k];
       if (k === si || q.isLoop || q.dead || q.missed) continue;
       if (Math.abs(a.Sig[i] - q.sigma) > DSIG) continue;
+      if (!skyOk(a.W[i], a.Sig[i], q.w, q.sigma)) continue;
       const d = dist(a.W[i], q.w);
       if (d < bd) { bd = d; bk = k; }
     }
@@ -1107,7 +1117,7 @@ function traceArcs(cx, seeds) {
       for (let i = 0; i + 1 < a.W.length - 1; i++) {
         if (Math.abs(a.Sig[i] - q.sigma) > DSIG && Math.abs(a.Sig[i + 1] - q.sigma) > DSIG) continue;
         const d = segD(a.W[i], a.W[i + 1], q.w);
-        if (d < bd) { bd = d; bk = k; bi = i; }
+        if (d < bd && skyOk(a.W[i], a.Sig[i], q.w, q.sigma)) { bd = d; bk = k; bi = i; }
       }
     }
     if (bk < 0) return;
@@ -2284,6 +2294,23 @@ export function computeShell(faceNormals, zetaDeg, thetaDeg, refN, lamp, eye, ra
   for (let i = 0; i < res.ends.length; i++) endIndex.set(res.ends[i], i);
 
   for (const a of raw) {
+    // 失控的弧 (追踪在消失点附近绕圈, 走满点数上限): 天上累计超过 720° 的不要 (3-5-6-8 Parry Σ34.5 r = 14.432: 8 万点、14265°)
+    if (a.W.length > 2000) {
+      let len = 0, prev = null;
+      for (let i = 0; i < a.W.length && len <= 4 * Math.PI; i += 1) { const wr = cx.world(a.W[i], a.Sig[i]); if (!wr) continue; if (prev) len += Math.acos(Math.max(-1, Math.min(1, prev[0] * wr.xi[0] + prev[1] * wr.xi[1] + prev[2] * wr.xi[2]))); prev = wr.xi; }
+      if (len > 4 * Math.PI) { res.nRunaway = (res.nRunaway || 0) + 1; continue; }
+    }
+    // 晶体系里几乎不动 (w 全程 < 1e-4, 即 0.006°) 却在天上拉出一段 (> 0.5°) 的弧: 同一个取向不会铺成一条天空弧 (一个 (α, h) 只落在锥上
+    //   两个点), 是追踪在 Φ 退化的方向上空走 (晕面快到最远处、有效区缩成一点时, 沿 σ 一路走到一个没找到过的 "漏端") —— 丢掉
+    //   (3-1-5 Parry Σ34.5 r≈16.73: 两条 3 点弧各跨 17°、125°, 网格里缝出一排尖刺)
+    if (a.W.length >= 2) {
+      let wSpan = 0;
+      for (const w of a.W) wSpan = Math.max(wSpan, dist(w, a.W[0]));
+      if (wSpan < 1e-4) {
+        const w0 = cx.world(a.W[0], a.Sig[0]), w1 = cx.world(a.W[a.W.length - 1], a.Sig[a.Sig.length - 1]);
+        if (w0 && w1 && w0.xi[0] * w1.xi[0] + w0.xi[1] * w1.xi[1] + w0.xi[2] * w1.xi[2] < Math.cos(0.5 * DEG)) { res.nDegenerate = (res.nDegenerate || 0) + 1; continue; }
+      }
+    }
     const o = {
       w: [], sigma: [], dir: [], p: [], alphaDeg: [], from: -1, to: -1,
       closed: a.Closed, viaLoop: a.ViaLoop, stop: a.Stop, foldIdx: [], foldP: [], foldDir: [],

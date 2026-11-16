@@ -821,8 +821,23 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     const VA = UA.map(pc => Object.assign(pieceVerts(A, pc), { noSelf: cutArc(pc) })), VB = UB.map(pc => Object.assign(pieceVerts(B, pc), { noSelf: cutArc(pc) }));
     const loneA = [], loneB = [];
     sewPass(VA, VB, false, null, loneA); sewPass(VB, VA, true, null, loneB);
-    // 只在对面一层这里什么都没有 (对不上的段全在这一侧) 时自缝: 两侧都有对不上的段是别的拓扑变化, 孤点只是离得远, 不是折回
-    return (VB.length ? runLen(loneA) : selfSew(loneA)) + (VA.length ? runLen(loneB) : selfSew(loneB));
+    // 只在对面一层这里什么都没有 (对不上的段全在这一侧) 时自缝: 两侧都有对不上的段是别的拓扑变化, 孤点只是离得远, 不是折回.
+    //   两侧都有时, 孤点串扇形收到对面最近的那个点上: 典型是闭环在两层之间张开成弧 (晕面几乎与球壳相切, r 差 0.004 m 轮廓在天上
+    //   挪好几度), 闭环上消失的那一段缩向边界线, 对面那层的弧端就在边界线上 (3-5-6-8 Lowitz Σ34.5 蓝边 2 r≈13.44:
+    //   闭环上 15° 的一段消失, 原来天上留一道 1°×4° 的缝). 截断出来的弧不收 (同自缝)
+    const fanTo = (runs, V) => {
+      let unc = 0;
+      for (const w of runs) {
+        if (w.fromCut || w.length < 2) { unc += runLen([w]); continue; }
+        let bv = -1, bd = 3 * LIM;
+        for (const x of V) for (const v of x.ids) for (const q of w) { const d = vang(q, v); if (d < bd) { bd = d; bv = v; } }
+        if (bv < 0) { unc += runLen([w]); continue; }
+        for (let i = 0; i + 1 < w.length; i++) emit(w[i], w[i + 1], bv);
+        stat.caps++;
+      }
+      return unc;
+    };
+    return (VB.length ? fanTo(loneA, VB) : selfSew(loneA)) + (VA.length ? fanTo(loneB, VA) : selfSew(loneB));
   };
   for (let k = 0; k + 1 < rows.length; k++) {
     const A = rows[k], B = rows[k + 1];
@@ -847,6 +862,11 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     const UA = [], UB = [];
     for (const pc of an.unA) { if (tiny(pc)) capTo(A, pc, false); else UA.push(pc); }
     for (const pc of an.unB) { if (tiny(pc)) capTo(B, pc, false); else UB.push(pc); }
+    // 一侧只剩一个闭环、对面什么也没有: 晕面像穹顶一样收成一点 (离眼最远 / 最近处与球壳在一点相切), 闭环收成扇形.
+    //   (两个闭环同时消失 —— 一里一外 —— 是一圈折回, 留给下面的同层自缝; 单个闭环对边的沿线距离只有直线的 π/2 倍, 自缝不缝它)
+    //   3-5-6-8 Parry Σ34.5: r≈14.43 处最后一层还剩 8.8° 的闭环, 原来中间留一个五边形的洞
+    if (!UB.length && UA.length === 1 && UA[0].loop) { capTo(A, UA[0], false); UA.length = 0; }
+    if (!UA.length && UB.length === 1 && UB[0].loop) { capTo(B, UB[0], false); UB.length = 0; }
     if (UA.length || UB.length) {
       const unc = looseSew(A, B, UA, UB);
       if (unc > 1.5 * SKY) { stat.loose++; stat.looseDeg += unc / DEG; }

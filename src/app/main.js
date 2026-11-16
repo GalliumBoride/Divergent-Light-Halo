@@ -1065,6 +1065,7 @@ function renderResults() {
     if (P.bdry) rows.push([t('res.bdry'), `${P.bdry.entry.length} / ${P.bdry.mirror.length} / ${P.bdry.tir.length}` + `<span class="lcount"> ${t('res.bdryKinds1')}</span>`]);
     if (P.edges) rows.push([t('res.bdry'), `${P.edges.entry.length} / ${P.edges.tir.length} / ${P.edges.seam.length} / ${P.edges.turn.length} / ${P.edges.cusp.length}` + `<span class="lcount"> ${t('res.bdryKinds2')}</span>`]);
     if (P.edges && P.edges.surf && P.edges.surf !== S.surf2) rows.push([t('res.surf'), t('res.surfFallback')]);
+    if (P.edges && P.edges.rank1) rows.push([t('res.surf'), t('res.rank1')]);
     const o = RO && S.lay.caustic ? RO.paths[ip] : null;
     if (o) rows.push([t('res.caustic'), `${o.ridge.length + o.ridgeInf.length}` + (S.lay.cSeam ? ` · ${t('res.seams')} ${o.seam.length}` : '')]);
     const sh = RS && S.shell.on ? RS.paths[ip] : null;

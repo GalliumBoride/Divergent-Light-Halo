@@ -111,6 +111,8 @@ export default {
   'res.bdryKinds1': ['掠入 / 镜面 / 出射', 'entry / mirror / exit'],
   'res.bdryKinds2': ['掠入 / 出射 / 接缝 / 转折 / 尖点', 'entry / exit / seam / turn / cusp'],
   'res.surf': ['曲面', 'surface'], 'res.surfFallback': ['这条光路没有选中的曲线, 已改用焦散', 'this path has no such curve; using the caustic'],
+  'res.rank1': ['这条光路在这种取向下降为一自由度: 天空方向只随一个角变, 另一个角只决定有效与否 —— 焦散就是整个晕面, 按各条边界曲线的像画 (没有焦散的边界线与外缘)',
+    'with this orientation family the path drops to one degree of freedom: the sky direction depends on one angle only, the other just decides validity — the caustic is the whole surface, drawn as the image of the boundary curves (no caustic boundary lines or rims)'],
   'res.caustic': ['焦散段', 'caustic arcs'], 'res.seams': ['边界像', 'images'],
   'res.shell': ['球壳', 'shell'], 'res.shellLine': ['{a} 弧 · {e} 末端 · {f} 折叠', '{a} arcs · {e} ends · {f} folds'],
   'res.dof1': ['一自由度', '1 DOF'], 'res.dof2': ['二自由度', '2 DOF'],

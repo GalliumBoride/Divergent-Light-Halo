@@ -453,6 +453,14 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
     const smp = insertFolds(samples, foldAt, mid, 24);
     const midM = memoMid(mid);                       // 两支的加密在同一串样本上二分: 同一对样本的中点只解一次
     for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], midM, Lden, 9, 24, sag));
+    // 碎段: 轨迹穿过锥分支有效性时断时续的一小块 (锥折叠旁), 出来一串两三个点、几厘米长的小段 —— 点数 ≤ 4 且短于所在半径 1% 的不要
+    tk.pts3 = tk.pts3.filter(pc => {
+      const p = pc.p, n = p.length / 3;
+      if (n > 4) return true;
+      let len = 0, rs = 0;
+      for (let i = 0; i < n; i++) { rs += Math.hypot(p[3 * i] - E[0], p[3 * i + 1] - E[1], p[3 * i + 2] - E[2]); if (i) len += Math.hypot(p[3 * i] - p[3 * i - 3], p[3 * i + 1] - p[3 * i - 2], p[3 * i + 2] - p[3 * i - 1]); }
+      return len >= 0.01 * rs / n;
+    });
   }
 }
 
@@ -967,6 +975,15 @@ export function computeDivergentEdges(path, m, fixedAng, surfId, lampElevDeg, la
     if (fenS === null) return tracks;
     const fname = fenS.name;
     const sceneAt = hd => { setSun(hd); return lightScene(refScene, FamC.make(m, fixedAng)); };
+    const DEG = Math.PI / 180, scCache = new Map();
+    const scAt = hd => {                         // 场景按 h 缓存几份 (差分雅可比在 h ± ε 与 h 之间来回)
+      let sc = scCache.get(hd);
+      if (sc) { setSun(hd); return sc; }
+      sc = sceneAt(hd);
+      if (scCache.size >= 6) scCache.delete(scCache.keys().next().value);
+      scCache.set(hd, sc);
+      return sc;
+    };
     const onTrack = (kind, hd, sol, eps) => {
       for (const tk of tracks) {
         if (tk.kind !== kind) continue;
@@ -994,7 +1011,28 @@ export function computeDivergentEdges(path, m, fixedAng, surfId, lampElevDeg, la
         if (fb === null) return null;
         return solveFF(sc, fa, fb, tk.eps, sd);
       };
-      extendTrack(tk, h0, sd0, slv, dh, cancelled);
+      if (!fine) { extendTrack(tk, h0, sd0, slv, dh, cancelled); return; }
+      // 修正版: 同焦散曲面的末端点轨迹, 当成 (h, w) 里的曲线 { 曲线 a = 0, 曲线 b = 0, |w|² = 1 } 做伪弧长延拓 ——
+      //   两个交点在某个 h 汇合消失 (h 方向的折叠) 时绕过去接着走另一支. 按 h 一步步走只能停在折叠前 (二分 10 次),
+      //   √ 区里两支的末端在天上还差好几度 (3-1-5-8 柱晶 ζ−90 Σ34.5 蓝边 1: 入射掠射线两支停在 h = ±32.2°, 天上差 9.5°,
+      //   离眼 12.4 m 对 18.1 m, 晕面边缘在那里成了一条直弦)
+      tk.slv = slv;
+      const b0 = slv(h0, sd0);
+      if (b0 === null) return;
+      const F = y => {
+        const sc = scAt(y[0] / DEG), w = [y[1], y[2], y[3]];
+        const fa = sc.Geo.find(f => f.name === fname) || null;
+        const fb = tk.kind === 'turn' ? (sc.Reach.find(f => f.name === otherName) || null) : (sc.Geo.find(f => f.name === otherName) || null);
+        if (fa === null || fb === null) return null;
+        const a = sc.P.fval(fa, w), b = sc.P.fval(fb, w);
+        return Number.isFinite(a) && Number.isFinite(b) ? [a, b, dot(w, w) - 1] : null;
+      };
+      const opt = { eps: 1e-7, stall: true, tol: [1e-12, 1e-12, 1e-13], maxCorr: 0.05, s0: 0.005, sMax: 0.02, sMin: 1e-7, maxN: 3000, cancelled,
+        valid: y => { if (Math.abs(y[0]) > 89 * DEG) return false; const sc = scAt(y[0] / DEG), w = [y[1], y[2], y[3]]; return sc.F.gram(w) >= -1e-9 && sc.minMargin(w) >= -1e-8; } };
+      const r = arcBoth(F, [h0 * DEG, ...b0], opt);
+      if (!r || r.ys.length < 3) { extendTrack(tk, h0, sd0, slv, dh, cancelled); return; }
+      tk.ys = r.ys; tk.arcF = F; tk.arcOpt = opt;
+      tk.hs = r.ys.map(y => y[0] / DEG); tk.sols = r.ys.map(y => [y[1], y[2], y[3]]);
     };
     for (const s0 of DIV_SEEDS)
       for (const hs of [s0, -s0]) {
@@ -1572,6 +1610,42 @@ export function lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg) {
   return { m, fx, P: new PathCtx(lpFaces) };
 }
 
+// ---- 降自由度: 二自由度取向族的平行光映射 (两个取向角) → 天空方向, 若雅可比处处只有一阶 (J ≡ 0), 天空方向只随一个角变,
+//   另一个角只决定有效与否 —— 如柱晶 3-5-6-8 (三次都在柱面上, 两次内反射合成绕 c 轴的转动, 进出两面成恒偏向棱镜:
+//   绕 c 轴转晶体不改变出射方向). 这时 "焦散" 就是整个晕面: 追 J = 0 的线是在舍入噪声里打转 (闭环尖点搜索与外缘要算
+//   好几分钟, 结果什么也没有). 晕面改按各条边界曲线的像画: 每个有效的 α, 有效的另一个角是一段区间, 两端都在边界曲线上,
+//   所以边界曲线的像之并就是整条天空像 (柱晶 3-5-6-8 Σ34.5: 有效取向的像离边界像最远 0.13°, 即取样间距).
+//   判据: 6 个太阳仰角 × 16×16 取向上的有效点 (至少 20 个) 里 |J| 最大 < 1e-8 (一般光路是 1 的量级; 柱晶 3-5-6-8 是 1e-11)
+const _rank1 = new Map();
+export function orientRank1(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg) {
+  const key = [lpFaces.join('-'), +!!zetaFree, fixedZetaDeg, fixedThetaDeg, LP.partial, LP.upperApexDeg, LP.lowerApexDeg, SqK].join('|');
+  let v = _rank1.get(key);
+  if (v !== undefined) return v;
+  const { m, fx, P } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
+  const keep = LP.TH * 180 / Math.PI;
+  let nv = 0, mx = 0;
+  try {
+    for (const h of [-50, -20, 0, 15, 35, 60]) {
+      setSun(h);
+      for (let i = 0; i < 16; i++) for (let j = 0; j < 16; j++) {
+        const u = (i + 0.37) / 16 * 2 * Math.PI, w = (j + 0.61) / 16 * 2 * Math.PI;
+        if (!validAt(P, m, fx, u, w, 0)) continue;
+        const J = jana3(u, w, m, fx, P);
+        if (Number.isFinite(J)) { nv++; mx = Math.max(mx, Math.abs(J)); }
+      }
+    }
+  } finally { setSun(keep); }
+  v = nv >= 20 && mx < 1e-8;
+  if (_rank1.size > 64) _rank1.clear();
+  _rank1.set(key, v);
+  return v;
+}
+/** 降自由度时代替焦散的曲面: 这条光路上存在的各条边界曲线 (SURF_IDS 里除焦散外, 光路上有的). 不降自由度 → null */
+export function rank1Fences(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg) {
+  if (!orientRank1(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg)) return null;
+  return SURF_IDS.filter(id => id !== 'caustic' && resolveSurface(lpFaces, id) === id);
+}
+
 /**
  * 2 自由度光锥: h 层 ih ∈ [from, to) (共 nH 层, h = −90..90). 每层 = 选定曲面 (焦散或某条篱笆) 的平行光曲线
  * → 锥映射. 返回 [{ curves: [Float32Array…], verts: Float32Array }] (每层一项); hFixed 给定时只算仰角 hFixed 一层.
@@ -1579,6 +1653,16 @@ export function lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg) {
  */
 export function lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, nGrid, maxDist,
   zetaFree, fixedZetaDeg, fixedThetaDeg, surfId, from = 0, to = nH, hFixed = null, fine = false) {
+  const rf = (surfId == null || surfId === 'caustic') ? rank1Fences(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg) : null;
+  if (rf) {                                         // 降自由度: 焦散 = 整个晕面 = 各边界曲线的像
+    let all = null;
+    for (const id of rf) {
+      const ls = lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, nGrid, maxDist, zetaFree, fixedZetaDeg, fixedThetaDeg, id, from, to, hFixed, fine);
+      if (!all) all = ls.map(l => ({ curves: [...l.curves], verts: Array.from(l.verts) }));
+      else ls.forEach((l, k) => { all[k].curves.push(...l.curves); all[k].verts.push(...l.verts); });
+    }
+    return (all || []).map(l => ({ curves: l.curves, verts: Float32Array.from(l.verts) }));
+  }
   const { m, fx, P } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
   const elevRad = lampElev * Math.PI / 180.0;
   const Lx = lampDist * Math.cos(elevRad), Lz = lampDist * Math.sin(elevRad);
@@ -1612,6 +1696,8 @@ export function lightCone2DofLayers(lpFaces, lampElev, lampDist, eyeHeight, nH, 
 
 /** 平行光弧 = 灯仰角处的平行光曲线, 投到远天球 (E + 200 m·D̂). */
 export function parallelArc2Dof(lpFaces, lampElev, eyeHeight, nGrid, zetaFree, fixedZetaDeg, fixedThetaDeg, surfId, fine = false) {
+  const rf = (surfId == null || surfId === 'caustic') ? rank1Fences(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg) : null;
+  if (rf) return rf.flatMap(id => parallelArc2Dof(lpFaces, lampElev, eyeHeight, nGrid, zetaFree, fixedZetaDeg, fixedThetaDeg, id, fine));
   const { m, fx, P } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
   const oldTH = LP.TH * 180 / Math.PI;
   const pArc = [];
@@ -1656,6 +1742,8 @@ export function parallelArc2Dof(lpFaces, lampElev, eyeHeight, nGrid, zetaFree, f
 export function edges2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist, zetaFree, fixedZetaDeg, fixedThetaDeg, surfId, cancelled = null, fine = false) {
   const { m, fx } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
   const out = { entry: [], tir: [], seam: [], turn: [], cusp: [], tracks: [] };
+  // 降自由度时焦散是整个晕面, 没有 "焦散的边界线" 可追 (追了只是在噪声里打转几分钟); 晕面按边界曲线的像画 (见 orientRank1)
+  if ((surfId == null || surfId === 'caustic') && orientRank1(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg)) { out.rank1 = true; return out; }
   const exact = computeDivergentEdges(lpFaces, m, fx, surfId, lampElev, lampDist, eyeHeight, maxDist, 0.5, true, cancelled, fine);
   const ownName = surfaceFenceName(lpFaces, surfId);
   for (const tk of exact) {
@@ -1705,6 +1793,7 @@ export function _debugCausticRuns(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg
  * 返回 [{ p, d }].
  */
 export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist, zetaFree, fixedZetaDeg, fixedThetaDeg, nGrid, cancelled = null) {
+  if (orientRank1(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg)) return [];      // 降自由度: 没有焦散外缘
   const { m, fx, P } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
   const se = lampElev * Math.PI / 180;
   const L = [lampDist * Math.cos(se), 0, lampDist * Math.sin(se)], E = [0, 0, eyeHeight];

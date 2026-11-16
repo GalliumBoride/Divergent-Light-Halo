@@ -6,7 +6,7 @@
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
-const eng = f => pathToFileURL(path.join(ROOT, 'src/engine', f)).href;
+const eng = f => process.env.ENGDIR ? pathToFileURL(path.join(process.env.ENGDIR, f)).href : pathToFileURL(path.join(ROOT, 'src/engine', f)).href;
 const BD = await import(eng('bdry4.js')), CR = await import(eng('crystal.js')), LPm = await import(eng('lp.js')), DS = await import(eng('divshell.js')), MS = await import(eng('mesh2s.js')), M1 = await import(eng('mesh1.js'));
 const SM = await import(eng('shellmesh.js')), CO = await import(eng('cone.js'));
 const PH = await import('./phys.mjs');
