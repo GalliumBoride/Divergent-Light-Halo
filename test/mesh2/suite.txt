@@ -35,3 +35,4 @@
 3-4-5 lowitz 10 15 caustic 0
 3-4-5 column 10 15 caustic -90
 3-5 column 10 15 caustic -90
+3-5 lowitz 15.5 15 entry 0

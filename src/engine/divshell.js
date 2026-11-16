@@ -1091,15 +1091,22 @@ function traceArcs(cx, seeds) {
     a.W.push(seeds[bk].w.slice()); a.Sig.push(seeds[bk].sigma); a.Xi.push(cx.xi(seeds[bk].w, seeds[bk].sigma));
     a.To = bk; a.Stop = 'end';
   };
+  //   比的是已知末端到弧上每一小段 (相邻两点连线) 的距离, 不只是到取样点: 尖端旁的小弧只有几个点, 一步就跨过了末端
+  //   (3-5 Parry Σ10 r≈6.15: 真弧 0.04° 之外多出 5° 长、4 个点的假弧)
+  const segD = (p, q, w) => {
+    const ex = q[0] - p[0], ey = q[1] - p[1], ez = q[2] - p[2], wx = w[0] - p[0], wy = w[1] - p[1], wz = w[2] - p[2], l2 = ex * ex + ey * ey + ez * ez;
+    let u = l2 > 0 ? (wx * ex + wy * ey + wz * ez) / l2 : 0; u = u < 0 ? 0 : u > 1 ? 1 : u;
+    return Math.hypot(wx - u * ex, wy - u * ey, wz - u * ez);
+  };
   const snapBack = (a, si, n0) => {
-    if (a.Stop !== 'missed_end' || a.W.length < 6) return;
+    if (a.Stop !== 'missed_end' || a.W.length < 2) return;
     let bk = -1, bi = -1, bd = 2e-3;
     for (let k = 0; k < n0; k++) {
       const q = seeds[k];
       if (k === si || q.isLoop || q.dead || q.missed) continue;
-      for (let i = 3; i < a.W.length - 1; i++) {
-        if (Math.abs(a.Sig[i] - q.sigma) > DSIG) continue;
-        const d = dist(a.W[i], q.w);
+      for (let i = 0; i + 1 < a.W.length - 1; i++) {
+        if (Math.abs(a.Sig[i] - q.sigma) > DSIG && Math.abs(a.Sig[i + 1] - q.sigma) > DSIG) continue;
+        const d = segD(a.W[i], a.W[i + 1], q.w);
         if (d < bd) { bd = d; bk = k; bi = i; }
       }
     }
