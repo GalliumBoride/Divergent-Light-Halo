@@ -37,6 +37,10 @@ function lightScene(reference, fam) {
 }
 
 function skyOfW(sc, w, eps) {
+  // ρ = Rᵀ·g 理应是单位向量. 可达带边界缩成一点时 (如 Lowitz 灯平射 h → 0: 可达带下界 ê·w = −1) ρ 的公式是 0/0, 由两个 ~1/|h|
+  //   的大数相减得到, |ρ| 偏离 1 —— 那样的 "取向" 与天空方向都是舍入噪声 (曾落成离对称面 50 m 的边界线点). 偏离超过 1e-6 就当无解
+  const rh = sc.F.rho(w, eps);
+  if (!(Math.abs(rh[0] * rh[0] + rh[1] * rh[1] + rh[2] * rh[2] - 1) < 1e-6)) return null;
   const E = sc.F.lift(w, eps);
   if (E === null) return null;
   const [e1, e2, e3] = E;
@@ -390,6 +394,13 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
     // 距它 1° 以内的 h 间隔再插 8 个样本 (以邻点为种子重解)
     // 弧长延拓的轨迹 (tk.ys): 中间点取在弦上该处垂直于弦的超平面与曲线的交点 (h 不单调、跨折叠也对)
     const RAD = Math.PI / 180, arc = !!tk.ys;
+    // 两个解之间的距离: 末端点 = 晶体系单位向量 w (欧氏), 尖点 = 取向角 (u, v) (按 2π 折回)
+    const solDist = (p, q) => {
+      let s = 0;
+      for (let k = 0; k < p.length; k++) { let d = p[k] - q[k]; if (tk.kind === 'cusp') d -= 2 * Math.PI * Math.round(d / (2 * Math.PI)); s += d * d; }
+      return Math.sqrt(s);
+    };
+    const between = (s, p, q) => { const l = 2 * solDist(p, q) + 1e-6; return solDist(s, p) <= l && solDist(s, q) <= l; };
     const fromY = y => ({ h: y[0] / RAD, sol: y.slice(1), y });
     const samples = [];
     for (let i = 0; i < tk.hs.length; i++) {
@@ -401,21 +412,29 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
           for (let k = 1; k < 8; k++) {
             if (arc) { const y = arcMid(tk.arcF, tk.ys[i], tk.ys[i + 1], k / 8, tk.arcOpt); if (y) samples.push(fromY(y)); continue; }
             const hk = ha + (hb - ha) * k / 8, sk = tk.slv(hk, seed);
-            if (sk) { samples.push({ h: hk, sol: sk }); seed = sk; }
+            if (sk && between(sk, tk.sols[i], tk.sols[i + 1])) { samples.push({ h: hk, sol: sk }); seed = sk; }
           }
         }
       }
     }
     // 超平面校正解不出时退回定 h 求解 (两端 h 不同 ⟹ 中间没有折叠)
+    // 定 h 重解 (Newton 从一端的解出发) 可能收敛到另一个交点 (例: 3-1-5-8 Lowitz 接缝面的转折缝, 对称取向上的解旁
+    //   还有一对离开对称面的解) —— 锥映射后是一个跳出去几十米的点, 画成一根横穿晕面的直线. 新解须落在两端的解附近
+    //   (到两端都不超过两端间距的 2 倍), 否则改从另一端出发, 还不行就当没有 (refineBranch 直接连两端)
+    const solMid = (h, a, b) => {
+      if (!tk.slv) return null;
+      let sol = tk.slv(h, a.sol);
+      if (sol && !between(sol, a.sol, b.sol)) { sol = tk.slv(h, b.sol); if (sol && !between(sol, a.sol, b.sol)) sol = null; }
+      return sol;
+    };
     const mid = arc ? (a, b) => {
       const y = arcMid(tk.arcF, a.y, b.y, 0.5, tk.arcOpt);
       if (y) return fromY(y);
-      if (a.h === b.h || !tk.slv) return null;
-      const h = 0.5 * (a.h + b.h), sol = tk.slv(h, a.sol);
+      if (a.h === b.h) return null;
+      const h = 0.5 * (a.h + b.h), sol = solMid(h, a, b);
       return sol ? fromY([h * RAD, ...sol]) : null;
     } : (a, b) => {
-      const h = 0.5 * (a.h + b.h);
-      const sol = tk.slv ? tk.slv(h, a.sol) : null;
+      const h = 0.5 * (a.h + b.h), sol = solMid(h, a, b);
       return sol ? { h, sol } : null;
     };
     const cache = new Map();

@@ -194,12 +194,27 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       // 再把连着触发的点聚成簇, 每簇一个折点. 闭环从一个不触发的点开始绕一圈 (跨过起点的簇不被拆成两半 ——
       //   拆开就在同一个折角两侧各出一个折点, 两者间距在去重阈值上下摆动, 相邻层时有时无); 整圈都触发 (比窗口还小的圈) 不算
       let cl = null;
+      // 一簇 → 折点. 簇里在最小触发尺度上触发的点若分成几串 (相隔不到一个大窗口的两个发夹弯, 大窗口下连成一簇), 每串一个折点
+      //   —— 否则灯旁挨得近的两条折叠线在某些层上并成一个折点, 线就断成几截
       const flush = () => {
         if (!cl) return;
-        let best = cl.i0, bv = -Infinity;
-        for (let k = cl.i0; k <= cl.i1; k++) { const v = dot(Ux(k), cl.a); if (v > bv) { bv = v; best = k; } }
-        const bi = closed ? ((best % n) + n) % n : best;
-        if (closed || (S[bi] > FOLDW && S[n - 1] - S[bi] > FOLDW)) arc.sp.push(mk(S[bi], 'fold', uAt(bi)));
+        const subs = [];
+        let cur = null;
+        for (let k = cl.i0; k <= cl.i1; k++) {
+          const i = closed ? ((k % n) + n) % n : k;
+          if (KT[i] === cl.k) {
+            if (!cur) subs.push(cur = { i0: k, i1: k, a: DIR[i], cmin: CS[i] });
+            else { cur.i1 = k; if (CS[i] < cur.cmin) { cur.cmin = CS[i]; cur.a = DIR[i]; } }
+          } else cur = null;
+        }
+        for (const sb of subs) {
+          // 尖: 沿该串最尖处的 "来向 − 去向" 投影最远的点, 在这一串两侧各放宽到簇的边界之内找
+          const lo2 = Math.max(cl.i0, sb.i0 - (sb.i1 - sb.i0) - 2), hi2 = Math.min(cl.i1, sb.i1 + (sb.i1 - sb.i0) + 2);
+          let best = sb.i0, bv = -Infinity;
+          for (let k = subs.length > 1 ? lo2 : cl.i0; k <= (subs.length > 1 ? hi2 : cl.i1); k++) { const v = dot(Ux(k), sb.a); if (v > bv) { bv = v; best = k; } }
+          const bi = closed ? ((best % n) + n) % n : best;
+          if (closed || (S[bi] > FOLDW && S[n - 1] - S[bi] > FOLDW)) arc.sp.push(mk(S[bi], 'fold', uAt(bi)));
+        }
         cl = null;
       };
       let s0 = lo;
@@ -750,37 +765,64 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     for (let i = 0; i + 1 < V.ids.length; i++) emit(V.ids[i], V.ids[i + 1], c);
     stat.caps++;
   };
-  // 对不上的段 (相邻两层几乎重合时): 每个点找对面对不上的段上视方向最近的点 (LIM 之内), 同一段上脚点单调的一串一串拉链
+  // 对不上的段 (相邻两层几乎重合时): 每个点找对面对不上的段上视方向最近的点 (LIM 之内), 同一段上脚点单调的一串一串拉链.
+  //   ok(w, i, q, j) 可再筛候选 (同一层自缝时排除沿线的近邻). 对面一个候选也没有的点连成串, 放进 lone (调用方再处理)
   const LIM = 2.5 * GAPSKY;
-  const looseSew = (A, B, UA, UB) => {
-    const VA = UA.map(pc => pieceVerts(A, pc)), VB = UB.map(pc => pieceVerts(B, pc));
-    let unc = 0;
-    const pass = (S, T, flip) => {
-      S.forEach(w => {
-        const ft = w.ids.map(v => { let bq = -1, bj = -1, bd = LIM; T.forEach((x, q) => { for (let j = 0; j < x.ids.length; j++) { const d = vang(v, x.ids[j]); if (d < bd) { bd = d; bq = q; bj = j; } } }); return bq < 0 ? null : [bq, bj]; });
-        for (let s0 = 0; s0 < ft.length;) {
-          if (!ft[s0]) { if (s0 + 1 < w.ids.length) unc += vang(w.ids[s0], w.ids[s0 + 1]); s0++; continue; }
-          let e = s0, dir = 0;
-          while (e + 1 < ft.length && ft[e + 1] && ft[e + 1][0] === ft[s0][0]) {
-            const sg = Math.sign(ft[e + 1][1] - ft[e][1]);
-            if ((sg && dir && sg !== dir) || Math.abs(ft[e + 1][1] - ft[e][1]) > 12) break;
-            if (sg) dir = sg; e++;
-          }
-          if (e > s0) {
-            const x = T[ft[s0][0]], j0 = ft[s0][1], j1 = ft[e][1], st = j1 >= j0 ? 1 : -1, Q = [];
-            for (let j = j0; j !== j1 + st; j += st) Q.push(x.ids[j]);
-            const P = w.ids.slice(s0, e + 1);
-            const a = { ids: flip ? Q : P, fr: (flip ? Q : P).map((_, k, arr) => k / Math.max(1, arr.length - 1)) };
-            const b = { ids: flip ? P : Q, fr: (flip ? P : Q).map((_, k, arr) => k / Math.max(1, arr.length - 1)) };
-            zipFr(a, b);
-          }
-          s0 = Math.max(e, s0 + 1);
+  const sewPass = (S, T, flip, ok, lone) => {
+    S.forEach((w, wi) => {
+      const ft = w.ids.map((v, i) => { let bq = -1, bj = -1, bd = LIM; T.forEach((x, q) => { for (let j = 0; j < x.ids.length; j++) { if (ok && !ok(wi, i, q, j)) continue; const d = vang(v, x.ids[j]); if (d < bd) { bd = d; bq = q; bj = j; } } }); return bq < 0 ? null : [bq, bj]; });
+      // 截断出来的弧 (带截断切口) 上的孤点串标上 fromCut, 不自缝: 那是截断球面把轮廓一点点切短, 不是曲面折回
+      //   (外界 r = 截断距离 + 灯距处曾把左右两段缝到一起)
+      if (lone) { let run = null; const push = rn => { if (w.noSelf) rn.fromCut = true; lone.push(rn); }; for (let i = 0; i < ft.length; i++) { if (!ft[i]) (run || (run = [])).push(w.ids[i]); else if (run) { push(run); run = null; } } if (run) push(run); }
+      for (let s0 = 0; s0 < ft.length;) {
+        if (!ft[s0]) { s0++; continue; }
+        let e = s0, dir = 0;
+        while (e + 1 < ft.length && ft[e + 1] && ft[e + 1][0] === ft[s0][0]) {
+          const sg = Math.sign(ft[e + 1][1] - ft[e][1]);
+          if ((sg && dir && sg !== dir) || Math.abs(ft[e + 1][1] - ft[e][1]) > 12) break;
+          if (sg) dir = sg; e++;
         }
-      });
+        if (e > s0) {
+          const x = T[ft[s0][0]], j0 = ft[s0][1], j1 = ft[e][1], st = j1 >= j0 ? 1 : -1, Q = [];
+          for (let j = j0; j !== j1 + st; j += st) Q.push(x.ids[j]);
+          const P = w.ids.slice(s0, e + 1);
+          const a = { ids: flip ? Q : P, fr: (flip ? Q : P).map((_, k, arr) => k / Math.max(1, arr.length - 1)) };
+          const b = { ids: flip ? P : Q, fr: (flip ? P : Q).map((_, k, arr) => k / Math.max(1, arr.length - 1)) };
+          zipFr(a, b);
+        }
+        s0 = Math.max(e, s0 + 1);
+      }
+    });
+  };
+  const runLen = runs => { let s = 0; for (const w of runs) for (let i = 0; i + 1 < w.length; i++) s += vang(w[i], w[i + 1]); return s; };
+  // 同一层里对不上、对面也没有可缝的点 (lone 串): 曲面在这一层与相邻一层之间到了离眼最远 (或最近) 处折回 —— 这一层的两条轮廓
+  //   (或一条闭环的两侧) 在两层之间汇合消失, 中间那条带子是折回处. 把两侧直接缝上 (带子在这一层的球面上, 离真曲面不超过
+  //   两层的半径差). 候选: 别的串上, 或同一串上沿线隔得远 (沿线弧长 > 3 倍直线角距, 且隔 3 个点以上) 的点. 返回仍没缝上的长度
+  const selfSew = runs0 => {
+    const runs = runs0.filter(w => !w.fromCut);
+    let cutLen = runLen(runs0.filter(w => w.fromCut));
+    if (!runs.length) return cutLen;
+    const V = runs.map(ids => {
+      const c = [0];
+      for (let k = 1; k < ids.length; k++) c.push(c[k - 1] + vang(ids[k - 1], ids[k]));
+      return { ids, c };
+    });
+    const ok = (a, i, b, j) => {
+      if (a !== b) return true;
+      if (Math.abs(i - j) < 3) return false;
+      return Math.abs(V[a].c[i] - V[a].c[j]) > 3 * vang(V[a].ids[i], V[a].ids[j]);
     };
-    if (VA.length && VB.length) { pass(VA, VB, false); pass(VB, VA, true); }
-    else for (const w of VA.length ? VA : VB) for (let i = 0; i + 1 < w.ids.length; i++) unc += vang(w.ids[i], w.ids[i + 1]);
-    return unc;
+    const lone = [];
+    sewPass(V, V, false, ok, lone);
+    return runLen(lone) + cutLen;
+  };
+  const looseSew = (A, B, UA, UB) => {
+    const cutArc = pc => pc.arc.sp.some(q => q.type === 'cut');
+    const VA = UA.map(pc => Object.assign(pieceVerts(A, pc), { noSelf: cutArc(pc) })), VB = UB.map(pc => Object.assign(pieceVerts(B, pc), { noSelf: cutArc(pc) }));
+    const loneA = [], loneB = [];
+    sewPass(VA, VB, false, null, loneA); sewPass(VB, VA, true, null, loneB);
+    // 只在对面一层这里什么都没有 (对不上的段全在这一侧) 时自缝: 两侧都有对不上的段是别的拓扑变化, 孤点只是离得远, 不是折回
+    return (VB.length ? runLen(loneA) : selfSew(loneA)) + (VA.length ? runLen(loneB) : selfSew(loneB));
   };
   for (let k = 0; k + 1 < rows.length; k++) {
     const A = rows[k], B = rows[k + 1];
@@ -819,8 +861,42 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     if (!c) { c = { kind: q.type, pts: [], dirs: [] }; chains.set(q.chain, c); }
     c.pts.push(...q.p); c.dirs.push(...q.u);
   }
+  // 折叠线只画延续得够长的: 径向跨度不到所在半径 15% 的 (且两头都不碰这一段的半径边界 —— 碰到的可能接着下一段) 不画.
+  //   这类短链多是球壳与晕面相切 (鞍点) 处的假折点: 两条交叉的轮廓在切点重新连成 )(, 刚分开时双曲线顶点尖得像折点,
+  //   半径稍一变就钝了 (3-4-5 Lowitz 入射面: r 3.158–3.535, 天空里却横扫 30°). 它们仍是网格的顶点, 只是不当成晕面的折痕画出来
+  const rLo = rows.length ? rows[0].r : 0, rHi = rows.length ? rows[rows.length - 1].r : 0;
+  // 链在天空里相邻两步的方向差 > 45° 处切开 (两条挨着的折叠线在灯前汇成一个折点时, 链会从一条跳到另一条), 取最长的一截
+  const kinkCut = c => {
+    const n = c.dirs.length / 3;
+    if (n < 4) return c;
+    const st = [];
+    for (let i = 0; i + 1 < n; i++) st.push([c.dirs[3 * i + 3] - c.dirs[3 * i], c.dirs[3 * i + 4] - c.dirs[3 * i + 1], c.dirs[3 * i + 5] - c.dirs[3 * i + 2]]);
+    const cuts = [0];
+    let prev = -1;
+    for (let i = 0; i < st.length; i++) {
+      const l = Math.hypot(...st[i]);
+      if (l < 1e-6) continue;
+      if (prev >= 0 && dot(st[prev], st[i]) < 0.7 * Math.hypot(...st[prev]) * l) cuts.push(i + 1);
+      prev = i;
+    }
+    if (cuts.length === 1) return c;
+    cuts.push(n);
+    let b = 0;
+    for (let k = 1; k + 1 < cuts.length; k++) if (cuts[k + 1] - cuts[k] > cuts[b + 1] - cuts[b]) b = k;
+    return { kind: c.kind, pts: c.pts.slice(3 * cuts[b], 3 * cuts[b + 1]), dirs: c.dirs.slice(3 * cuts[b], 3 * cuts[b + 1]) };
+  };
   const special = [];
-  for (const c of chains.values()) if (c.pts.length >= 6) { special.push({ kind: c.kind, p: Float32Array.from(c.pts), d: Float32Array.from(c.dirs) }); if (c.kind === 'fold') stat.folds++; else stat.focal++; }
+  for (const c0 of chains.values()) {
+    const c = c0.kind === 'fold' ? kinkCut(c0) : c0;
+    if (c.pts.length < 6) continue;
+    if (c.kind === 'fold') {
+      const n = c.pts.length / 3, ra = Math.hypot(c.pts[0] - E[0], c.pts[1] - E[1], c.pts[2] - E[2]), rb = Math.hypot(c.pts[3 * n - 3] - E[0], c.pts[3 * n - 2] - E[1], c.pts[3 * n - 1] - E[2]);
+      const r0 = Math.min(ra, rb), r1 = Math.max(ra, rb), edge = r0 <= rLo * (1 + 1e-6) || r1 >= rHi * (1 - 1e-6);
+      if (!edge && r1 - r0 < 0.15 * 0.5 * (r0 + r1)) { stat.foldsHidden = (stat.foldsHidden || 0) + 1; continue; }
+    }
+    special.push({ kind: c.kind, p: Float32Array.from(c.pts), d: Float32Array.from(c.dirs) });
+    if (c.kind === 'fold') stat.folds++; else stat.focal++;
+  }
 
   // ---- 输出: 每个三角形三个顶点依次排; 法向 = 共顶点且朝向相近 (夹角 < 60°) 的面法向之和 (至多看 48 个)
   const nT = tris.length / 3, pos = new Float32Array(9 * nT), dir = new Float32Array(9 * nT), hh = new Float32Array(3 * nT), nrm = new Float32Array(9 * nT);
