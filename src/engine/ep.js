@@ -67,6 +67,15 @@ function adj3(P) {
   return [cross(c2, c3), cross(c3, c1), cross(c1, c2)];
 }
 
+// adj3 的不分配版: P、A 按行存的 3×3 (A 的行 = 列叉积, 与 adj3 逐位相同)
+const _NQ = new Float64Array(9), _NR = new Float64Array(9), _NA = new Float64Array(9), _NB = new Float64Array(9);
+function adjInto(P, A) {
+  const P00 = P[0], P01 = P[1], P02 = P[2], P10 = P[3], P11 = P[4], P12 = P[5], P20 = P[6], P21 = P[7], P22 = P[8];
+  A[0] = P11 * P22 - P21 * P12; A[1] = P21 * P02 - P01 * P22; A[2] = P01 * P12 - P11 * P02;
+  A[3] = P12 * P20 - P22 * P10; A[4] = P22 * P00 - P02 * P20; A[5] = P02 * P10 - P12 * P00;
+  A[6] = P10 * P21 - P20 * P11; A[7] = P20 * P01 - P00 * P21; A[8] = P00 * P11 - P10 * P01;
+}
+
 function mul(M, v) {
   return [
     M[0][0] * v[0] + M[0][1] * v[1] + M[0][2] * v[2],
@@ -135,35 +144,46 @@ class PathC {
   }
 
   // 焦散: N_a, N_b  (adj(Φ) 对 λ=−qE/TE 严格仿射; Ĵ = TE·(Na·Λ) − qE·(Nb·Λ))
+  //   热路径 (焦散函数每次求值都走这里): 不分配, 逐元素按原来的运算次序 (含与 0 相乘、加 0 的项), 结果逐位相同.
+  //   返回的是本光路的暂存对象, 下一次调用就覆盖 —— 调用方马上读完, 不留引用
   naNb(w) {
-    const { X, S, qE, TE, Dc } = this.chainW(w);
     const U0 = this.U0, UE = this.UE, LE = this.LE, CE = this.CE, Lm = this.Lm, Vv = this.Vv;
+    const w0 = w[0], w1 = w[1], w2 = w[2];
+    // = chainW(w) 的 X, S, qE, TE, Dc
+    const X = U0[0] * w0 + U0[1] * w1 + U0[2] * w2, S = Math.sqrt(X * X + K);
+    const qE = LE[0] * w0 + LE[1] * w1 + LE[2] * w2 + this.CE * S;
+    const t2 = qE * qE - K;
+    const TE = t2 >= 0 ? Math.sqrt(t2) : (t2 > -1e-11 ? 0.0 : NaN);
+    const P0 = Lm[0][0] * w0 + Lm[0][1] * w1 + Lm[0][2] * w2 + S * Vv[0];
+    const P1 = Lm[1][0] * w0 + Lm[1][1] * w1 + Lm[1][2] * w2 + S * Vv[1];
+    const P2 = Lm[2][0] * w0 + Lm[2][1] * w1 + Lm[2][2] * w2 + S * Vv[2];
+    const tEv = -qE - TE;
+    const D0 = P0 + tEv * UE[0], D1 = P1 + tEv * UE[1], D2 = P2 + tEv * UE[2];
     const xs = X / S;
-    const g = [LE[0] + xs * CE * U0[0], LE[1] + xs * CE * U0[1], LE[2] + xs * CE * U0[2]];
-    const M1 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-    for (let i = 0; i < 3; i++)
-      for (let j = 0; j < 3; j++)
-        M1[i][j] = Lm[i][j] + Vv[i] * xs * U0[j] - UE[i] * g[j];
-    const Wx = [[0, -w[2], w[1]], [w[2], 0, -w[0]], [-w[1], w[0], 0]];
-    const Dx = [[0, -Dc[2], Dc[1]], [Dc[2], 0, -Dc[0]], [-Dc[1], Dc[0], 0]];
-    const Phi1 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-    for (let i = 0; i < 3; i++)
-      for (let j = 0; j < 3; j++) {
-        let s = 0;
-        for (let t = 0; t < 3; t++) s += M1[i][t] * Wx[t][j];
-        Phi1[i][j] = s - Dx[i][j];
-      }
-    const gxw = cross(g, w);
-    const Phi2 = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-    for (let i = 0; i < 3; i++)
-      for (let j = 0; j < 3; j++)
-        Phi2[i][j] = Phi1[i][j] + UE[i] * gxw[j];
-    const aj1 = adj3(Phi1), aj2 = adj3(Phi2);
-    const Na = mul(aj1, Dc);
-    const dj = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) dj[i][j] = aj2[i][j] - aj1[i][j];
-    const Nb = mul(dj, Dc);
-    return { Na, Nb, qE, TE, Dc };
+    const g0 = LE[0] + xs * CE * U0[0], g1 = LE[1] + xs * CE * U0[1], g2 = LE[2] + xs * CE * U0[2];
+    const gx0 = g1 * w2 - g2 * w1, gx1 = g2 * w0 - g0 * w2, gx2 = g0 * w1 - g1 * w0;      // g × w
+    const nw0 = -w0, nw1 = -w1, nw2 = -w2;
+    const Q = _NQ, R = _NR;                    // Φ1 = M1·[w]× − [Dc]×,  Φ2 = Φ1 + UE (g×w)ᵀ  (按行存)
+    for (let i = 0; i < 3; i++) {
+      const L = Lm[i], vx = Vv[i] * xs, ue = UE[i];
+      const m0 = L[0] + vx * U0[0] - ue * g0, m1 = L[1] + vx * U0[1] - ue * g1, m2 = L[2] + vx * U0[2] - ue * g2;
+      const s0 = 0 + m0 * 0 + m1 * w2 + m2 * nw1;
+      const s1 = 0 + m0 * nw2 + m1 * 0 + m2 * w0;
+      const s2 = 0 + m0 * w1 + m1 * nw0 + m2 * 0;
+      const d0 = i === 0 ? 0 : i === 1 ? D2 : -D1, d1 = i === 0 ? -D2 : i === 1 ? 0 : D0, d2 = i === 0 ? D1 : i === 1 ? -D0 : 0;
+      const q0 = s0 - d0, q1 = s1 - d1, q2 = s2 - d2;
+      Q[3 * i] = q0; Q[3 * i + 1] = q1; Q[3 * i + 2] = q2;
+      R[3 * i] = q0 + ue * gx0; R[3 * i + 1] = q1 + ue * gx1; R[3 * i + 2] = q2 + ue * gx2;
+    }
+    adjInto(Q, _NA); adjInto(R, _NB);
+    const A = _NA, B = _NB, o = this._nb || (this._nb = { Na: [0, 0, 0], Nb: [0, 0, 0], qE: 0, TE: 0, Dc: [0, 0, 0] });
+    for (let i = 0; i < 3; i++) {
+      const a0 = A[3 * i], a1 = A[3 * i + 1], a2 = A[3 * i + 2];
+      o.Na[i] = a0 * D0 + a1 * D1 + a2 * D2;
+      o.Nb[i] = (B[3 * i] - a0) * D0 + (B[3 * i + 1] - a1) * D1 + (B[3 * i + 2] - a2) * D2;
+    }
+    o.qE = qE; o.TE = TE; o.Dc[0] = D0; o.Dc[1] = D1; o.Dc[2] = D2;
+    return o;
   }
 
   fval(f, w) {
@@ -660,6 +680,9 @@ function solveCausticFence(sc, fen, eps, n) {
       for (let t = 0; t < 70; t++) {
         const wm = projectFence(sc, fen, scl(add(wa, wb), 0.5));
         if (wm === null) break;
+        // 中点与一端逐位相同: 这一步 (以及之后每一步) 什么都不改 —— wa 端: Ĵ 同号 (fa ≠ 0) 仍是 wa; wb 端: 仍异号仍是 wb.
+        //   提前结束, 结果与跑满 70 次相同
+        if ((fa !== 0 && wm[0] === wa[0] && wm[1] === wa[1] && wm[2] === wa[2]) || (wm[0] === wb[0] && wm[1] === wb[1] && wm[2] === wb[2])) break;
         const fm = sc.jhatW(wm, eps);
         if (Number.isNaN(fm)) break;
         if (fa * fm <= 0) wb = wm; else { wa = wm; fa = fm; }
@@ -945,7 +968,7 @@ function findCusps(sc, seedsUV, seedFens) {
  * 末端点 (end/turn/cross/cusp). 记录 { kind, label, W, eps, sc, sw (deg), D, az, el }.
  * @param {number[]} faces 光路面号
  */
-export function computeEndpoints(faces, m, fixedAng, withCusps = true) {
+export function computeEndpoints(faces, m, fixedAng, withCusps = true, withCaustic = true) {
   const recs = [];
   const fam = FamC.make(m, fixedAng);
   if (fam === null) return recs;
@@ -996,19 +1019,20 @@ export function computeEndpoints(faces, m, fixedAng, withCusps = true) {
     for (const rf of sc.Reach)
       for (const w of solveLL(sc, fen, rf))
         addPt(w, +1, 'turn', fen.name + '∩' + rf.name);
-  // (c) 焦散 ∩ 几何曲线
-  for (const fen of sc.Geo)
+  // (c) 焦散 ∩ 几何曲线 (withCaustic = false: 调用方只要篱笆 ∩ 篱笆 / 可达带, (c)(d)(e) 都不算 ——
+  //   (a)(b) 的记录先加, 不受后面影响; 只是标签里少了重合的焦散交点, 而那种调用方本来就跳过焦散的部分)
+  if (withCaustic) for (const fen of sc.Geo)
     for (let e = 0; e < 2; e++) {
       const eps = e === 0 ? 1 : -1;
       for (const w of solveCausticFence(sc, fen, eps, 1600))
         addPt(w, eps, fen.side !== 0 ? 'end' : 'cross', '焦散∩' + fen.name);
     }
   // (d) 焦散 ∩ 可达带圆 = 转折
-  for (const rf of sc.Reach)
+  if (withCaustic) for (const rf of sc.Reach)
     for (const w of solveCausticFence(sc, rf, +1, 1600))
       addPt(w, +1, 'turn', '焦散∩' + rf.name);
   // (e) 尖点: 从焦散 end/turn 种子沿曲线追踪
-  if (withCusps) {
+  if (withCusps && withCaustic) {
     const seedsUV = [], seedFens = [];
     for (const r of recs) {
       if (!r.label.includes('焦散')) continue;

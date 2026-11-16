@@ -37,7 +37,8 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   const CAPMAX = 1 * DEG, VBUDGET = opt.budget || 90000;
   const EPSR = opt.epsR || 5e-4, CRIT = 2e-4, PINL = opt.pinLamp || 1e-3;
   const MAXCALLS = opt.maxCalls || 900, MAXROWS = opt.maxRows || 700;
-  const FOLDW = Math.max(0.05 * DEG, 0.25 * SKY);          // 折点检测: 前后各沿线走这么长 (天空弧长) 比方向
+  const FOLDW = Math.max(0.05 * DEG, 0.25 * SKY);          // 折点检测: 前后各沿线走这么长 (天空弧长) 比方向 (最小尺度)
+  const CORNW = Math.max(FOLDW, SKY), FOLDC = Math.cos(100 * DEG);   // 最大尺度; 两段弦夹角超过 120° (最小尺度) / 100° (更大尺度) 算折回
   const tol3 = r => 0.01 + 1e-3 * r;                       // 三维容差 (弦高、径向弯曲)
   const cancelled = opt.cancelled || null;
   const log = opt.log || null;
@@ -155,32 +156,59 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     if (!closed) { arc.sp.push(mk(0, headType, uAt(0))); arc.sp.push(mk(S[n - 1], tailType, uAt(n - 1))); }
     // 接头 (引擎分段给的同一条轮廓并接处; 退化弧两侧的两支在焦点处相接 —— 两张面交于焦线): 也是特殊点, 段在这里切开
     for (const j of joints) if ((j > 0 && j < n - 1) || closed) arc.sp.push(mk(S[Math.min(j, n - 1)], 'joint', uAt(Math.min(j, n - 1))));
-    // 折点: 前后各沿线走 FOLDW 的两段弦反向 (夹角 > 120°); 连着几个点都满足的取最尖的那个 (沿来向投影最远)
+    // 折点 (轮廓在天空里折回 —— 曲面的折痕): 前后各沿线走 W 的两段弦夹角 > 120° (W = FOLDW) 或 > 100° (W = 2·FOLDW … 到一个天空步长)
+    //   (多尺度: 眼旁折痕尖到点距以下, 离眼远了变成圆角 —— 圆角半径还小于天空步长时网格照样需要一个顶点在尖上);
+    //   连着几个点都满足的取最尖的那个 (沿 "来向 − 去向" 投影最远)
     if (n >= 5 && len > 2 * FOLDW) {
       const Sx = k => closed ? (k < 0 ? S[k + n] - len : k >= n ? S[k - n] + len : S[k]) : S[k];
       const Ux = k => uAt(closed ? ((k % n) + n) % n : k);
       const lo = closed ? 0 : 1, hi = closed ? n : n - 1;
-      let h = lo - 1, j = lo + 1, cl = null;
+      const WS = [FOLDW];
+      // 大尺度只用在比窗口长得多的弧上 (闭环 16 倍、开弧 8 倍): 灯旁一两度的小圈上, 大窗口处处 "折回", 认出的折点没有意义
+      while (WS.length < 4 && 2 * WS[WS.length - 1] <= CORNW * 1.0001 && 2 * WS[WS.length - 1] <= (closed ? 1 / 16 : 1 / 8) * len) WS.push(2 * WS[WS.length - 1]);
+      const hs = WS.map(() => lo - 1), js = WS.map(() => lo + 1);
+      // 先逐点算: 触发的最小尺度 KT (−1 = 不触发)、该尺度的余弦与尖的方向
+      const KT = new Int8Array(n).fill(-1), CS = new Float64Array(n), DIR = new Array(n);
+      for (let i = lo; i < hi; i++) {
+        if (!closed && (S[i] < FOLDW || S[n - 1] - S[i] < FOLDW)) continue;
+        const ui = Ux(i);
+        for (let w = 0; w < WS.length; w++) {
+          const W = WS[w];
+          if (!closed && (S[i] < W || S[n - 1] - S[i] < W)) break;
+          let h = hs[w], j = js[w];
+          while (Sx(i) - Sx(h) > W && h < i - 1) h++;
+          while (Sx(i) - Sx(h) < W && h > i - n) h--;
+          if (j <= i) j = i + 1;
+          while (Sx(j) - Sx(i) < W && j < i + n - 1 && (closed || j < n - 1)) j++;
+          hs[w] = h; js[w] = j;
+          const uh = Ux(h), uj = Ux(j);
+          const a = [ui[0] - uh[0], ui[1] - uh[1], ui[2] - uh[2]], b = [uj[0] - ui[0], uj[1] - ui[1], uj[2] - ui[2]];
+          const la = Math.hypot(a[0], a[1], a[2]), lb = Math.hypot(b[0], b[1], b[2]);
+          if (la < 1e-12 || lb < 1e-12) continue;
+          const cs = dot(a, b) / (la * lb);
+          // 触发的最小尺度定尖的方向: 真尖点 (小窗口就折回) 用小窗口的弦, 尖取得准 (大窗口的弦带着两支的弯曲, 尖会偏);
+          //   只有大窗口才折回的圆角才用大窗口
+          if (cs < (w ? FOLDC : -0.5)) { KT[i] = w; CS[i] = cs; DIR[i] = unit([a[0] / la - b[0] / lb, a[1] / la - b[1] / lb, a[2] / la - b[2] / lb]); break; }
+        }
+      }
+      // 再把连着触发的点聚成簇, 每簇一个折点. 闭环从一个不触发的点开始绕一圈 (跨过起点的簇不被拆成两半 ——
+      //   拆开就在同一个折角两侧各出一个折点, 两者间距在去重阈值上下摆动, 相邻层时有时无); 整圈都触发 (比窗口还小的圈) 不算
+      let cl = null;
       const flush = () => {
         if (!cl) return;
         let best = cl.i0, bv = -Infinity;
         for (let k = cl.i0; k <= cl.i1; k++) { const v = dot(Ux(k), cl.a); if (v > bv) { bv = v; best = k; } }
         const bi = closed ? ((best % n) + n) % n : best;
-        if (closed || (S[bi] > FOLDW && S[n - 1] - S[bi] > FOLDW)) { const f = mk(S[bi], 'fold', uAt(bi)); f.sharp = -cl.cmin; arc.sp.push(f); }
+        if (closed || (S[bi] > FOLDW && S[n - 1] - S[bi] > FOLDW)) arc.sp.push(mk(S[bi], 'fold', uAt(bi)));
         cl = null;
       };
-      for (let i = lo; i < hi; i++) {
-        if (!closed && (S[i] < FOLDW || S[n - 1] - S[i] < FOLDW)) { flush(); continue; }
-        while (Sx(i) - Sx(h) > FOLDW && h < i - 1) h++;
-        while (Sx(i) - Sx(h) < FOLDW && h > i - n) h--;
-        if (j <= i) j = i + 1;
-        while (Sx(j) - Sx(i) < FOLDW && j < i + n - 1 && (closed || j < n - 1)) j++;
-        const ui = Ux(i), uh = Ux(h), uj = Ux(j);
-        const a = [ui[0] - uh[0], ui[1] - uh[1], ui[2] - uh[2]], b = [uj[0] - ui[0], uj[1] - ui[1], uj[2] - ui[2]];
-        const la = Math.hypot(a[0], a[1], a[2]), lb = Math.hypot(b[0], b[1], b[2]);
-        if (la > 1e-12 && lb > 1e-12 && dot(a, b) < -0.5 * la * lb) {
-          const cs = dot(a, b) / (la * lb);
-          if (!cl) cl = { i0: i, i1: i, a: [a[0] / la, a[1] / la, a[2] / la], cmin: cs }; else { cl.i1 = i; cl.cmin = Math.min(cl.cmin, cs); }
+      let s0 = lo;
+      if (closed) { s0 = -1; for (let i = 0; i < n; i++) if (KT[i] < 0) { s0 = i; break; } }
+      if (s0 >= 0) for (let q = closed ? s0 + 1 : lo; q < (closed ? s0 + n : hi); q++) {
+        const i = closed ? q % n : q, kt = KT[i];
+        if (kt >= 0) {
+          if (!cl) cl = { i0: q, i1: q, a: DIR[i], cmin: CS[i], k: kt };
+          else { cl.i1 = q; if (kt < cl.k || (kt === cl.k && CS[i] < cl.cmin)) { cl.cmin = CS[i]; cl.a = DIR[i]; cl.k = kt; } }
         } else flush();
       }
       flush();
@@ -555,7 +583,7 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   for (let pass = 0; pass < 28; pass++) {
     relink(rows);
     const ins = new Map(), over = vEst(rows) > 2.5 * VBUDGET;
-    const AN = [];
+    const AN = [], why = { ev: 0, gap: 0, lamp: 0, line: 0, rad: 0, radR: [] };
     for (let k = 0; k + 1 < rows.length; k++) {
       const A = rows[k], B = rows[k + 1];
       if (!A.arcs.length && !B.arcs.length && !A.sp.length && !B.sp.length) { AN.push(null); continue; }
@@ -563,10 +591,10 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       AN.push(an);
       if (pairSkip(A, B)) continue;
       const ratio = B.r / A.r - 1, mid = Math.sqrt(A.r * B.r);
-      if (an.event) { if (ratio > EPSR) ins.set(mid, [A, B]); continue; }
+      if (an.event) { if (ratio > EPSR) { ins.set(mid, [A, B]); why.ev++; } continue; }
       if (ratio <= 4 * EPSR) continue;
       if (over) continue;
-      if (an.gap > GAPSKY || nearLamp(A, B) || an.lineDev > tol3(B.r)) ins.set(mid, [A, B]);
+      if (an.gap > GAPSKY || nearLamp(A, B) || an.lineDev > tol3(B.r)) { ins.set(mid, [A, B]); if (log) { if (an.gap > GAPSKY) why.gap++; else if (an.lineDev > tol3(B.r)) why.line++; else why.lamp++; } }
     }
     // 径向弯曲: 三层 (A, B, C) 上对应段的同一比例点不在一条直线上 (超了预算不做) (按 ln r 插值) → 两侧各加一层
     for (let k = 1; k + 1 < rows.length && !over; k++) {
@@ -587,7 +615,7 @@ export function meshShellSurface(compute, L, E, opt = {}) {
           dev = Math.max(dev, dist3(PB, [PA[0] + lam * (PC[0] - PA[0]), PA[1] + lam * (PC[1] - PA[1]), PA[2] + lam * (PC[2] - PA[2])]));
         }
       }
-      if (dev > 2 * tol3(B.r)) { ins.set(Math.sqrt(A.r * B.r), [A, B]); ins.set(Math.sqrt(B.r * C.r), [B, C]); }
+      if (dev > 2 * tol3(B.r)) { ins.set(Math.sqrt(A.r * B.r), [A, B]); ins.set(Math.sqrt(B.r * C.r), [B, C]); if (log) { why.rad++; if (why.radR.length < 6) why.radR.push(`${B.r.toFixed(3)}:${dev.toFixed(3)}`); } }
     }
     if (!ins.size || calls >= MAXCALLS || rows.length >= MAXROWS) break;
     const add = [];
@@ -596,7 +624,7 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       add.push(buildRow(r, A, B, 'ref'));
     }
     rows = rows.concat(add).sort((p, q) => p.r - q.r);
-    if (log) log(`pass ${pass}: +${add.length} shells (${rows.length})`);
+    if (log) log(`pass ${pass}: +${add.length} shells (${rows.length}) [事件 ${why.ev}, 天空间距 ${why.gap}, 边界线弦高 ${why.line}, 近灯 ${why.lamp}, 径向弯曲 ${why.rad} ${why.radR.join(' ')}]`);
   }
   relink(rows);
   if (opt.debugFinal) opt.debugFinal(rows, analyze);      // 测试 / 排查用: 看最终各层的特殊点与对应

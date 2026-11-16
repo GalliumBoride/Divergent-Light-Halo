@@ -6,9 +6,10 @@
 //       曲面边界线 = 平行光末端点身份的 h-延拓 × 锥闭式.
 // 与 C# 逐句对应 (对账见 tools/).
 
-import { LP, OMode, setSun, PathCtx, Chain3, jana3, validAt, axesMeta, traceContours, allFams, famEval3, SqK } from './lp.js';
+import { LP, OMode, setSun, PathCtx, Chain3, Chain3s, JA, jana3, validAt, axesMeta, traceContours, allFams, famEval3, SqK } from './lp.js';
 import { PathC, FamC, Scene, polishPair, fenceSamples, projectFence, cuspState, minMarginUV, computeEndpoints } from './ep.js';
 import { tryConePoint } from './cone.js';
+import { AP } from './aperture.js';
 
 const f32 = Math.fround;
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -352,6 +353,19 @@ function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40, sag =
   return out;
 }
 
+// 中点函数加记忆 (按有序的一对参数对象): 锥映射两支各加密一遍, 用的是同一串样本、同样的二分 —— 第二支直接取第一支解过的中点
+//   (返回同一个对象, branches 的缓存也就命中). 中点函数是确定的, 结果与不记忆完全相同
+function memoMid(mid) {
+  const memo = new Map();
+  return (a, b) => {
+    let mb = memo.get(a);
+    if (!mb) memo.set(a, mb = new Map());
+    let r = mb.get(b);
+    if (r === undefined) { r = mid(a, b); mb.set(b, r); }
+    return r;
+  };
+}
+
 // 修正版轨迹投影: 每条轨迹 (h 样本 + 解) 两支各自加密, 中间 h 用 tk.slv 以邻点为种子重解
 function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
   const pctx = new PathCtx(path);
@@ -418,7 +432,8 @@ function projectTracksFine(tracks, m, fixedAng, path, L, E, maxDist) {
     const foldAt = x => { const D = skyAt(x.h, x.sol); return D ? coneFold(D, x.h * Math.PI / 180, L, E) : null; };
     // 轨迹上每个中点都要重解一次末端点 (Newton), 二分 24 次已是 0.5° 步长的 2⁻²⁴
     const smp = insertFolds(samples, foldAt, mid, 24);
-    for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], mid, Lden, 9, 24, sag));
+    const midM = memoMid(mid);                       // 两支的加密在同一串样本上二分: 同一对样本的中点只解一次
+    for (let b = 0; b < 2; b++) tk.pts3.push(...refineBranch(smp, x => branches(x)[b], midM, Lden, 9, 24, sag));
   }
 }
 
@@ -967,7 +982,8 @@ export function computeDivergentEdges(path, m, fixedAng, surfId, lampElevDeg, la
         if (cancelled && cancelled()) return tracks;
         setSun(hs);
         let recs;
-        try { recs = computeEndpoints(path, m, fixedAng, false); } catch (e) { continue; }
+        // 篱笆曲面只要篱笆 ∩ 篱笆 / 可达带 (下面跳过焦散的部分): 焦散交点不算 (那是 computeEndpoints 的大头)
+        try { recs = computeEndpoints(path, m, fixedAng, false, false); } catch (e) { continue; }
         for (const rc of recs) {
           if (rc.kind !== 'end' && rc.kind !== 'cross' && rc.kind !== 'turn') continue;
           for (const part of rc.label.split(' | ')) {
@@ -1163,7 +1179,7 @@ function jHat(m, fx, P) {
   return (u, v) => {
     const J = jana3(u, v, m, fx, P);
     if (!Number.isFinite(J)) return J;
-    const mE = -SqK - Chain3(u, v, m, fx, P).qE;
+    const mE = -SqK - JA.qE;                       // = Chain3(u, v, …).qE: jana3 刚算过, 逐位相同
     return mE > 0 ? J * Math.sqrt(mE) : J;
   };
 }
@@ -1173,17 +1189,19 @@ function jHat(m, fx, P) {
 //   这里用两个方程 (Ĵ, 约束余量) 的 Newton (差分雅可比, 步长受限) 直接解交点; 不收敛就退回原点.
 // 约束余量: [入射 g0, 出射 (−√K − qE), 各中间反射 (−qs)], 全 ≥ 0 才有效
 function marginsAt(u, v, P, m, fx) {
-  const c = Chain3(u, v, m, fx, P);
+  const c = Chain3s(u, v, m, fx, P);
   const out = [c.g0, -SqK - c.qE];
   for (const q of c.qs || []) out.push(-q);
   return out;
 }
+// 第 k 个余量, 取自刚算过的 jana3 (调用方刚在同一 (u, v) 上求过 Ĵ): 与 marginsAt(u, v)[k] 逐位相同, 省一遍链
+const marginJA = k => k === 0 ? JA.g0 : k === 1 ? -SqK - JA.qE : -JA.qs[k - 2];
 // 解 Ĵ = 0 且 第 k 个余量 = 0 (焦散与有效区边的交点), 从 x0 出发; 失败返回 null. 用当前 LP 太阳.
 function edgeNewton(x0, k, P, m, fx, maxMove = 0.05, target = 1e-6) {
   const Jh = jHat(m, fx, P);
   // 目标余量 1e-6 而不是 0: 焦散在出射临界边旁几乎是贴着边走的, 正好在边上的交点病态; 余量 1e-6 处交点良态,
   //   离真正的边只差约 1/1000 的距离 (20 m 处 2 cm)
-  const F = (u, v) => [Jh(u, v), marginsAt(u, v, P, m, fx)[k] - target];
+  const F = (u, v) => [Jh(u, v), marginJA(k) - target];      // marginJA: 同一点上 Jh 里的 jana3 刚算过链
   let u = x0[0], v = x0[1];
   // 起点可能已在有效区外 (h 一变, 边界就挪过来了; 那边 Ĵ 无定义): 先沿该余量的梯度把它推回到余量 2e-6 处 (余量两边都有定义)
   for (let it = 0; it < 20; it++) {
@@ -1283,7 +1301,7 @@ function traceCausticFine(P, m, fx, nGrid) {
   const J = jHat(m, fx, P);
   const TWO = 2 * Math.PI, wd = a => a - TWO * Math.round(a / TWO);
   // 有效: 严格; 出射余量 < 1e-6 当作到边 (有的光路 J 在出射临界边上不发散, Ĵ 沿整条边为 0, 不能让线顺着边滑)
-  const ok = x => validAt(P, m, fx, x[0], x[1], 0) && -SqK - Chain3(x[0], x[1], m, fx, P).qE > 1e-6;
+  const ok = x => validAt(P, m, fx, x[0], x[1], 0) && -SqK - Chain3s(x[0], x[1], m, fx, P).qE > 1e-6;
   const grad = (u, v) => {
     const e = 1e-7;
     let gx = (J(u + e, v) - J(u - e, v)) / (2 * e), gy = (J(u, v + e) - J(u, v - e)) / (2 * e);
@@ -1329,6 +1347,17 @@ function traceCausticFine(P, m, fx, nGrid) {
       if (Math.hypot(px - t * sx, py - t * sy) < tol) return true;
     }
     return false;
+  };
+  // 到已追线段的最近距离, 只看 x 所在格子周围 ±1 格登记的线段 (离 x 不到一格的点 y 做 nearTraced 时这些格子都在它的 ±2 格里)
+  const tracedDist1 = x => {
+    const cu = Math.floor(wrap(x[0]) / cell), cv = Math.floor(wrap(x[1]) / cell);
+    let d = Infinity;
+    for (let du = -1; du <= 1; du++) for (let dv = -1; dv <= 1; dv++) for (const [a, b] of hash.get(hk(cu + du, cv + dv)) || []) {
+      const px = wd(x[0] - a[0]), py = wd(x[1] - a[1]), sx = b[0] - a[0], sy = b[1] - a[1], l2 = sx * sx + sy * sy;
+      const t = l2 > 0 ? Math.max(0, Math.min(1, (px * sx + py * sy) / l2)) : 0;
+      d = Math.min(d, Math.hypot(px - t * sx, py - t * sy));
+    }
+    return d;
   };
   const HMAX = 0.02, HMIN = 2e-6, COS_T = Math.cos(12 * Math.PI / 180), COS_E = Math.cos(4 * Math.PI / 180);
   // 从 x0 沿 d0 走到头: 返回 { pts (不含 x0), closed }
@@ -1424,10 +1453,38 @@ function traceCausticFine(P, m, fx, nGrid) {
     if (run.length >= 2) { runs.push(run); addRun(run); }
   };
   // 种子: 格边上 J 变号处 (二分到边上的根, 再拉回 Ĵ = 0)
+  //   提前放弃: 二分到一半, 根所在的区间 (半长 half) 中点离已追的线 d, d + half < 2e-3 ⟹ 二分到底的根离线也 < 2e-3,
+  //   照样会被下面的 nearTraced 判掉 (距离对位置是 1-Lipschitz; 中点与根相差不到一格, 见 tracedDist1). 结果与原来完全相同,
+  //   省掉的是绝大多数种子 (格边跨过已追过的线) 后面三十来次 jana3
+  //   同理, 区间整段都在有效区外 (根会被 ok 判掉): 有效性余量 (入射 g0、各中间反射 q、出射 −√K − qE) 对一个取向角
+  //   都是利普希茨的 —— 面法向随角以单位速率转, |dg0| ≤ 1; 折射后 |dP| ≤ 2 + (1 + n); 每次反射 |dP'| ≤ 3|dP| + 4n,
+  //   |dq| ≤ |dP| + n (n = 折射率, |P| ≡ n). 中点的 (余量 / 上界) 最小值 < −半长 ⟹ 整段无效. 孔径 (真实晶体) 开着时不用这条
+  const nI = Math.sqrt(1 + SqK * SqK), LQ = [];
+  let dPb = 3 + nI;
+  for (let i = 0; i < P.nMid; i++) { LQ.push(dPb + nI); dPb = 3 * dPb + 4 * nI; }
+  const LQE = dPb + nI;
+  const certMargin = (u, v) => {
+    const c = Chain3s(u, v, m, fx, P);
+    let s = Math.min(c.g0, (-SqK - c.qE - 1e-6) / LQE);
+    for (let i = 0; i < P.nMid; i++) { s = Math.min(s, -c.qs[i] / LQ[i]); if (!LP.partial) s = Math.min(s, (c.qs[i] + SqK) / LQ[i]); }
+    return s;
+  };
   const seedOn = (ua, va, fa, ub, vb, fb) => {
     if (!(fa * fb < 0)) return;
-    let lo = 0, hi = 1, flo = fa;
+    const el = Math.hypot(ub - ua, vb - va);
+    let lo = 0, hi = 1, flo = fa, far = !hash.size, chk = !(AP.on && P.apSupported);
     for (let it = 0; it < 40; it++) {
+      const half = 0.5 * (hi - lo) * el;
+      if (chk && half < 0.02) {
+        const c = 0.5 * (lo + hi), s = certMargin(ua + (ub - ua) * c, va + (vb - va) * c);
+        if (s < -half * (1 + 1e-6) - 1e-12) return;       // 整段在有效区外
+        if (s > half * (1 + 1e-6)) chk = false;            // 整段在有效区内: 不必再看
+      }
+      if (!far && half < 1e-3) {
+        const c = 0.5 * (lo + hi), d = tracedDist1([ua + (ub - ua) * c, va + (vb - va) * c]);
+        if (d + half < 2e-3 * (1 - 1e-9)) return;
+        if (d - half > 2e-3) far = true;                  // 肯定不在已追的线上: 不必再看
+      }
       const md = 0.5 * (lo + hi), fv = jana3(ua + (ub - ua) * md, va + (vb - va) * md, m, fx, P);
       if (!Number.isFinite(fv)) return;
       if (flo * fv <= 0) hi = md; else { lo = md; flo = fv; }
@@ -1645,7 +1702,7 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
     const DEG = Math.PI / 180, TAU = 1e-6, Jh = jHat(m, fx, P);
     const rimF = k => y => {
       setSun(y[0] / DEG);
-      const j = Jh(y[1], y[2]), mk = marginsAt(y[1], y[2], P, m, fx)[k];
+      const j = Jh(y[1], y[2]), mk = marginJA(k);      // = marginsAt(y[1], y[2])[k]
       return Number.isFinite(j) && Number.isFinite(mk) ? [j, mk - TAU] : null;
     };
     // 出射临界边旁 Ĵ 随余量呈 √ 变化: 差分步长要远小于目标余量 (同 edgeNewton)
@@ -1764,7 +1821,8 @@ export function causticRims2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist,
       };
       const foldAt = s0 => { const D = sky(s0); return D ? coneFold(D, s0.h * Math.PI / 180, L, E) : null; };
       const smp = insertFolds(samples, foldAt, mid, 24);
-      for (let b = 0; b < 2; b++) out.push(...refineBranch(smp, s0 => branches(s0)[b], mid, Lden, 9, 24, sag));
+      const midM = memoMid(mid);
+      for (let b = 0; b < 2; b++) out.push(...refineBranch(smp, s0 => branches(s0)[b], midM, Lden, 9, 24, sag));
     }
   } finally { setSun(oldTH); }
   return out;

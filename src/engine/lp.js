@@ -113,10 +113,14 @@ export class PathCtx {
 
 // ---------- 取向 ----------
 // Euler 取向框架 (_orient_euler): 写入 out[0..8] = e1, e2, e3
+//   三个角的 sin/cos 各缓存上一次的: 取向平面上的网格一行里两个角不变, 沿格边二分时一个角不变, jana3 的生成元与框架
+//   用同一组角 —— 不重算. 值与直接调 Math.sin/cos 逐位相同 (±0 与 NaN 每次重算, 保住零的符号)
+let _tA = NaN, _sA = 0, _cA = 1, _tZ = NaN, _sZ = 0, _cZ = 1, _tR = NaN, _sR = 0, _cR = 1;
 export function orientEuler(al, ze, rho, out) {
-  const sz = Math.sin(ze), cz = Math.cos(ze);
-  const sa = Math.sin(al), ca = Math.cos(al);
-  const sr = Math.sin(rho), cr = Math.cos(rho);
+  if (ze !== _tZ || ze === 0) { _tZ = ze; _sZ = Math.sin(ze); _cZ = Math.cos(ze); }
+  if (al !== _tA || al === 0) { _tA = al; _sA = Math.sin(al); _cA = Math.cos(al); }
+  if (rho !== _tR || rho === 0) { _tR = rho; _sR = Math.sin(rho); _cR = Math.cos(rho); }
+  const sz = _sZ, cz = _cZ, sa = _sA, ca = _cA, sr = _sR, cr = _cR;
   out[6] = sz * ca; out[7] = sz * sa; out[8] = cz;
   const e1b0 = -sa, e1b1 = ca, e1b2 = 0;
   const e2b0 = -cz * ca, e2b1 = -cz * sa, e2b2 = sz;
@@ -177,6 +181,10 @@ export function chain3(sc, sw, m, fixedAng, P, out, graze = false) {
 export function Chain3(sc, sw, m, fixedAng, P, graze = false) {
   return chain3(sc, sw, m, fixedAng, P, newC3(P), graze);
 }
+/** 不分配的 Chain3: 结果写在该光路的暂存里, 下一次调用就覆盖 —— 只在马上读完、不留引用的地方用 (热路径). */
+export function Chain3s(sc, sw, m, fixedAng, P, graze = false) {
+  return chain3(sc, sw, m, fixedAng, P, P._c3 || (P._c3 = newC3(P)), graze);
+}
 
 export function valid3(c, tol) {
   if (!(c.g0 >= -tol)) return false;
@@ -209,10 +217,28 @@ function clampMask(qE, v) {
 
 const _JE = new Float64Array(9), _JW = new Float64Array(6);
 const _JU = new Float64Array(3 * 64);
+// 同 gens, 但三角值取 orientOf 刚算 (缓存) 的那一组 —— 紧跟在 orientOf(m, fixedAng, sc, sw) 之后调用. 逐位与 gens 相同:
+//   ZenFree 框架 (α=sc, ζ=sw, ρ=θ): sin/cos(sc) = _sA/_cA; ZetaFixed (α=sc, ζ=ζ0, ρ=sw): sin/cos(ζ0) = _sZ/_cZ;
+//   AlphaFixed (α=α0, ζ=sw, ρ=sc): sin/cos(sw) = _sZ/_cZ, sin/cos(α0) = _sA/_cA
+function gensCached(m, w) {
+  if (m === OMode.ZenFree) {
+    w[0] = 0.0; w[1] = 0.0; w[2] = 1.0;
+    w[3] = -_sA; w[4] = _cA; w[5] = 0.0;
+  } else if (m === OMode.ZetaFixed) {
+    w[0] = 0.0; w[1] = 0.0; w[2] = 1.0;
+    w[3] = _sZ * _cA; w[4] = _sZ * _sA; w[5] = _cZ;
+  } else {
+    w[0] = _sZ * _cA; w[1] = _sZ * _sA; w[2] = _cZ;
+    w[3] = -_sA; w[4] = _cA; w[5] = 0.0;
+  }
+}
+/** jana3 最近一次算出的链: 入射 g0、各中间反射 qs、出射 qE (与 Chain3 逐位相同: 同样的运算次序) ——
+ *  规范化焦散 Ĵ = J·√(−√K − qE) 与有效性余量不必再算一遍链. */
+export const JA = { g0: NaN, qE: NaN, qs: new Float64Array(64) };
 
 export function jana3(sc, sw, m, fixedAng, P) {
   const e = orientOf(m, fixedAng, sc, sw, _JE);
-  gens(m, fixedAng, sc, sw, _JW);
+  gensCached(m, _JW);
   const cf = P.coef, n = P.faces.length, A3 = LP.A3;
   const U = n <= 64 ? _JU : new Float64Array(3 * n);
   for (let i = 0; i < n; i++) {
@@ -223,6 +249,7 @@ export function jana3(sc, sw, m, fixedAng, P) {
   }
   const u00 = U[0], u01 = U[1], u02 = U[2];
   const g0 = u00 * A3[0] + u01 * A3[1] + u02 * A3[2];
+  JA.g0 = g0;
   const S0 = Math.sqrt(g0 * g0 + K);
   const t0 = -g0 + S0, t0p = g0 / S0 - 1.0;
   let P0 = A3[0] + t0 * u00, P1 = A3[1] + t0 * u01, P2 = A3[2] + t0 * u02;
@@ -242,6 +269,7 @@ export function jana3(sc, sw, m, fixedAng, P) {
   for (let i = 1; i < n - 1; i++) {
     const ux = U[3 * i], uy = U[3 * i + 1], uz = U[3 * i + 2];
     const q = P0 * ux + P1 * uy + P2 * uz;
+    if (i <= 64) JA.qs[i - 1] = q;
     // k = 0
     let wx = _JW[0], wy = _JW[1], wz = _JW[2];
     let dux = wy * uz - wz * uy, duy = wz * ux - wx * uz, duz = wx * uy - wy * ux;
@@ -257,6 +285,7 @@ export function jana3(sc, sw, m, fixedAng, P) {
   const j = 3 * (n - 1);
   const ex = U[j], ey = U[j + 1], ez = U[j + 2];
   const qE = P0 * ex + P1 * ey + P2 * ez;
+  JA.qE = qE;
   const TE = Math.sqrt(Math.max(qE * qE - K, 1e-30));
   const tE = -qE - TE;
   const D0 = P0 + tE * ex, D1 = P1 + tE * ey, D2 = P2 + tE * ez;
