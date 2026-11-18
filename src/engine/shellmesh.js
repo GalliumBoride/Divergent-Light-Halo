@@ -564,6 +564,34 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       makeArc(row, a.V, a.m, a.closed, a.h, a.t, opt.union ? [] : a.J, [a.hc, a.tc]);
       row.raw.push({ p: Float32Array.from({ length: 3 * a.m }, (_, k) => E[k % 3] + r * a.V[k]), d: Float32Array.from(a.V.subarray(0, 3 * a.m)) });
     }
+    // 转折缝穿过这一层的地方: 轮廓上多取一个顶点 (arc.extraT). 转折缝是晕面的折痕; 那里没有特殊点的弧 (引擎一口气走过去,
+    //   没在那里分段) 顶点跨在折痕两边, 网格削掉折痕的尖, 离线一二十厘米. 只是多一个顶点, 不是特殊点 —— 不改段的划分与对应
+    for (const ln of LN) {
+      if (ln.kind !== 'turn') continue;
+      const rr = i => Math.hypot(ln.p[3 * i] - E[0], ln.p[3 * i + 1] - E[1], ln.p[3 * i + 2] - E[2]);
+      let ra = rr(0);
+      for (let i = 0; i + 1 < ln.n; i++) {
+        const rb = rr(i + 1), a = ra - r, b = rb - r;
+        ra = rb;
+        if (!(a === 0 || a * b < 0)) continue;
+        const f = a / (a - b), u = unit([ln.p[3 * i] + f * (ln.p[3 * i + 3] - ln.p[3 * i]) - E[0], ln.p[3 * i + 1] + f * (ln.p[3 * i + 4] - ln.p[3 * i + 1]) - E[1], ln.p[3 * i + 2] + f * (ln.p[3 * i + 5] - ln.p[3 * i + 2]) - E[2]]);
+        let best = null, bd = 1e-3;
+        for (const arc of row.arcs) {
+          const m = arc.n + (arc.closed ? 1 : 0);
+          for (let k = 0; k + 1 < m; k++) {
+            const k1 = (k + 1) % arc.n, px = arc.U[3 * k], py = arc.U[3 * k + 1], pz = arc.U[3 * k + 2], ex = arc.U[3 * k1] - px, ey = arc.U[3 * k1 + 1] - py, ez = arc.U[3 * k1 + 2] - pz, l2 = ex * ex + ey * ey + ez * ez;
+            let t = l2 > 0 ? ((u[0] - px) * ex + (u[1] - py) * ey + (u[2] - pz) * ez) / l2 : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+            const d = Math.hypot(u[0] - px - t * ex, u[1] - py - t * ey, u[2] - pz - t * ez);
+            if (d < bd) { bd = d; best = { arc, t: arc.S[k] + t * ((k + 1 < arc.n ? arc.S[k + 1] : arc.len) - arc.S[k]) }; }
+          }
+        }
+        if (!best) continue;
+        const arc = best.arc, gapTo = t => { let d = Math.abs(t - best.t); if (arc.closed) d = Math.min(d, arc.len - d); return d; }, lim = 0.25 * SKY0;
+        if (arc.sp.some(q => gapTo(q.t) < lim) || (arc.extraT || []).some(t => gapTo(t) < lim)) continue;
+        if (!arc.closed && (best.t < lim || arc.S[arc.n - 1] - best.t < lim)) continue;
+        (arc.extraT || (arc.extraT = [])).push(best.t);
+      }
+    }
     return row;
   };
 
@@ -777,6 +805,9 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       if (qa.type !== qb.type) continue;
       if (qa.type === 'cut' && (qa.cutId === undefined || qa.cutId !== qb.cutId)) continue;      // 截断点只接同一段切口的两头
       let Q = qa.type === 'end' ? linePath(qa, qb, A.r, B.r) : null;
+      // 一条弧的两端 (月牙): 那段线可以比对面那一层还往外鼓出去一点 (至多 0.5%) —— 弧在对面那层上还没出现 (引擎在
+      //   出生点旁找不到那条很短的弧), 月牙就是这条弧到边界线之间的全部
+      if (Q === null && qa.type === 'end' && ends[a].i === ends[b].i) Q = row === B ? linePath(qa, qb, B.r * (1 - 5e-3), B.r) : linePath(qa, qb, A.r, A.r * (1 + 5e-3));
       const exact = Q !== null;
       if (!exact) {
         // 没有边界线可走 (一自由度没有传线; 或截断球面的切口): 挨得近的直接连 —— 两个末端在这两层之间相遇消失 (两条弧并成
@@ -1060,6 +1091,7 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     const dl = row => { if (row.rl === undefined) { let m = Infinity; for (const arc of row.arcs) for (let i = 0; i < arc.n; i += Math.max(1, arc.n >> 6)) { const p = at(row.r, [arc.U[3 * i], arc.U[3 * i + 1], arc.U[3 * i + 2]]); m = Math.min(m, Math.hypot(p[0] - L[0], p[1] - L[1], p[2] - L[2])); } row.rl = m; } return row.rl; };
     return B.r - A.r > 0.35 * Math.max(Math.min(dl(A), dl(B)), 2e-3 * D);
   };
+  const refine = () => {
   for (let pass = 0; pass < 28; pass++) {
     relink(rows);
     const ins = new Map(), over = vEst(rows) > 2.5 * VBUDGET;
@@ -1111,6 +1143,44 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     rows = rows.concat(add).sort((p, q) => p.r - q.r);
     if (log) log(`pass ${pass}: +${add.length} shells (${rows.length}) [事件 ${why.ev}, 天空间距 ${why.gap}, 边界线弦高 ${why.line}, 近灯 ${why.lamp}, 径向弯曲 ${why.rad} ${why.radR.join(' ')}]`);
   }
+  };
+  // 带路重算: 相邻两层对不上, 一层有、另一层没有的一段轮廓 —— 可能是真的在这里出生 / 消失, 也可能是引擎在没有的那一层漏了
+  //   (全局搜索找种子有死角: 3-5-6-8 Lowitz Σ10.5 焦散在灯距附近 r 14.94–15.05 找不到上面那条三十几度的弧, 再往外就找得到;
+  //   初始层由里往外算, 只有里面一层的种子, 外面先找到的弧带不进来). 用有的那一层的状态点当种子 (加密) 把没有的那一层重算
+  //   一遍: 找回来的长度超过缺口的一半就换上. 由外往里、由里往外各扫一遍 (换上的层接着给下一层带路). 交界层不动 (相邻两段
+  //   要算出同一条轮廓)
+  const reseed = () => {
+    let changed = 0;
+    const unLen = list => { let l = 0; for (const pc of list) l += pc.len; return l; };
+    for (const dir of [-1, 1]) {
+      for (let k = dir < 0 ? rows.length - 2 : 0; k >= 0 && k + 1 < rows.length; k += dir) {
+        if (calls >= MAXCALLS + 40 || Date.now() - t0 > SOFTMS) return changed;
+        const A = rows[k], B = rows[k + 1];
+        if (!A.arcs.length && !B.arcs.length) continue;
+        relink([A, B]);
+        const an = analyze(A, B);
+        if (!an.unA.length && !an.unB.length) continue;
+        const la = unLen(an.unA), lb = unLen(an.unB);
+        // 穷的一侧: 由外往里扫时修 A (用 B 带路), 由里往外扫时修 B
+        if (dir < 0 ? !(lb > la + 2 * SKY0) : !(la > lb + 2 * SKY0)) continue;
+        const poor = dir < 0 ? A : B, rich = dir < 0 ? B : A, kp = dir < 0 ? k : k + 1;
+        if (poor.seam || poor.reseeded) continue;
+        const other = dir < 0 ? rows[k - 1] || null : rows[k + 2] || null;
+        const R2 = buildRow(poor.r, dir < 0 ? other : rich, dir < 0 ? rich : other, poor.kind, true);
+        R2.reseeded = true; poor.reseeded = true;
+        if (lenOf(R2) > lenOf(poor) + 0.5 * Math.abs(lb - la)) { rows[kp] = R2; changed++; }
+      }
+    }
+    return changed;
+  };
+  refine();
+  for (let it = 0; it < 2; it++) {
+    const n = reseed();
+    if (!n) break;
+    stat.reseeded = (stat.reseeded || 0) + n;
+    if (log) log(`reseed: ${n} shells recomputed with seeds from the neighbour that has more`);
+    refine();
+  }
   // 预算收尾: 拓扑变化多的一段, 二分加的层不受预算管 (每层都是整圈轮廓), 顶点数会超出几倍. 加密完再按实际层数把段内点距
   //   放大到预算以内 (至多 3°; 交界层照旧按 SKY0, 与相邻段对得上)
   {
@@ -1131,6 +1201,7 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     if (arc.base) return vertsOf(row, arc.base);       // 克隆的闭合弧 (joinPieces): 顶点是原弧的
     if (arc.vt) return arc.vt;
     const ts = arc.sp.filter(q => q.type !== 'focal').map(q => q.t);
+    if (arc.extraT) ts.push(...arc.extraT);
     if (!arc.closed) { ts.push(0, arc.S[arc.n - 1]); }
     const T = [...new Set(ts.map(t => +t.toFixed(12)))].sort((a, b) => a - b);
     const all = [];
@@ -1625,11 +1696,39 @@ export function meshShellSurface(compute, L, E, opt = {}) {
 
   // ---- 特殊线输出 (折叠线、焦线): 各链按半径排的点
   const chains = new Map();
-  for (const row of rows) for (const q of row.sp) {
-    if (q.type !== 'fold' && q.type !== 'focal' && !q.foldAt) continue;
-    let c = chains.get(q.chain);
-    if (!c) { c = { kind: q.type === 'focal' ? 'focal' : 'fold', pts: [], dirs: [] }; chains.set(q.chain, c); }
-    c.pts.push(...q.p); c.dirs.push(...q.u);
+  rows.forEach((row, ri) => {
+    for (const q of row.sp) {
+      if (q.type !== 'fold' && q.type !== 'focal' && !q.foldAt) continue;
+      let c = chains.get(q.chain);
+      if (!c) { c = { kind: q.type === 'focal' ? 'focal' : 'fold', pts: [], dirs: [], k0: ri, q0: q }; chains.set(q.chain, c); }
+      c.pts.push(...q.p); c.dirs.push(...q.u); c.k1 = ri; c.q1 = q;
+    }
+  });
+  // 焦线的头: 焦线在离眼最远 (最近) 处掉头时, 两条焦线停在同一层上, 中间那一小截夹在这一层与下一层之间 (层够不到).
+  //   引擎的边界线里若有一条与焦线重合 (边界引擎把焦线当成接缝线 / 外缘), 沿它把两条焦线接成一条
+  if (LN.length) {
+    const fc = [...chains.entries()].filter(e => e[1].kind === 'focal');
+    const tolL = r => Math.max(1e-6, 2e-3 * r), labOf = q => ({ lab: nearLines(q.p, k => k !== 'cusp', tolL(Math.hypot(q.p[0] - E[0], q.p[1] - E[1], q.p[2] - E[2]))) });
+    const rev3 = a => { const o = []; for (let i = a.length - 3; i >= 0; i -= 3) o.push(a[i], a[i + 1], a[i + 2]); return o; };
+    for (let x = 0; x < fc.length; x++) for (let y = x + 1; y < fc.length; y++) {
+      const [ka, a] = fc[x], [kb, b] = fc[y];
+      if (a.gone || b.gone) continue;
+      for (const tail of [true, false]) {
+        const ra = tail ? a.k1 : a.k0, rb = tail ? b.k1 : b.k0, nx = tail ? ra + 1 : ra - 1;
+        if (ra !== rb || nx < 0 || nx >= rows.length) continue;
+        const Q = linePath(labOf(tail ? a.q1 : a.q0), labOf(tail ? b.q1 : b.q0), rows[ra].r, rows[nx].r);
+        if (Q === null || !Q.length) continue;
+        const qp = [], qd = [];
+        for (const p of Q) { qp.push(p[0], p[1], p[2]); qd.push(...unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]])); }
+        // a (头 → 尾) + 线 + b (尾 → 头); 接在头上的反过来
+        const pts = tail ? [...a.pts, ...qp, ...rev3(b.pts)] : [...rev3(a.pts), ...qp, ...b.pts], dirs = tail ? [...a.dirs, ...qd, ...rev3(b.dirs)] : [...rev3(a.dirs), ...qd, ...b.dirs];
+        a.pts = pts; a.dirs = dirs; b.gone = true;
+        if (tail) { a.k1 = b.k0; a.q1 = b.q0; } else { a.k0 = b.k1; a.q0 = b.q1; const t0 = a.k0; a.k0 = a.k1; a.k1 = t0; const tq = a.q0; a.q0 = a.q1; a.q1 = tq; }
+        stat.focalJoins = (stat.focalJoins || 0) + 1;
+        break;
+      }
+    }
+    for (const [k, c] of fc) if (c.gone) chains.delete(k);
   }
   // 折叠线只画延续得够长的: 径向跨度不到所在半径 15% 的 (且两头都不碰这一段的半径边界 —— 碰到的可能接着下一段) 不画.
   //   这类短链多是球壳与晕面相切 (鞍点) 处的假折点: 两条交叉的轮廓在切点重新连成 )(, 刚分开时双曲线顶点尖得像折点,

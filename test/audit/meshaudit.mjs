@@ -2,7 +2,7 @@
 //   node test/audit/meshaudit.mjs code mode el D [surf] [fix] [NW=12]
 //   mode: plate | parry | custom (一自由度, fix = "ζ,θ") | column | lowitz (二自由度, fix = ζ 或 θ);  surf: caustic / entry / exit / deg1 / blue1 …
 //   env: SRC = src 目录的 file URL (默认本仓库的 src; 可指向另一份源码做对比), Q = 精度 0/1/2, MAXD = 截断距离,
-//        TOP = 列出最大的几处缺口, DUMP = 存缺口边 (json), VERBOSE = 逐段打印
+//        TOP = 列出最大的几处缺口, BLTOP = 列出最长的几段没贴上的边界线, DUMP = 存缺口边 (json), VERBOSE = 逐段打印
 //
 // 解决什么: 回归测试 (test/mesh1, test/mesh2) 只测单段网格的覆盖, 测不到页面实际用的分段管线, 也不看网格的边是不是贴在边界上.
 //   这里把各段的三角形按顶点位置 (逐位相同) 焊在一起, 找开口边 (只属于一个三角形的边), 逐条判:
@@ -177,6 +177,21 @@ const meshDist = (p, lim) => {
 };
 let blLen = 0, blMiss = 0, blSky = 0, blMissSky = 0, worstL = null;
 const byKind = {};
+const MISS = [];           // BLTOP: 没贴上的线段连成的段
+// 网格给出的特殊线 (焦线 / 折叠线): 边界引擎的线与焦线重合时 (一整条取向曲线都把光射向同一点, 那里没有三角形) 也算贴上
+const SPEC = [];
+for (const { m } of parts) for (const s of m.special || []) SPEC.push(s.p);
+const specDist = (q, lim) => {
+  let bd = Infinity;
+  for (const p of SPEC) for (let i = 0; i + 5 < p.length; i += 3) {
+    const ex = p[i + 3] - p[i], ey = p[i + 4] - p[i + 1], ez = p[i + 5] - p[i + 2], l2 = ex * ex + ey * ey + ez * ez;
+    let t = l2 > 0 ? ((q[0] - p[i]) * ex + (q[1] - p[i + 1]) * ey + (q[2] - p[i + 2]) * ez) / l2 : 0;
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    const d = Math.hypot(q[0] - p[i] - t * ex, q[1] - p[i + 1] - t * ey, q[2] - p[i + 2] - t * ez);
+    if (d < bd) { bd = d; if (bd <= lim) return bd; }
+  }
+  return bd;
+};
 for (const ln of bl) {
   const p = ln.p;
   for (let i = 0; i + 5 < p.length; i += 3) {
@@ -186,7 +201,9 @@ for (const ln of bl) {
     const len = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]), sky = ang(a, b) / DEG;
     blLen += len; blSky += sky;
     const o = byKind[ln.kind] || (byKind[ln.kind] = { len: 0, miss: 0 }); o.len += len;
-    const d = meshDist(m, tolB(r));
+    let d = meshDist(m, tolB(r));
+    if (d > tolB(r) && SPEC.length) d = Math.min(d, specDist(m, tolB(r)));
+    if (d > tolB(r) && process.env.BLTOP) { const last = MISS[MISS.length - 1]; if (last && last.ln === ln && last.i1 === i - 3) { last.i1 = i; last.len += len; last.rlo = Math.min(last.rlo, r); last.rhi = Math.max(last.rhi, r); last.d = Math.max(last.d, d); last.b = m; } else MISS.push({ ln, i0: i, i1: i, len, rlo: r, rhi: r, d, a: m, b: m }); }
     if (d > tolB(r)) { blMiss += len; blMissSky += sky; o.miss += len; if (!worstL || sky > worstL.sky) worstL = { sky, d, r, kind: ln.kind, az: Math.atan2(m[1], m[0]) / DEG, el: Math.asin(m[2] / r) / DEG }; }
   }
 }
@@ -195,6 +212,8 @@ const sceneName = [code, mode, els, Ds, dof === 2 ? surfArg : '', fixArg].filter
 console.log(`${sceneName}${note}: ${nTri} 三角形 (预算 ${bud}), 边界 ${tEdges} ms, 网格合计 ${tSum} ms (最慢一段 ${tMax} ms)${failed ? ', 失败 ' + failed + ' 段' : ''}, 丢超长边 ${skipped}, 没缝上 ${loose.toFixed(1)}°, 自检: 开口 ${selfOpen.toFixed(1)}° 补洞 ${selfFilled}`);
 console.log(`  开口边 ${stats.open}: 边界线上 ${stats.line}, 截断面 ${stats.cut}, 最里/最外层 ${stats.rim}, 灯旁 ${stats.lamp}; 缺口 ${stats.defect} 条 ${defLen.toFixed(2)} m / 天空 ${defSky.toFixed(1)}°, 段间缝 ${stats.seam} 条 ${seamLen.toFixed(2)} m / 天空 ${seamSky.toFixed(1)}°`);
 console.log(`  边界线 ${blLen.toFixed(1)} m / 天空 ${blSky.toFixed(0)}°: 没贴上网格 ${blMiss.toFixed(2)} m / ${blMissSky.toFixed(1)}°` + (worstL ? ` (最长一段 ${worstL.kind} 离网格 ${worstL.d === Infinity ? '>0.5' : worstL.d.toFixed(3)} m, r ${worstL.r.toFixed(2)}, 天空 ${worstL.az.toFixed(1)}/${worstL.el.toFixed(1)})` : '') + ' | ' + Object.entries(byKind).map(([k, o]) => `${k} ${o.miss.toFixed(1)}/${o.len.toFixed(1)}`).join(' '));
+const fsky = q => { const r = Math.hypot(...q); return `${(Math.atan2(q[1], q[0]) / DEG).toFixed(1)}/${(Math.asin(q[2] / r) / DEG).toFixed(1)}`; };
+for (const u of MISS.sort((x, y) => y.len - x.len).slice(0, +(process.env.BLTOP || 0))) console.log(`    没贴上的边界线: ${u.ln.kind} ${u.len.toFixed(2)} m, r ${u.rlo.toFixed(3)}–${u.rhi.toFixed(3)}, 天空 ${fsky(u.a)} → ${fsky(u.b)}, 离网格最远 ${u.d === Infinity ? '>0.5' : u.d.toFixed(3)} m`);
 for (const g of top.slice(0, +(process.env.TOP || 0))) {
   const c = g.c.map(x => x / g.n), r = Math.hypot(...c);
   console.log(`    缺口团: ${g.n} 条边 ${g.len.toFixed(3)} m / 天空 ${g.sky.toFixed(2)}°${g.seam ? ' (段间缝 ' + g.seam + ' 条)' : ''}, r ${g.rlo.toFixed(4)}–${g.rhi.toFixed(4)}, 天空 ${(Math.atan2(c[1], c[0]) / DEG).toFixed(2)}/${(Math.asin(c[2] / r) / DEG).toFixed(2)}, 离边界线 ≥ ${g.ld === Infinity ? '>0.25' : g.ld.toFixed(3)} m`);

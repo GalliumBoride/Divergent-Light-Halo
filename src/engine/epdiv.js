@@ -297,7 +297,7 @@ function chordDev(p, a, b) {
 //   有效 ↔ 无效 的转折处二分 (iters 次) 找精确端点. 返回 [{ p, d }].
 //   sag > 0 (边界线用): 段长/张角已够细时还要看中点离弦多远, 超过 sag 就再分 —— 弯得急的地方 (√ 区、尖点旁)
 //   按长度分段的折线会从真曲线上偏出去, 层线端点明明落在曲线上, 却离画出来的折线一两厘米.
-function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40, sag = 0) {
+function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40, sag = 0, ptsOut = null) {
   const out = [];
   // 状态带取向坐标 st.x 时 (层线), 每个点的 (u, v) 也一起输出 (x): 二自由度曲面网格用它对应相邻两层
   let P = [], D = [], X = [];
@@ -309,7 +309,7 @@ function refineBranch(samples, mapAt, mid, Lden, maxDepth = 9, iters = 40, sag =
       const o = { p: Float32Array.from(P), d: Float32Array.from(D) };
       if (X.length === 2 * P.length / 3) o.x = Float32Array.from(X);
       out.push(o);
-    }
+    } else if (ptsOut && P.length >= 6) ptsOut.push([P[0], P[1], P[2]]);      // 点状的像 (退化纤维 = 焦点): 调用方要的话另外报
     P = []; D = []; X = [];
   };
   // 有效 xa 与无效 xb 之间的转折点: 返回最后一个有效的 { x, s }
@@ -1169,7 +1169,7 @@ function coneMapRuns(runs, cosH, sinH, m, fx, P, Dx, Dy, Dz, L, maxDist, verts, 
 //   段内别处切断 (出射临界篱笆本身就压在出射约束的边上), 段端偏离真正的边界
 // 周期坐标差折回到 (−π, π] (闭环可能绕周期轴整圈, 首尾差 2π)
 const wd2 = a => a - 2 * Math.PI * Math.round(a / (2 * Math.PI));
-function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, checkValid = true, graze = false) {
+function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, checkValid = true, graze = false, ptsOut = null) {
   const hRad = hDeg * Math.PI / 180;
   const Lden = Math.max(1e-3, Math.min(maxDist, dist3(L, E)) / 150);
   for (const run of runs) {
@@ -1211,7 +1211,7 @@ function coneMapRunsFine(runs, hDeg, m, fx, P, L, E, maxDist, corr, outCurves, c
     const smp = Math.min(Math.abs(hDeg + sig), Math.abs(hDeg - sig)) < 6 ? insertPoles(smp0, gAt, mid) : smp0;
     const n = run.length, closed = n > 3 && Math.hypot(wd2(run[0][0] - run[n - 1][0]), wd2(run[0][1] - run[n - 1][1])) < 1e-3;
     for (let b = 0; b < 2; b++) {
-      const pcs = refineBranch(smp, x => branches(x)[b], mid, Lden);
+      const pcs = refineBranch(smp, x => branches(x)[b], mid, Lden, 9, 40, 0, ptsOut);
       // 闭环: 起点 (追线的种子, 位置任意) 两侧的首段与末段其实是同一段, 接起来 —— 否则层线在种子处断成两截,
       //   种子恰在尖点旁时两截都从这里朝同一方向出发, 看起来像停在半空
       if (closed && pcs.length >= 2) {
@@ -1745,6 +1745,7 @@ export function edges2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist, zetaF
   // 降自由度时焦散是整个晕面, 没有 "焦散的边界线" 可追 (追了只是在噪声里打转几分钟); 晕面按边界曲线的像画 (见 orientRank1)
   if ((surfId == null || surfId === 'caustic') && orientRank1(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg)) { out.rank1 = true; return out; }
   const exact = computeDivergentEdges(lpFaces, m, fx, surfId, lampElev, lampDist, eyeHeight, maxDist, 0.5, true, cancelled, fine);
+  if (fine && (surfId == null || surfId === 'caustic')) dropOffCausticEnds(exact, lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg, lampElev, lampDist, eyeHeight, maxDist);
   const ownName = surfaceFenceName(lpFaces, surfId);
   for (const tk of exact) {
     let dst;
@@ -1759,6 +1760,59 @@ export function edges2Dof(lpFaces, lampElev, lampDist, eyeHeight, maxDist, zetaF
     out.tracks.push({ kind: tk.kind, label: tk.label, n: tk.hs.length, h0: tk.hs[0], h1: tk.hs[tk.hs.length - 1], nShadow: tk.nShadow });
   }
   return out;
+}
+
+// 修正版: 焦散的末端点轨迹里, 不在焦散面上的线不要.
+//   解决什么: 末端点引擎把 "边界上 Ĵ = 0 的点" 都当成焦散的末端沿 h 延拓. 有的这种点旁边并没有焦散 —— 那里只是边界像自己
+//   经过的地方 (独立的光线追踪: 线两侧能把灯光折进眼睛的取向个数只差 1, 是一张边界像; 焦散是折叠, 该差 2). 原窗体的层线在
+//   这些 h 上也多出一支假焦散, 修正版的层线 (traceCausticFine + coneMapRunsFine) 没有它, 球壳引擎也没有. 例: 3-5-6-8 Lowitz
+//   Σ10.5 焦散有 8 条这样的线 (各 17 m, 从眼睛连到灯, 离晕面 60°), 画出来是横在半空的 "出射临界 / 接缝" 线.
+//   判据: 轨迹每段取两个点, 在该点所在的 h 上另算修正版的焦散层线 —— 真末端就是层线的端点 (差 1e-6 m 量级); 或者落在
+//   点状的像上 (退化纤维 = 焦点: 这种线与焦线重合, 留着). 两个点都对不上的段丢掉. 每层 ~10 ms, 同一个 h 只算一次.
+function dropOffCausticEnds(tracks, lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg, lampElev, lampDist, eyeHeight, maxDist) {
+  if (!tracks.some(tk => tk.kind === 'end' && tk.pts3.length)) return;
+  const { m, fx, P } = lp2DofSetup(lpFaces, zetaFree, fixedZetaDeg, fixedThetaDeg);
+  const er = lampElev * Math.PI / 180, L = [lampDist * Math.cos(er), 0, lampDist * Math.sin(er)], E = [0, 0, eyeHeight];
+  const oldTH = LP.TH * 180 / Math.PI, cache = new Map();
+  const layerAt = hDeg => {
+    const key = hDeg.toFixed(5);
+    let v = cache.get(key);
+    if (!v) {
+      setSun(hDeg);
+      const fr = traceCausticFine(P, m, fx, 101), fc = [], pts = [];
+      coneMapRunsFine(fr, hDeg, m, fx, P, L, E, maxDist, fr.mid || midCorrector(P, m, fx, true), fc, true, false, pts);
+      cache.set(key, v = { curves: fc.map(c => c.p), pts });
+    }
+    return v;
+  };
+  const distTo = (q, lay) => {
+    let bd = Infinity;
+    for (const p of lay.curves) for (let i = 0; i + 5 < p.length; i += 3) {
+      const ex = p[i + 3] - p[i], ey = p[i + 4] - p[i + 1], ez = p[i + 5] - p[i + 2], l2 = ex * ex + ey * ey + ez * ez;
+      let t = l2 > 0 ? ((q[0] - p[i]) * ex + (q[1] - p[i + 1]) * ey + (q[2] - p[i + 2]) * ez) / l2 : 0;
+      t = t < 0 ? 0 : t > 1 ? 1 : t;
+      bd = Math.min(bd, Math.hypot(q[0] - p[i] - t * ex, q[1] - p[i + 1] - t * ey, q[2] - p[i + 2] - t * ez));
+    }
+    for (const c of lay.pts) bd = Math.min(bd, Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]));
+    return bd;
+  };
+  try {
+    for (const tk of tracks) {
+      if (tk.kind !== 'end') continue;
+      tk.pts3 = tk.pts3.filter(pc => {
+        const p = pc.p, n = p.length / 3;
+        if (n < 4) return true;
+        for (const f of [0.3, 0.7]) {
+          const i = Math.floor(f * n), q = [p[3 * i], p[3 * i + 1], p[3 * i + 2]], dl = Math.hypot(q[0] - L[0], q[1] - L[1], q[2] - L[2]);
+          if (!(dl > 1e-9)) return true;
+          const h = Math.asin(Math.max(-1, Math.min(1, (L[2] - q[2]) / dl))) * 180 / Math.PI;
+          if (Math.abs(h) > 89) return true;
+          if (distTo(q, layerAt(h)) <= 1e-3 * (1 + dl)) return true;
+        }
+        return false;
+      });
+    }
+  } finally { setSun(oldTH); }
 }
 
 // 修正版去重: 同一条脊线可能被不同种子各追一遍 (参数差 2π 的同一解, 原窗体判重时没折回) → 三维折线逐点重合的只留一条
