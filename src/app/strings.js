@@ -108,6 +108,8 @@ export default {
   'res.empty': ['还没有结果.', 'No results yet.'],
   'res.points': ['采样点', 'samples'], 'res.mesh': ['网格', 'mesh'], 'res.meshLine': ['{n} 三角形 · {ms} ms', '{n} triangles · {ms} ms'],
   'res.layers': ['h 层', 'h layers'], 'res.shells': ['球壳层', 'shells'], 'res.layersLine': ['{n} 层有曲线 · {c} 条', '{n} layers with curves · {c} curves'], 'res.bdry': ['边界段', 'boundary pieces'],
+  'res.check': ['网格自检', 'mesh check'], 'res.checkOk': ['开口边都在边界上', 'every open edge lies on a boundary'],
+  'res.checkFilled': [' · 补了 {n} 个小洞', ' · {n} small holes filled'], 'res.checkBad': ['有 {d}° 的开口边不在边界上 (缺口)', '{d}° of open edges are off the boundary (gaps)'],
   'res.bdryKinds1': ['掠入 / 镜面 / 出射', 'entry / mirror / exit'],
   'res.bdryKinds2': ['掠入 / 出射 / 接缝 / 转折 / 尖点', 'entry / exit / seam / turn / cusp'],
   'res.surf': ['曲面', 'surface'], 'res.surfFallback': ['这条光路没有选中的曲线, 已改用焦散', 'this path has no such curve; using the caustic'],

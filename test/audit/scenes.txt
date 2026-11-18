@@ -1,0 +1,31 @@
+# 贴边审计的场景 (node test/audit/run.mjs): code mode el D surf fix
+# 都是出过问题的: 段间缝、掐断点旁的洞、边没贴到边界线、降自由度光路算不完 …
+
+# 极点线 (Lowitz: 过灯的水平面里的真边界, 只在灯光仰角 h = 0 上存在)
+3-1-5-8 lowitz 87.5 4.5 entry 0
+3-1-5-8 lowitz 34.5 12.5 entry 0
+3-1-5-8 lowitz 10.5 15 deg1 0
+3-4-5 lowitz 10.5 15 entry 0
+3-1-5 lowitz 87.5 4.5 entry 0
+3-5 lowitz 15.5 15 entry 0
+3-5 lowitz 10.5 15 exit 0
+
+# 掐断点 (鞍点) / 灯旁 / 晕面的顶
+3-1-5 parry 87.5 4.5
+3-1-5 parry 34.5 12.5
+3-5-6-8 parry 34.5 12.5
+1-2-3-1 parry 34.5 12.5
+1-2-3-1 plate 34.5 12.5
+3-5 parry 10 15
+3-1-5 column 87.5 4.5 entry -90
+3-1-5-8 column 34.5 12.5 blue1 -90
+3-5-6-8 lowitz 34.5 12.5 blue2 0
+3-5-6-8 lowitz 34.5 12.5 blue1 0
+3-5-6 column 34.5 12.5 exit -90
+3-1-2 column 34.5 12.5 exit -90
+4-6 lowitz 10.5 15 caustic 0
+3-5-6-8 lowitz 10.5 15 caustic 0
+
+# 降自由度 (焦散 = 各条边界曲线的像之并)
+3-5-6-8 column 20.5 4.5 caustic -90
+3-5-6-8 column 34.5 12.5 caustic -90

@@ -33,10 +33,16 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   const maxD = opt.maxD || 80, rMin = opt.rMin || 1e-3 * D, rMax = opt.rMax || maxD + D;
   const N0 = opt.rows || 72;
   let SKY = opt.skyStep > 0 ? opt.skyStep : 0.5 * DEG;
+  // 交界层 (这一段的最里、最外一层, 相邻段各算一次): 顶点按传入的点距 SKY0 取 —— 各段传进来的一样; 段内的点距可以按
+  //   这一段的预算放大, 交界层不跟着变, 两段在交界层上的顶点才逐位相同 (否则两侧的三角形边对不上, 屏幕上是一圈细缝)
+  const SKY0 = SKY;
   let GAPSKY = Math.max(1.2 * DEG, 3 * SKY), MAXEDGE = Math.max(4 * GAPSKY, 5 * DEG);
   const CAPMAX = 1 * DEG, VBUDGET = opt.budget || 90000;
   const EPSR = opt.epsR || 5e-4, CRIT = 2e-4, PINL = opt.pinLamp || 1e-3;
-  const MAXCALLS = opt.maxCalls || 900, MAXROWS = opt.maxRows || 700;
+  // 层数上限随初始层数 (一段只有七八层初始层时不许加到几百层: 那是相邻层反复对不上在空转, 每层都是整圈轮廓,
+  //   三角形与用时一起爆掉); softMs: 加密用掉这么久就收手, 用已有的层出网格 (不整段作废)
+  const MAXROWS = opt.maxRows || Math.max(60, Math.min(700, 12 * N0 + 80)), MAXCALLS = opt.maxCalls || Math.round(1.3 * MAXROWS);
+  const SOFTMS = opt.softMs || Infinity;
   const FOLDW = Math.max(0.05 * DEG, 0.25 * SKY);          // 折点检测: 前后各沿线走这么长 (天空弧长) 比方向 (最小尺度)
   const CORNW = Math.max(FOLDW, SKY), FOLDC = Math.cos(100 * DEG);   // 最大尺度; 两段弦夹角超过 120° (最小尺度) / 100° (更大尺度) 算折回
   const tol3 = r => 0.01 + 1e-3 * r;                       // 三维容差 (弦高、径向弯曲)
@@ -60,7 +66,9 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       if (i) s[i] = s[i - 1] + Math.hypot(p[3 * i] - p[3 * i - 3], p[3 * i + 1] - p[3 * i - 2], p[3 * i + 2] - p[3 * i - 1]);
       for (let k = 0; k < 3; k++) { lo[k] = Math.min(lo[k], p[3 * i + k]); hi[k] = Math.max(hi[k], p[3 * i + k]); }
     }
-    LN.push({ id: LN.length, kind: l.kind || 'edge', p, n, s, lo, hi });
+    // 闭合的线 (首尾同一点; 如极点线): 线上两点之间走短的那一边, 可以越过起止点
+    const closed = n > 3 && Math.hypot(p[0] - p[3 * n - 3], p[1] - p[3 * n - 2], p[2] - p[3 * n - 1]) < 1e-5;
+    LN.push({ id: LN.length, kind: l.kind || 'edge', p, n, s, lo, hi, tot: s[n - 1], closed });
   }
   // q 附近 (tol 之内) 的所有线 (kindOk 过滤), 每条线取最近点: → [{ id, s, d }] (可空).
   //   同一条边界线常有几份重合的副本 (不同分组 / 镜像各给一次), 只取最近的一条会在相邻层间换来换去 —— 全留下, 有共同的线就算同一条
@@ -90,15 +98,52 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   const sharedLine = (la, lb) => {
     if (!la || !lb) return null;
     let best = null;
-    for (const a of la) for (const b of lb) if (a.id === b.id) { const ds = Math.abs(a.s - b.s); if (!best || ds < best.ds) best = { id: a.id, sa: a.s, sb: b.s, ds }; }
+    for (const a of la) for (const b of lb) if (a.id === b.id) {
+      let ds = Math.abs(a.s - b.s);
+      if (LN[a.id].closed && ds > 0.5 * LN[a.id].tot) ds = LN[a.id].tot - ds;
+      if (!best || ds < best.ds) best = { id: a.id, sa: a.s, sb: b.s, ds };
+    }
     return best;
   };
-  // 线 id 上弧长 s0 → s1 之间 (不含两端) 的点, 按 s0 → s1 的顺序
+  // 线 id 上弧长 s0 → s1 之间 (不含两端) 的点, 按 s0 → s1 的顺序 (闭合的线走短的那一边)
   const linePts = (id, s0, s1) => {
     const ln = LN[id], out = [], a = Math.min(s0, s1), b = Math.max(s0, s1);
-    for (let i = 0; i < ln.n; i++) if (ln.s[i] > a + 1e-9 && ln.s[i] < b - 1e-9) out.push([ln.p[3 * i], ln.p[3 * i + 1], ln.p[3 * i + 2]]);
+    const pt = i => [ln.p[3 * i], ln.p[3 * i + 1], ln.p[3 * i + 2]];
+    if (ln.closed && b - a > 0.5 * ln.tot) {
+      // 越过起止点 (第 0 点与最后一点是同一个点, 只取一次)
+      if (s0 < s1) { for (let i = ln.n - 2; i >= 0; i--) if (ln.s[i] < s0 - 1e-9) out.push(pt(i)); for (let i = ln.n - 2; i >= 1; i--) if (ln.s[i] > s1 + 1e-9) out.push(pt(i)); }
+      else { for (let i = 1; i < ln.n; i++) if (ln.s[i] > s0 + 1e-9) out.push(pt(i)); for (let i = 1; i < ln.n - 1; i++) if (ln.s[i] < s1 - 1e-9) out.push(pt(i)); }
+      return out;
+    }
+    for (let i = 0; i < ln.n; i++) if (ln.s[i] > a + 1e-9 && ln.s[i] < b - 1e-9) out.push(pt(i));
     if (s0 > s1) out.reverse();
     return out;
+  };
+  // 这些点离眼的距离都夹在两层半径之间吗 (tol: 相对放宽量). 两层各有一个末端点落在同一条边界线上、两点之间的那段线又没出过
+  //   这两层的半径范围 ⟹ 那段线就是晕面在这两层之间的边
+  const inBand = (Q, r0, r1, tol) => {
+    const lo = Math.min(r0, r1) * (1 - tol), hi = Math.max(r0, r1) * (1 + tol);
+    for (const q of Q) { const rq = Math.hypot(q[0] - E[0], q[1] - E[1], q[2] - E[2]); if (rq < lo || rq > hi) return false; }
+    return true;
+  };
+  const BAND = 2e-5;                       // 远小于临界半径两侧那对层的间距 (2·CRIT): 线的极值点不算 "夹在" 相邻的下一对层之间
+  // q0 → q1 沿边界线走的点 (不含两端; 可空): 同一条线; 或两条在端点相接的线 (晕面的角点). 走不通 (不在这两层之间) 返回 null
+  const linePath = (q0, q1, r0, r1) => {
+    if (!q0.lab || !q1.lab) return null;
+    const sh = sharedLine(q0.lab, q1.lab);
+    if (sh) { const Q = linePts(sh.id, sh.sa, sh.sb); if (inBand(Q, r0, r1, BAND)) return Q; }
+    for (const a of q0.lab) for (const b of q1.lab) {
+      if (a.id === b.id) continue;
+      const la = LN[a.id], lb = LN[b.id];
+      if (la.closed || lb.closed) continue;
+      for (const ea of [0, la.n - 1]) for (const eb of [0, lb.n - 1]) {
+        const ca = [la.p[3 * ea], la.p[3 * ea + 1], la.p[3 * ea + 2]], cb = [lb.p[3 * eb], lb.p[3 * eb + 1], lb.p[3 * eb + 2]];
+        if (dist3(ca, cb) > 1e-3 * Math.max(r0, r1)) continue;
+        const Q = [...linePts(a.id, a.s, la.s[ea]), ca, ...linePts(b.id, lb.s[eb], b.s)];
+        if (inBand(Q, r0, r1, BAND)) return Q;
+      }
+    }
+    return null;
   };
   // 两层之间这段线可信吗: 线上的点离眼距离落在两层半径之间 (略放宽), 且离两端连线不超过两端距离的一半 ——
   //   否则 (共同的线在两端之间绕了远路、或是另一处交点) 不用它
@@ -119,10 +164,12 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   };
 
   // ---- 顶点表
-  let VP = new Float64Array(3 * 65536), VU = new Float64Array(3 * 65536), nv = 0;
-  const addV = (p, u) => {
-    if (3 * nv + 3 > VP.length) { const a = new Float64Array(2 * VP.length); a.set(VP); VP = a; const b = new Float64Array(2 * VU.length); b.set(VU); VU = b; }
+  // VF: 顶点的标记 (自检用): 1 = 可以在晕面边界上 (弧的末端点 / 截断点, 边界线上的点, 灯), 2 / 4 = 在这一段最里 / 最外一层上
+  let VP = new Float64Array(3 * 65536), VU = new Float64Array(3 * 65536), VF = new Uint8Array(65536), nv = 0;
+  const addV = (p, u, f = 0) => {
+    if (3 * nv + 3 > VP.length) { const a = new Float64Array(2 * VP.length); a.set(VP); VP = a; const b = new Float64Array(2 * VU.length); b.set(VU); VU = b; const c = new Uint8Array(2 * VF.length); c.set(VF); VF = c; }
     VP[3 * nv] = p[0]; VP[3 * nv + 1] = p[1]; VP[3 * nv + 2] = p[2]; VU[3 * nv] = u[0]; VU[3 * nv + 1] = u[1]; VU[3 * nv + 2] = u[2];
+    VF[nv] = f;
     return nv++;
   };
   const vu = v => [VU[3 * v], VU[3 * v + 1], VU[3 * v + 2]];
@@ -136,24 +183,29 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   };
 
   // ---- 一层: 引擎 → 弧 (天空累计弧长) → 特殊点
-  let calls = 0;
-  const seedsOf = (...rows) => {
+  let calls = 0, cutSeq = 0;
+  const seedsOf = (dense, ...rows) => {
     const runs = [];
     for (const rw of rows) if (rw && rw.states) for (const run of rw.states) if (run && run.length) runs.push(run);
     if (!runs.length) return null;
-    const per = Math.max(3, Math.min(16, Math.floor(80 / runs.length))), out = [];
+    const per = dense ? Math.max(8, Math.min(120, Math.floor(600 / runs.length))) : Math.max(3, Math.min(16, Math.floor(80 / runs.length))), out = [];
     for (const run of runs) { const st = Math.max(1, Math.floor(run.length / per)); for (let i = st >> 1; i < run.length; i += st) out.push(run[i]); out.push(run[0], run[run.length - 1]); }
     return out;
   };
   // 弧: U = 单位视方向 (3n), S = 累计天空弧长; 折点检测
-  const makeArc = (row, U, n, closed, headType, tailType, joints = []) => {
+  const makeArc = (row, U, n, closed, headType, tailType, joints = [], cuts = null) => {
     const S = new Float64Array(n);
     for (let i = 1; i < n; i++) S[i] = S[i - 1] + angU([U[3 * i - 3], U[3 * i - 2], U[3 * i - 1]], [U[3 * i], U[3 * i + 1], U[3 * i + 2]]);
     const len = S[n - 1] + (closed && n > 2 ? angU([U[3 * n - 3], U[3 * n - 2], U[3 * n - 1]], [U[0], U[1], U[2]]) : 0);
     const arc = { U, n, S, len, closed, sp: [], ai: row.arcs.length };
     const uAt = i => [U[3 * i], U[3 * i + 1], U[3 * i + 2]];
     const mk = (t, type, u) => ({ t, type, u, p: at(row.r, u), arc, lab: null, chain: -1 });
-    if (!closed) { arc.sp.push(mk(0, headType, uAt(0))); arc.sp.push(mk(S[n - 1], tailType, uAt(n - 1))); }
+    if (!closed) {
+      const h = mk(0, headType, uAt(0)), t = mk(S[n - 1], tailType, uAt(n - 1));
+      // 截断点的配对号: 同一条轮廓上被截断球面切掉的一段, 它两头的两个截断点同号 (joinPieces 只把同号的接上)
+      if (cuts) { if (headType === 'cut') h.cutId = cuts[0]; if (tailType === 'cut') t.cutId = cuts[1]; }
+      arc.sp.push(h); arc.sp.push(t);
+    }
     // 接头 (引擎分段给的同一条轮廓并接处; 退化弧两侧的两支在焦点处相接 —— 两张面交于焦线): 也是特殊点, 段在这里切开
     for (const j of joints) if ((j > 0 && j < n - 1) || closed) arc.sp.push(mk(S[Math.min(j, n - 1)], 'joint', uAt(Math.min(j, n - 1))));
     // 折点 (轮廓在天空里折回 —— 曲面的折痕): 前后各沿线走 W 的两段弦夹角 > 120° (W = FOLDW) 或 > 100° (W = 2·FOLDW … 到一个天空步长)
@@ -232,6 +284,17 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       if (closed && fs.length > 1 && fs[0].t + len - fs[fs.length - 1].t < FOLDW) fs[fs.length - 1].dup = true;
       arc.sp = arc.sp.filter(q => !q.dup);
     }
+    // 折点与接头落在同一处 (引擎分段的并接处常常就是轮廓在天空里折回的地方): 两个特殊点挤在一起, 相邻层间次序随意对调,
+    //   段就对不上 (当成拓扑在变). 留接头 (每层都有, 身份稳定), 折点并进去 (foldAt: 画折叠线时照样算折点)
+    {
+      const js = arc.sp.filter(q => q.type === 'joint');
+      if (js.length) for (const f of arc.sp) {
+        if (f.type !== 'fold') continue;
+        const j = js.find(q => { let d = Math.abs(q.t - f.t); if (closed) d = Math.min(d, len - d); return d < FOLDW; });
+        if (j) { j.foldAt = true; f.dup = true; }
+      }
+      arc.sp = arc.sp.filter(q => !q.dup);
+    }
     arc.sp.sort((x, y) => x.t - y.t);
     // 标签: 末端点 → 最近的非尖点脊线的三维边界线; 折点 → 最近的尖点脊线 (焦散的折点就在尖点脊线上)
     for (const q of arc.sp) {
@@ -244,10 +307,10 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     for (const q of arc.sp) row.sp.push(q);
     return arc;
   };
-  const buildRow = (r, nbA, nbB, kind) => {
+  const buildRow = (r, nbA, nbB, kind, dense = false) => {
     if (cancelled && cancelled()) throw new Error('cancelled');
     calls++;
-    const s = compute(r, { seeds: seedsOf(nbA, nbB) }) || { arcs: [] };
+    const s = compute(r, { seeds: seedsOf(dense, nbA, nbB) }) || { arcs: [] };
     const row = { r, kind, arcs: [], sp: [], raw: [], states: s.states || null, lmin: Infinity, lmax: -Infinity };
     for (const q of s.focal || []) {
       if (Math.hypot(q[0] - L[0], q[1] - L[1], q[2] - L[2]) > maxD) continue;
@@ -306,7 +369,9 @@ export function meshShellSurface(compute, L, E, opt = {}) {
         let e = q; while (e + 1 < order.length && ok[order[e + 1]]) e++;
         runs.push([q, e]); q = e + 1;
       }
-      for (const [q0, q1] of runs) {
+      const cut0 = cutSeq; cutSeq += runs.length + 1;
+      for (let ri = 0; ri < runs.length; ri++) {
+        const [q0, q1] = runs[ri];
         const idx = order.slice(q0, q1 + 1), head = q0 > 0 || closed ? cut(order[q0], order[(q0 - 1 + order.length) % order.length]) : null;
         const tail = q1 < order.length - 1 || closed ? cut(order[q1], order[(q1 + 1) % order.length]) : null;
         const m = idx.length + (head ? 1 : 0) + (tail ? 1 : 0), V = new Float64Array(3 * m);
@@ -315,7 +380,8 @@ export function meshShellSurface(compute, L, E, opt = {}) {
         for (const i of idx) { V[3 * k] = U[3 * i]; V[3 * k + 1] = U[3 * i + 1]; V[3 * k + 2] = U[3 * i + 2]; k++; }
         if (tail) V.set(tail, 3 * k);
         if (m < 2) continue;
-        pre.push({ V, m, closed: false, h: head ? 'cut' : 'end', t: tail ? 'cut' : 'end', J: [] });
+        // 第 ri 段的头与上一段的尾之间是切掉的一段 (闭环: 最后一段的尾接回第一段的头)
+        pre.push({ V, m, closed: false, h: head ? 'cut' : 'end', t: tail ? 'cut' : 'end', J: [], hc: cut0 + ri, tc: closed && ri === runs.length - 1 ? cut0 : cut0 + ri + 1 });
       }
     }
     // 退化的弧 (整条映到天上同一点, 天空直径 < 1e-5 rad; 如一自由度 1-3-2 ζ90 每层都是): 焦点, 不当弧 (二自由度引擎已先做了这一步)
@@ -326,6 +392,91 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       if (mx >= 1e-5) continue;
       pre.splice(i, 1);
       if (Math.hypot(...at(r, u0).map((x, k) => x - L[k])) <= maxD && !row.sp.some(q => q.type === 'focal' && angU(q.u, u0) < 1e-5)) row.sp.push({ t: 0, type: 'focal', u: u0, p: at(r, u0), arc: null, lab: null, chain: -1 });
+    }
+    // 并集 (opt.union; 降自由度的光路): 各条边界曲线的像互相重叠着铺满同一条轮廓 (取向的每条纤维两头都落在边界上, 轮廓上
+    //   每一点至少被盖两次), 每条像的末端多半落在别的像中间 —— 不是轮廓的真末端. 不并的话: 重叠的几张面各铺各的, 假末端
+    //   在相邻层间时有时无 (层层当成拓扑在变, 二分加层到上限), 接不上的地方留细缝.
+    //   并法: 长的先留; 后面的每条只留没被已留的盖住的部分, 而且从已留弧的端点接着走 (接头逐位相同, 下面的首尾并接
+    //   把它们并成一条). 已留的线段登记在方向空间的格子里, 查一个点只看周围 27 格
+    if (opt.union && pre.length > 1) {
+      const TOLU = 1e-4, G = 96, cells = new Map(), segs = [], ends = [];
+      const cellOf = (x, y, z) => (Math.floor((x + 1) * G) * 256 + Math.floor((y + 1) * G)) * 256 + Math.floor((z + 1) * G);
+      const reg = a => {
+        for (let i = 0; i + 1 < a.m + (a.closed ? 1 : 0); i++) {
+          const j = (i + 1) % a.m, si = segs.length / 6;
+          const ax = a.V[3 * i], ay = a.V[3 * i + 1], az = a.V[3 * i + 2], bx = a.V[3 * j], by = a.V[3 * j + 1], bz = a.V[3 * j + 2];
+          segs.push(ax, ay, az, bx, by, bz);
+          const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, by - ay, bz - az) * 2 * G));
+          let last = -1;
+          for (let k = 0; k <= n; k++) {
+            const f = k / n, c = cellOf(ax + f * (bx - ax), ay + f * (by - ay), az + f * (bz - az));
+            if (c === last) continue;
+            last = c;
+            const l = cells.get(c);
+            if (l) { if (l[l.length - 1] !== si) l.push(si); } else cells.set(c, [si]);
+          }
+        }
+        if (!a.closed) ends.push([a.V[0], a.V[1], a.V[2]], [a.V[3 * a.m - 3], a.V[3 * a.m - 2], a.V[3 * a.m - 1]]);
+      };
+      const covered = (x, y, z) => {                  // 这个方向离已留的线不到 TOLU
+        const cx = Math.floor((x + 1) * G), cy = Math.floor((y + 1) * G), cz = Math.floor((z + 1) * G);
+        for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) for (let dz = -1; dz <= 1; dz++) {
+          const l = cells.get(((cx + dx) * 256 + cy + dy) * 256 + cz + dz);
+          if (!l) continue;
+          for (const si of l) {
+            const ax = segs[6 * si], ay = segs[6 * si + 1], az = segs[6 * si + 2], ex = segs[6 * si + 3] - ax, ey = segs[6 * si + 4] - ay, ez = segs[6 * si + 5] - az;
+            const qx = x - ax, qy = y - ay, qz = z - az, l2 = ex * ex + ey * ey + ez * ez;
+            let t = l2 > 0 ? (qx * ex + qy * ey + qz * ez) / l2 : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+            if (Math.hypot(qx - t * ex, qy - t * ey, qz - t * ez) <= TOLU) return true;
+          }
+        }
+        return false;
+      };
+      // 已留弧的端点里, 落在线段 p → q 上 (2·TOLU 之内) 的那个: 新的一截从它起
+      const endOn = (p, q) => {
+        const ex = q[0] - p[0], ey = q[1] - p[1], ez = q[2] - p[2], l2 = ex * ex + ey * ey + ez * ez;
+        let best = null, bd = 2 * TOLU;
+        for (const e of ends) {
+          const qx = e[0] - p[0], qy = e[1] - p[1], qz = e[2] - p[2];
+          let t = l2 > 0 ? (qx * ex + qy * ey + qz * ez) / l2 : 0; t = t < 0 ? 0 : t > 1 ? 1 : t;
+          const d = Math.hypot(qx - t * ex, qy - t * ey, qz - t * ez);
+          if (d < bd) { bd = d; best = e; }
+        }
+        return best;
+      };
+      const lenOfPre = a => { let l = 0; for (let i = 1; i < a.m; i++) l += angU([a.V[3 * i - 3], a.V[3 * i - 2], a.V[3 * i - 1]], [a.V[3 * i], a.V[3 * i + 1], a.V[3 * i + 2]]); return l; };
+      const order = pre.map(a => [lenOfPre(a), a]).sort((x, y) => y[0] - x[0]).map(x => x[1]);
+      const out = [];
+      let nCut = 0;
+      for (const a of order) {
+        const P = i => [a.V[3 * i], a.V[3 * i + 1], a.V[3 * i + 2]];
+        const on = new Uint8Array(a.m);
+        let nOn = 0;
+        if (segs.length) for (let i = 0; i < a.m; i++) if (covered(a.V[3 * i], a.V[3 * i + 1], a.V[3 * i + 2])) { on[i] = 1; nOn++; }
+        if (nOn === a.m) { nCut++; continue; }                               // 整条被盖住
+        if (nOn === 0) { out.push(a); reg(a); continue; }
+        nCut++;
+        // 没被盖住的各截 (闭环从一个被盖住的点起算, 当开弧切)
+        const idx = [];
+        if (a.closed) { const k0 = on.indexOf(1); for (let k = 0; k <= a.m; k++) idx.push((k0 + k) % a.m); } else for (let k = 0; k < a.m; k++) idx.push(k);
+        const fresh = [];
+        for (let q = 0; q < idx.length;) {
+          if (on[idx[q]]) { q++; continue; }
+          let e = q; while (e + 1 < idx.length && !on[idx[e + 1]]) e++;
+          const pts = [];
+          if (q > 0) { const pv = P(idx[q - 1]), cu = P(idx[q]); pts.push(endOn(pv, cu) || pv); }
+          for (let k = q; k <= e; k++) pts.push(P(idx[k]));
+          if (e + 1 < idx.length) { const cu = P(idx[e]), nx = P(idx[e + 1]); pts.push(endOn(cu, nx) || nx); }
+          if (pts.length >= 2) {
+            const V = new Float64Array(3 * pts.length);
+            pts.forEach((p, k) => { V[3 * k] = p[0]; V[3 * k + 1] = p[1]; V[3 * k + 2] = p[2]; });
+            fresh.push({ V, m: pts.length, closed: false, h: q === 0 && !a.closed ? a.h : 'end', t: e === idx.length - 1 && !a.closed ? a.t : 'end', J: [], hc: q === 0 && !a.closed ? a.hc : undefined, tc: e === idx.length - 1 && !a.closed ? a.tc : undefined });
+          }
+          q = e + 1;
+        }
+        for (const f of fresh) { out.push(f); reg(f); }
+      }
+      if (nCut) { pre.length = 0; pre.push(...out); stat.unionCuts = (stat.unionCuts || 0) + nCut; }
     }
     // 重复的弧: 整条落在另一条弧上 (天空里 1e-4 rad 以内; 两条折线取样不同, 弯处弦高本身就到 1e-5 量级) 的去掉. 焦点附近引擎有时给出两条状态空间里不同、天空像完全
     //   重合的弧 (3-5 column ζ−90 Σ10 r≈0.65), 不去掉的话下面会把它们首尾并成闭环, 相邻层间拓扑乱跳
@@ -362,29 +513,55 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     // 首尾相接的弧并成一条: 引擎把一条轮廓分成几段给 (边界像在 σ 的一支没了、另一支接着走的地方断开; 两条段在那里
     //   端点重合), 这种接头不是末端点 (不落在任何边界线上). 并接后若真是尖角, 折点检测会认出来; 首尾相接的成闭环
     const JOIN = 1e-6;
+    // 两个末端算不算同一点: 1e-6 rad 以内; 都不在边界线上的放宽到 1e-4 rad (对称面上左右两半的轮廓各自停在离对称面
+    //   千分之几度处, 不并的话晕面沿对称面留一道零宽的缝 —— 两条挨着的 "边")
+    const near2 = (u, v) => {
+      const g = angU(u, v);
+      if (g < JOIN) return true;
+      if (g >= 1e-4) return false;
+      const tolL = Math.max(1e-6, 2e-3 * r);
+      return !(LN.length && (nearLines(at(r, u), k => k !== 'cusp', tolL) || nearLines(at(r, v), k => k !== 'cusp', tolL)));
+    };
     const endU = (a, tail) => { const i = tail ? a.m - 1 : 0; return [a.V[3 * i], a.V[3 * i + 1], a.V[3 * i + 2]]; };
-    const flip = a => { const V = new Float64Array(3 * a.m); for (let i = 0; i < a.m; i++) { V[3 * i] = a.V[3 * (a.m - 1 - i)]; V[3 * i + 1] = a.V[3 * (a.m - 1 - i) + 1]; V[3 * i + 2] = a.V[3 * (a.m - 1 - i) + 2]; } return { V, m: a.m, closed: false, h: a.t, t: a.h, J: a.J.map(j => a.m - 1 - j) }; };
-    const cat = (a, b) => { const V = new Float64Array(3 * (a.m + b.m - 1)); V.set(a.V.subarray(0, 3 * a.m)); V.set(b.V.subarray(3, 3 * b.m), 3 * a.m); return { V, m: a.m + b.m - 1, closed: false, h: a.h, t: b.t, J: [...a.J, a.m - 1, ...b.J.map(j => j + a.m - 1)] }; };
+    const flip = a => { const V = new Float64Array(3 * a.m); for (let i = 0; i < a.m; i++) { V[3 * i] = a.V[3 * (a.m - 1 - i)]; V[3 * i + 1] = a.V[3 * (a.m - 1 - i) + 1]; V[3 * i + 2] = a.V[3 * (a.m - 1 - i) + 2]; } return { V, m: a.m, closed: false, h: a.t, t: a.h, J: a.J.map(j => a.m - 1 - j), hc: a.tc, tc: a.hc }; };
+    const cat = (a, b) => { const V = new Float64Array(3 * (a.m + b.m - 1)); V.set(a.V.subarray(0, 3 * a.m)); V.set(b.V.subarray(3, 3 * b.m), 3 * a.m); return { V, m: a.m + b.m - 1, closed: false, h: a.h, t: b.t, J: [...a.J, a.m - 1, ...b.J.map(j => j + a.m - 1)], hc: a.hc, tc: b.tc }; };
     for (let again = true; again;) {
       again = false;
       for (let i = 0; i < pre.length && !again; i++) {
         const a = pre[i];
         if (a.closed) continue;
-        if (a.m > 2 && a.h === 'end' && a.t === 'end' && angU(endU(a, false), endU(a, true)) < JOIN) { a.m--; a.closed = true; a.J.push(0); again = true; break; }
+        if (a.m > 2 && a.h === 'end' && a.t === 'end' && angU(endU(a, false), endU(a, true)) < JOIN) { a.m--; a.closed = true; again = true; break; }
         for (let j = i + 1; j < pre.length && !again; j++) {
           const b = pre[j];
           if (b.closed) continue;
           let c = null;
-          if (a.t === 'end' && b.h === 'end' && angU(endU(a, true), endU(b, false)) < JOIN) c = cat(a, b);
-          else if (a.t === 'end' && b.t === 'end' && angU(endU(a, true), endU(b, true)) < JOIN) c = cat(a, flip(b));
-          else if (a.h === 'end' && b.t === 'end' && angU(endU(a, false), endU(b, true)) < JOIN) c = cat(b, a);
-          else if (a.h === 'end' && b.h === 'end' && angU(endU(a, false), endU(b, false)) < JOIN) c = cat(flip(a), b);
+          if (a.t === 'end' && b.h === 'end' && near2(endU(a, true), endU(b, false))) c = cat(a, b);
+          else if (a.t === 'end' && b.t === 'end' && near2(endU(a, true), endU(b, true))) c = cat(a, flip(b));
+          else if (a.h === 'end' && b.t === 'end' && near2(endU(a, false), endU(b, true))) c = cat(b, a);
+          else if (a.h === 'end' && b.h === 'end' && near2(endU(a, false), endU(b, false))) c = cat(flip(a), b);
           if (c) { pre[i] = c; pre.splice(j, 1); again = true; }
         }
       }
     }
+    // 首尾差一点没合上的弧 (两端相距不到半个点距、也不到弧长的 2%, 而且都不在边界线上): 当闭环. 引擎的轮廓在对称面上、
+    //   灯旁、几条边界像换手处常差这么一点 (千分之几度到零点几度); 留着当开弧的话, 两个末端挤在一起, 相邻层间谁连谁
+    //   是随意的, 8 字形的闭环还可能两层从不同的那一次过叉点处断开 —— 按弧长比例对应就错开半圈
     for (const a of pre) {
-      makeArc(row, a.V, a.m, a.closed, a.h, a.t, a.J);
+      if (a.closed || a.m < 8 || a.h !== 'end' || a.t !== 'end') continue;
+      const u0 = endU(a, false), u1 = endU(a, true), g = angU(u0, u1);
+      if (g >= 0.5 * SKY0) continue;
+      let len = 0;
+      for (let i = 1; i < a.m; i++) len += angU([a.V[3 * i - 3], a.V[3 * i - 2], a.V[3 * i - 1]], [a.V[3 * i], a.V[3 * i + 1], a.V[3 * i + 2]]);
+      if (g >= 0.02 * len) continue;
+      const tolL = Math.max(1e-6, 2e-3 * r);
+      if (LN.length && (nearLines(at(r, u0), k => k !== 'cusp', tolL) || nearLines(at(r, u1), k => k !== 'cusp', tolL))) continue;
+      a.closed = true; a.J = a.J.filter(j => j > 0 && j < a.m - 1);
+      stat.closedArcs = (stat.closedArcs || 0) + 1;
+    }
+    for (const a of pre) {
+      // 并集模式下接头不当特殊点: 那里只是两条边界像换手的地方 (留哪条、从哪接, 随各条的长短变), 位置在相邻层间乱跳
+      //   (对称的闭环上, 接头这一层在左、下一层在右 → 按链号对上的段差着十几度, 层层当成对不上)
+      makeArc(row, a.V, a.m, a.closed, a.h, a.t, opt.union ? [] : a.J, [a.hc, a.tc]);
       row.raw.push({ p: Float32Array.from({ length: 3 * a.m }, (_, k) => E[k % 3] + r * a.V[k]), d: Float32Array.from(a.V.subarray(0, 3 * a.m)) });
     }
     return row;
@@ -410,9 +587,14 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     //   特殊点分不清); 两个都有标签的还要有共同的线
     const cost = (a, b) => {
       if (a.type !== b.type) return Infinity;
-      if (a.lab && b.lab && !sharedLine(a.lab, b.lab)) return Infinity;
+      const sh = a.lab && b.lab ? sharedLine(a.lab, b.lab) : null;
+      if (a.lab && b.lab && !sh) return Infinity;
       const d = angU(a.u, b.u);
-      return d <= 0.35 ? d : Infinity;
+      if (d <= 0.35) return d;
+      // 隔得远也连: 两个末端点在同一条边界线上, 两点之间的那段线没出过这两层的半径范围 —— 就是同一条边 (晕面在这里几乎与
+      //   球壳相切时, 末端沿线跑得很快: 3-1-5-8 Lowitz Σ87.5 入射面的极点线整圈都在 r 15.797–15.812 之内, 层距 0.004 m 末端挪 17°)
+      if (sh && a.type === 'end') { const Q = linePts(sh.id, sh.sa, sh.sb); if (Q.length && inBand(Q, A.r, B.r, BAND)) return d; }
+      return Infinity;
     };
     const nA = A.sp.length, nB = B.sp.length;
     if (!nA || !nB) return pairs;
@@ -497,24 +679,206 @@ export function meshShellSurface(compute, L, E, opt = {}) {
         for (const q of br) if (q !== arc.sp[0] && q !== arc.sp[arc.sp.length - 1]) pts.push({ t: q.t, q });
         pts.push({ t: arc.sp[arc.sp.length - 1].t, q: arc.sp[arc.sp.length - 1] });
         const key = q => keep.has(q.chain) ? q.chain : uniq--;
-        for (let i = 0; i + 1 < pts.length; i++) out.push({ arc, t0: pts[i].t, t1: pts[i + 1].t, k0: key(pts[i].q), k1: key(pts[i + 1].q), loop: false });
+        for (let i = 0; i + 1 < pts.length; i++) out.push({ arc, t0: pts[i].t, t1: pts[i + 1].t, k0: key(pts[i].q), k1: key(pts[i + 1].q), q0: pts[i].q, q1: pts[i + 1].q, loop: false });
       } else if (!br.length) {
         out.push({ arc, t0: 0, t1: arc.len, k0: 'L', k1: 'L', loop: true });
       } else {
         for (let i = 0; i < br.length; i++) {
           const a = br[i], b = br[(i + 1) % br.length];
-          out.push({ arc, t0: a.t, t1: i + 1 < br.length ? b.t : b.t + arc.len, k0: a.chain, k1: b.chain, loop: false });
+          out.push({ arc, t0: a.t, t1: i + 1 < br.length ? b.t : b.t + arc.len, k0: a.chain, k1: b.chain, q0: a, q1: b, loop: false });
         }
       }
     }
     for (const pc of out) { pc.len = pc.t1 - pc.t0; pc.mid = uOn(pc.arc, 0.5 * (pc.t0 + pc.t1)); }
     return out;
   };
-  // 相邻两层 A < B 的分析: 对应段 (pairs: [pa, pb, rev]), 对不上的段, 对不上的特殊点, 天空间距, 边界线弦高
+  // 对应段的一端: 两层的末端点落在同一条边界线上, 而末端沿线跑得比层距快 (晕面在这里几乎与球壳相切 —— 临界半径旁, 或
+  //   边界线整段几乎躺在一层球壳上). 这时按整段弧长比例对应会把这一头拉歪 (对应点隔出十几度, 整条带被当成对不上).
+  //   正确的对应: 长的那一层多出来的一头对着两层之间的那段边界线, 剩下的才对着短的那一层.
+  //   → 每端 null (不用管) 或 { who: 'A' | 'B' (哪一层多出来), x (多出来的弧长), Q (那段线上的点, A 的末端 → B 的末端) }
+  const LONGSIDE = () => Math.max(2 * SKY, 1 * DEG);
+  const sideTrim = (A, B, pa, pb, rev) => {
+    const out = [null, null];
+    if (pa.loop || pb.loop) return out;
+    for (let e = 0; e < 2; e++) {
+      const eb = rev ? 1 - e : e, qa = e ? pa.q1 : pa.q0, qb = eb ? pb.q1 : pb.q0;
+      if (!qa || !qb) continue;
+      // 截断点也一样: 截断球面的切口就是这里的边界 (远处截断球面几乎与球壳相切, 切口沿轮廓一层挪十几度); 没有线上的点可插,
+      //   多出来的一头直接对着两个截断点的连线
+      const isCut = qa.type === 'cut' && qb.type === 'cut';
+      if (!isCut && (qa.type !== 'end' || qb.type !== 'end' || !qa.lab || !qb.lab)) continue;
+      const d = angU(qa.u, qb.u);
+      if (d <= LONGSIDE()) continue;
+      let Q = [];
+      if (!isCut) {
+        const sh = sharedLine(qa.lab, qb.lab);
+        if (!sh) continue;
+        Q = linePts(sh.id, sh.sa, sh.sb);
+        if (!Q.length || !inBand(Q, A.r, B.r, BAND)) continue;
+      }
+      // 对面那一层的弧上离本层末端最近的位置 (从它自己的末端往里找, 至多到 60%)
+      const near = (pc, fromEnd, u) => {
+        const lim = 0.6 * pc.len, st = Math.max(Math.min(0.5 * SKY, lim / 48), lim / 400);
+        let bx = 0, bd = Infinity;
+        for (let x = 0; x <= lim; x += st) { const dd = angU(uOn(pc.arc, fromEnd ? pc.t1 - x : pc.t0 + x), u); if (dd < bd) { bd = dd; bx = x; } }
+        return [bx, bd, st];
+      };
+      const [xb, db, sb] = near(pb, eb === 1, qa.u), [xa, da, sa] = near(pa, e === 1, qb.u);
+      if (xb > 1.5 * sb && db < 0.7 * d && db <= da) out[e] = { who: 'B', x: xb, Q };
+      else if (xa > 1.5 * sa && da < 0.7 * d) out[e] = { who: 'A', x: xa, Q };
+    }
+    // 两头都从同一层上截, 截完得还有剩
+    for (const [w, pc] of [['A', pa], ['B', pb]]) {
+      const x = (out[0] && out[0].who === w ? out[0].x : 0) + (out[1] && out[1].who === w ? out[1].x : 0);
+      if (x > 0.9 * pc.len) { out[0] = out[1] = null; break; }
+    }
+    return out;
+  };
+  // ---- 两层之间, 边界线也是轮廓的一部分 ("接合"): 同一层上两个没延续到对面的末端点, 若都在边界线上、沿线从一个走到另一个的
+  //   那一段整个夹在这两层之间, 那段线就是晕面在这两层之间的边 —— 把它两头的弧接成一条 (拼接段). 几种拓扑变化是同一个道理:
+  //     一条弧的两端互相接上: 弧从线上出生 / 缩回线上消失 (月牙), 或闭环碰到线后张开成弧;
+  //     两条弧的末端接上: 两条弧在线离眼最远 (最近) 处并成一条 / 一条分成两条.
+  //   拼接段照常与对面一层的段对应 (两端的链号, 或闭环对闭环); 顶点 = 各弧自己的顶点 + 线上的点 (网格的边 = 精确边界线).
+  //   拼接段带一条合成的 "弧" (各段的采样点 + 线上的点; 只用来按比例取方向、量间距), 这样后面的代码不用区分
+  const mkVirtual = (seq, closed) => {
+    const us = [];
+    for (const it of seq) {
+      if (it.Q) { for (const p of it.Q) us.push(unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]])); continue; }
+      const n = Math.max(2, Math.ceil(it.pc.len / (0.5 * SKY)));
+      for (let k = 0; k <= n; k++) us.push(uOn(it.pc.arc, it.pc.t0 + (it.rev ? 1 - k / n : k / n) * it.pc.len));
+    }
+    const n = us.length, U = new Float64Array(3 * n), S = new Float64Array(n);
+    for (let i = 0; i < n; i++) { U[3 * i] = us[i][0]; U[3 * i + 1] = us[i][1]; U[3 * i + 2] = us[i][2]; if (i) S[i] = S[i - 1] + angU(us[i - 1], us[i]); }
+    const len = S[n - 1] + (closed ? angU(us[n - 1], us[0]) : 0), sp = [];
+    for (const it of seq) if (it.pc) { const c = it.pc.arc.sp.find(q => q.type === 'cut'); if (c) sp.push(c); }
+    const first = seq[0], last = seq[seq.length - 1];
+    const pc = {
+      arc: { U, n, S, len, closed, sp, virt: true }, t0: 0, t1: len, len, loop: closed, virt: seq,
+      k0: closed ? 'L' : first.rev ? first.pc.k1 : first.pc.k0, k1: closed ? 'L' : last.rev ? last.pc.k0 : last.pc.k1,
+      q0: closed ? null : first.rev ? first.pc.q1 : first.pc.q0, q1: closed ? null : last.rev ? last.pc.q0 : last.pc.q1,
+    };
+    pc.mid = uOn(pc.arc, 0.5 * len);
+    return pc;
+  };
+  const joinPieces = (A, B, row, P, joined) => {
+    // 候选: 段的自由端 (链不延续到对面), 末端点或截断点
+    const ends = [], port = P.map(() => [-1, -1]);
+    P.forEach((pc, i) => {
+      if (pc.loop) return;
+      for (const e of [0, 1]) {
+        const q = e ? pc.q1 : pc.q0, k = e ? pc.k1 : pc.k0;
+        if (q && (q.type === 'end' || q.type === 'cut') && !(typeof k === 'number' && k >= 0)) { port[i][e] = ends.length; ends.push({ i, e, q }); }
+      }
+    });
+    if (ends.length < 2) return P;
+    const cand = [];
+    for (let a = 0; a < ends.length; a++) for (let b = a + 1; b < ends.length; b++) {
+      const qa = ends[a].q, qb = ends[b].q;
+      if (qa.type !== qb.type) continue;
+      if (qa.type === 'cut' && (qa.cutId === undefined || qa.cutId !== qb.cutId)) continue;      // 截断点只接同一段切口的两头
+      let Q = qa.type === 'end' ? linePath(qa, qb, A.r, B.r) : null;
+      const exact = Q !== null;
+      if (!exact) {
+        // 没有边界线可走 (一自由度没有传线; 或截断球面的切口): 挨得近的直接连 —— 两个末端在这两层之间相遇消失 (两条弧并成
+        //   一条 / 一条小弧缩没 / 截断球面刚切进闭环), 它们之间的边界只有这么一小段. 都有标签却走不通的 (两条不相干的边界线
+        //   挨着) 只在很近时连
+        const lim = qa.type === 'cut' ? MAXEDGE : qa.lab && qb.lab ? GAPSKY : 2.5 * GAPSKY;
+        if (angU(qa.u, qb.u) > lim) continue;
+        Q = [];
+      }
+      let l = 0, u = qa.u;
+      for (const p of Q) { const v = unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]]); l += angU(u, v); u = v; }
+      cand.push({ a, b, Q, l: l + angU(u, qb.u), exact });
+    }
+    if (!cand.length) return P;
+    cand.sort((x, y) => x.l - y.l);                       // 短的先接: 每个末端只接一次
+    const jn = new Array(ends.length).fill(null);
+    for (const c of cand) if (!jn[c.a] && !jn[c.b]) {
+      jn[c.a] = { to: c.b, Q: c.Q }; jn[c.b] = { to: c.a, Q: c.Q.slice().reverse() };
+      // 沿精确边界线接上的不再算 "对不上的特殊点"; 直接连的仍算 (照常二分到底, 连线只管把最后剩的小口补上)
+      if (c.exact) { joined.add(ends[c.a].q); joined.add(ends[c.b].q); }
+    }
+    const out = [], done = new Uint8Array(P.length);
+    for (let i = 0; i < P.length; i++) {
+      if (done[i]) continue;
+      const j0 = port[i][0] >= 0 ? jn[port[i][0]] : null, j1 = port[i][1] >= 0 ? jn[port[i][1]] : null;
+      if (!j0 && !j1) { out.push(P[i]); done[i] = 1; continue; }
+      // 找这一串的起点: 从 i 的 0 端往回走, 走到没接的端 (开链) 或回到 i 的 1 端 (闭环)
+      let s = i, ps = 0, closed = false;
+      for (let guard = 0; guard <= P.length; guard++) {
+        const j = port[s][ps] >= 0 ? jn[port[s][ps]] : null;
+        if (!j) break;
+        const nx = ends[j.to];
+        if (nx.i === i && nx.e === 1) { closed = true; s = i; ps = 0; break; }
+        s = nx.i; ps = 1 - nx.e;
+      }
+      // 从 (s, ps) 起: 进 ps 端、出另一端, 沿接合到下一段 …
+      const seq = [];
+      let cur = s, pin = ps;
+      for (let guard = 0; guard <= P.length; guard++) {
+        seq.push({ pc: P[cur], rev: pin === 1 }); done[cur] = 1;
+        const pout = 1 - pin, j = port[cur][pout] >= 0 ? jn[port[cur][pout]] : null;
+        if (!j) break;
+        seq.push({ Q: j.Q });
+        const nx = ends[j.to];
+        if (nx.i === s && nx.e === ps) { closed = true; break; }
+        cur = nx.i; pin = nx.e;
+      }
+      if (seq.length === 1) { out.push(P[i]); continue; }
+      // 一整条开弧, 两端直接连上 (没有边界线): 就是一个闭环 (引擎没把最后一小截走完 —— 灯旁的水滴形轮廓, 尖上差一点;
+      //   或闭环刚在没有线的边界上张开). 当真闭环用 (克隆一条闭合的弧, 顶点仍是原弧的): 鞍点、穹顶收口都照常
+      //   (两端之间有一小段边界线、比半个点距还短的也一样: 灯旁各条边界线都汇到灯上)
+      if (closed && seq.length === 2) {
+        const pc = seq[0].pc, a = pc.arc, u0 = [a.U[0], a.U[1], a.U[2]];
+        if (!a.closed && pc.t0 === 0 && pc.t1 === a.S[a.n - 1] && seq[1].Q.every(q => angU(u0, unit([q[0] - E[0], q[1] - E[1], q[2] - E[2]])) < 0.5 * SKY) && angU(u0, [a.U[3 * a.n - 3], a.U[3 * a.n - 2], a.U[3 * a.n - 1]]) < 0.5 * SKY || !seq[1].Q.length && !a.closed && pc.t0 === 0 && pc.t1 === a.S[a.n - 1]) {
+          const len = a.S[a.n - 1] + angU([a.U[0], a.U[1], a.U[2]], [a.U[3 * a.n - 3], a.U[3 * a.n - 2], a.U[3 * a.n - 1]]);
+          const arc = { U: a.U, n: a.n, S: a.S, len, closed: true, sp: a.sp, ai: a.ai, base: a };
+          const lp = { arc, t0: 0, t1: len, k0: 'L', k1: 'L', loop: true, len };
+          lp.mid = uOn(arc, 0.5 * len);
+          out.push(lp);
+          continue;
+        }
+      }
+      const v = mkVirtual(seq, closed);
+      out.push(v);
+    }
+    return out;
+  };
+  // 这一圈上 8 个点到那一圈的最大夹角 (那一圈按采样点算)
+  const loopDist = (pa, pb) => {
+    const b = pb.arc, st = Math.max(1, b.n >> 7);
+    let mx = 0;
+    for (let k = 0; k < 8; k++) {
+      const u = uOn(pa.arc, pa.t0 + (k + 0.5) / 8 * pa.len);
+      let best = -Infinity;
+      for (let i = 0; i < b.n; i += st) { const c = u[0] * b.U[3 * i] + u[1] * b.U[3 * i + 1] + u[2] * b.U[3 * i + 2]; if (c > best) best = c; }
+      mx = Math.max(mx, best >= 1 ? 0 : Math.acos(Math.max(-1, best)));
+    }
+    return mx;
+  };
+  // 月牙: 拼接成的闭环只有一条弧 + 一段线. 弧与线按比例对应的点得都挨着 (闭环碰到边界线后张开成的弧不是月牙: 两端在线上
+  //   挨得很近, 弧却有一百多度长 —— 它对着的是对面一层的闭环). 返回弧与线的最大间距; 不是月牙返回 −1
+  const lensGap = pc => {
+    if (!pc.virt || !pc.loop || pc.virt.length !== 2) return -1;
+    const sub = pc.virt[0], a = sub.pc, ua = f => uOn(a.arc, a.t0 + (sub.rev ? 1 - f : f) * a.len);
+    const W = [ua(1), ...pc.virt[1].Q.map(p => unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]])), ua(0)], cw = [0];   // 线: 弧的出口端 → 入口端
+    for (let k = 1; k < W.length; k++) cw.push(cw[k - 1] + angU(W[k - 1], W[k]));
+    const lw = cw[cw.length - 1];
+    let g = 0;
+    for (let k = 1; k < 16; k++) {
+      const s = k / 16, tw = s * lw;
+      let j = 1; while (j + 1 < W.length && cw[j] < tw) j++;
+      const f = (tw - cw[j - 1]) / Math.max(1e-15, cw[j] - cw[j - 1]), p = W[j - 1], q = W[j];
+      g = Math.max(g, angU(unit([p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1]), p[2] + f * (q[2] - p[2])]), ua(1 - s)));
+    }
+    return g > 0.5 * MAXEDGE ? -1 : g;
+  };
+  // 相邻两层 A < B 的分析: 对应段 (pairs: [pa, pb, rev, trim]), 对不上的段, 对不上的特殊点, 天空间距, 边界线弦高
   const analyze = (A, B) => {
     const chA = new Set(A.sp.map(q => q.chain)), chB = new Set(B.sp.map(q => q.chain));
     const keep = new Set([...chA].filter(c => chB.has(c)));
-    const PA = piecesOf(A, keep), PB = piecesOf(B, keep);
+    const joined = new Set();
+    const PA = joinPieces(A, B, A, piecesOf(A, keep), joined), PB = joinPieces(A, B, B, piecesOf(B, keep), joined);
     const used = new Set(), pairs = [], unA = [];
     for (const pa of PA) {
       let best = null, bd = Infinity, rev = false;
@@ -527,7 +891,8 @@ export function meshShellSurface(compute, L, E, opt = {}) {
           else if (pb.k0 === pa.k1 && pb.k1 === pa.k0) { ok = true; rv = true; }
         }
         if (!ok) continue;
-        const d = angU(pa.mid, pb.mid);
+        // 闭环: 中点落在哪由起点定 (随意), 改按形状比 —— 这一圈上 8 个点到那一圈的最大距离
+        const d = pa.loop ? loopDist(pa, pb) : angU(pa.mid, pb.mid);
         if (d < bd) { bd = d; best = pb; rev = rv; }
       }
       // 走向再按形状核一遍: 两端 + 四分点的夹角之和, 正反取小 (挨得很近的两个折点在相邻层间可能互换了链号 ——
@@ -539,13 +904,61 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       }
       if (best) { used.add(best); pairs.push([pa, best, rev]); } else unA.push(pa);
     }
-    const unB = PB.filter(pb => !used.has(pb));
-    const spA = A.sp.filter(q => !keep.has(q.chain)), spB = B.sp.filter(q => !keep.has(q.chain));
-    // 天空间距: 对应段上 9 个比例点的最大夹角
+    let unB = PB.filter(pb => !used.has(pb));
+    // 沿边界线接上的末端点不算 "对不上的特殊点" (那段线就是它们在这两层之间的去处)
+    const spA = A.sp.filter(q => !keep.has(q.chain) && !joined.has(q)), spB = B.sp.filter(q => !keep.has(q.chain) && !joined.has(q));
+    // A closed trace can start anywhere and run in either direction. Measure
+    // separation with the same cyclic correspondence used for triangulation.
     let gap = 0;
-    for (const [pa, pb, rev] of pairs) for (let k = 0; k <= 8; k++) {
-      const f = k / 8, fb = rev ? 1 - f : f;
-      gap = Math.max(gap, angU(uOn(pa.arc, pa.t0 + f * pa.len), uOn(pb.arc, pb.t0 + fb * pb.len)));
+    const matched = [];
+    for (const pair of pairs) {
+      const [pa, pb, rev] = pair;
+      let start = rev ? pb.t1 : pb.t0, sign = rev ? -1 : 1;
+      if (pa.loop && pb.loop) {
+        const u = uOn(pa.arc, pa.t0), b = pb.arc;
+        let best = -Infinity;
+        for (let i = 0; i < b.n; i++) {
+          const c = u[0] * b.U[3*i] + u[1] * b.U[3*i+1] + u[2] * b.U[3*i+2];
+          if (c > best) { best = c; start = b.S[i]; }
+        }
+        // 闭环自己打叉 (过灯的 8 字形: 起点常常就在叉点上) 时, 离起点最近的地方有两处 —— 两次经过叉点. 差不多近的都试,
+        //   两个走向也都试, 取四分点对得最近的 (只看最近的那个点会把整圈错开半圈)
+        const thr = Math.cos(Math.min(Math.PI, (best >= 1 ? 0 : Math.acos(best)) + Math.max(SKY, 0.5 * DEG)));
+        const qs = [0.25, 0.5, 0.75].map(f => uOn(pa.arc, pa.t0 + f * pa.len));
+        let bc = Infinity, lastI = -99;
+        for (let i = 0; i < b.n; i++) {
+          if (u[0] * b.U[3*i] + u[1] * b.U[3*i+1] + u[2] * b.U[3*i+2] < thr) continue;
+          if (i - lastI < 3 && i - lastI > 0 && bc < Infinity) { lastI = i; continue; }       // 同一处挨着的点不必都试
+          lastI = i;
+          for (const sg of [1, -1]) {
+            let cs = 0;
+            for (let k = 0; k < 3; k++) cs += angU(qs[k], uOn(b, b.S[i] + sg * (k + 1) / 4 * pb.len));
+            if (cs < bc) { bc = cs; start = b.S[i]; sign = sg; }
+          }
+        }
+      }
+      let g = 0;
+      // 末端沿边界线滑得快的一头先截掉 (那一头对着边界线, 见 sideTrim), 间距只量剩下互相对着的部分
+      const trim = sideTrim(A, B, pa, pb, rev);
+      if (trim[0] || trim[1]) {
+        const cutOf = (w, e) => trim[e] && trim[e].who === w ? trim[e].x : 0;
+        const a0 = pa.t0 + cutOf('A', 0), a1 = pa.t1 - cutOf('A', 1);
+        // pb 在自己的参数里: pa 的 0 端对着 pb 的 (rev ? 1 : 0) 端
+        const b0 = pb.t0 + cutOf('B', rev ? 1 : 0), b1 = pb.t1 - cutOf('B', rev ? 0 : 1);
+        for (let k = 0; k <= 8; k++) {
+          const f = k / 8;
+          g = Math.max(g, angU(uOn(pa.arc, a0 + f * (a1 - a0)), uOn(pb.arc, rev ? b1 - f * (b1 - b0) : b0 + f * (b1 - b0))));
+        }
+        pair.push(trim);
+      } else
+      for (let k = 0; k <= 8; k++) {
+        const f = k / 8;
+        g = Math.max(g, angU(uOn(pa.arc, pa.t0 + f * pa.len), uOn(pb.arc, start + sign * f * pb.len)));
+      }
+      // 对应点隔得比三角形边长上限还远的一对段, 铺出来的三角形会被整条丢掉 (留一条空带): 这不是 "对应", 是这两层之间
+      //   拓扑变了 (开弧两端还在、中段掐成了闭环 …) 或者有一层缺了东西 —— 当对不上的段: 先二分, 分到底就近缝
+      if (g > MAXEDGE) { if (log && opt.debugGap) log(`gap reject r ${A.r.toFixed(5)}..${B.r.toFixed(5)}: g ${(g / DEG).toFixed(2)}° > ${(MAXEDGE / DEG).toFixed(2)}°, rev ${rev}, loop ${pa.loop}/${pb.loop}, len ${(pa.len / DEG).toFixed(2)}/${(pb.len / DEG).toFixed(2)}, k ${pa.k0}|${pa.k1} ${pb.k0}|${pb.k1}, trim ${pair.length > 3}`); unA.push(pa); unB.push(pb); }
+      else { matched.push(pair); gap = Math.max(gap, g); }
     }
     // 边界线在两层之间的弦高 (同一条线上相连的两个末端点之间)
     let lineDev = 0;
@@ -556,8 +969,12 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       const Q = linePts(sh.id, sh.sa, sh.sb);
       if (lineOk(Q, qa.p, qb.p, A.r, B.r)) lineDev = Math.max(lineDev, chordDev(qa.p, qb.p, Q));
     }
-    const event = unA.length > 0 || unB.length > 0 || spA.length > 0 || spB.length > 0;
-    return { pairs, unA, unB, spA, spB, gap, lineDev, event, keep };
+    // 月牙 (一条弧 + 一段边界线围成, 对面没有对应的闭环): 不算对不上, 间距 = 弧与线的最大间距
+    const lens = [];
+    const takeLens = (row, list) => list.filter(pc => { const g = lensGap(pc); if (g < 0) return true; lens.push({ row, pc }); gap = Math.max(gap, g); return false; });
+    const unA2 = takeLens(A, unA); unB = takeLens(B, unB);
+    const event = unA2.length > 0 || unB.length > 0 || spA.length > 0 || spB.length > 0;
+    return { pairs: matched, unA: unA2, unB, spA, spB, gap, lineDev, event, keep, lens };
   };
 
   // ---- 1) 初始层
@@ -572,14 +989,23 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   }
   const rs = [];
   for (let k = 0; k < N0; k++) {
-    const r = rMin * Math.pow(rMax / rMin, k / Math.max(1, N0 - 1));
-    if (Math.abs(r / D - 1) > PINL && !crit.some(rc => Math.abs(r / rc - 1) < 2 * CRIT)) rs.push([r, 'init']);
+    // 首末两层 = 这一段的边界, 半径取准 (pow 的舍入会让它与相邻段差一个末位), 一定算
+    const seam = k === 0 || k === N0 - 1;
+    const r = k === 0 ? rMin : k === N0 - 1 ? rMax : rMin * Math.pow(rMax / rMin, k / Math.max(1, N0 - 1));
+    if (seam || (Math.abs(r / D - 1) > PINL && !crit.some(rc => Math.abs(r / rc - 1) < 2 * CRIT))) rs.push([r, 'init']);
   }
   if (rMin < D * (1 - PINL) && rMax > D * (1 + PINL)) rs.push([D * (1 - PINL), 'lampLo'], [D * (1 + PINL), 'lampHi']);
   for (const rc of crit) rs.push([rc * (1 - CRIT), 'critLo'], [rc * (1 + CRIT), 'critHi']);
   rs.sort((p, q) => p[0] - q[0]);
   let rows = [];
-  for (const [r, kind] of rs) rows.push(buildRow(r, rows[rows.length - 1], null, kind));
+  for (const [r, kind] of rs) {
+    // 交界层不带种子算: 相邻两段各算一次, 都是 "引擎全搜" 这同一个确定的计算, 轮廓逐点相同 (带相邻层的种子的话, 两段的
+    //   相邻层不同, 闭环的起点、取样都不同)
+    const seam = r === rMin || r === rMax;
+    const row = buildRow(r, seam ? null : rows[rows.length - 1], null, kind);
+    row.seam = seam;
+    rows.push(row);
+  }
   if (log) log(`initial ${rows.length} shells, ${crit.length} critical radii, ${LN.length} lines`);
   // 顶点预算 (opt.budget): 铺满大半个天空的晕面每层的线有几百度长. 按初始层估一下顶点数 (加密大约再多一半),
   //   超了就把点距按比例放大 (至多 2°); 加密过程中超了预算就不再为天空间距 / 弦高加层, 只为拓扑变化二分
@@ -589,8 +1015,47 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     if (est > VBUDGET) { SKY = Math.min(2 * DEG, SKY * est / VBUDGET); GAPSKY = Math.max(1.2 * DEG, 3 * SKY); MAXEDGE = Math.max(4 * GAPSKY, 5 * DEG); }
   }
 
+  // ---- 层的一致性校验: 不盲信单独一层.
+  //   轮廓总长随半径连续 (掐断、合并、出生、消失、被截断球面切短时都连续). 夹在 A、B 之间的一层 M 若总长跳出了两邻层的范围
+  //   (odd), 而且放进去以后两侧都对不上 (useless: 只连这三层试一下) —— 这一层多半是引擎漏了 (或重了) 一条轮廓: 它帮不上
+  //   忙, 反而把两侧的带子都毁掉 (3-1-5 Parry Σ87.5: 掐断点旁一层丢了 211° 的闭环, 两侧各留一圈空带).
+  //   先加密种子重算, 再把半径挪一挪 (离开掐断点) 重算; 都不行就不要这一层, 这两层之间不再二分 (就近缝).
+  const lenOf = row => { if (row.slen === undefined) { let l = 0; for (const a of row.arcs) l += a.len; row.slen = l; } return row.slen; };
+  const odd = (M, A, B) => {
+    const la = lenOf(A), lb = lenOf(B), lm = lenOf(M), tol = 0.5 * Math.abs(la - lb) + 0.02 * Math.max(la, lb) + 0.5 * DEG;
+    return lm < Math.min(la, lb) - tol || lm > Math.max(la, lb) + tol;
+  };
+  const useless = (M, A, B) => { relink([A, M, B]); return analyze(A, M).event && analyze(M, B).event; };
+  //   只在两邻层挨得很近 (半径差 < 2%) 时查: 隔得远的两层之间, 轮廓总长本来就可以不单调 (灯旁、铺满全天的晕面), 这时
+  //   拒掉中间的层反而留下一条几米宽、没法再分的带 (一自由度 1-3-2 Σ12: r 24.5–30 之间整段只能就近缝, 21.9 m² 假面)
+  const bad = (M, A, B) => B.r / A.r - 1 < 0.02 && odd(M, A, B) && useless(M, A, B);
+  const checkedRow = (r, A, B, kind) => {
+    let M = buildRow(r, A, B, kind);
+    if (!bad(M, A, B)) return M;
+    stat.retry = (stat.retry || 0) + 1;
+    M = buildRow(r, A, B, kind, true);
+    if (!bad(M, A, B)) return M;
+    for (const f of [0.35, 0.65]) {
+      const r2 = A.r * Math.pow(B.r / A.r, f);
+      if (!(r2 > A.r * (1 + 0.2 * EPSR) && r2 < B.r * (1 - 0.2 * EPSR))) continue;
+      M = buildRow(r2, A, B, kind, true);
+      if (!bad(M, A, B)) return M;
+    }
+    stat.rejected = (stat.rejected || 0) + 1;
+    if (log) log(`shell r ${r.toFixed(5)} rejected: contour length ${(lenOf(M) / DEG).toFixed(1)}° between ${(lenOf(A) / DEG).toFixed(1)}° and ${(lenOf(B) / DEG).toFixed(1)}°, unmatched on both sides`);
+    return null;
+  };
+  // 初始层也查 (交界层、临界半径 / 灯两侧的层不动): 可疑的重算, 还不行就去掉 (留给两邻层之间的二分)
+  for (let k = 1; k + 1 < rows.length; k++) {
+    const A = rows[k - 1], M = rows[k], B = rows[k + 1];
+    if (M.seam || M.kind !== 'init' || !bad(M, A, B)) continue;
+    const M2 = checkedRow(M.r, A, B, 'init');
+    if (M2) rows[k] = M2; else { rows.splice(k, 1); k--; }
+  }
+
   // ---- 5) 加密
-  const pairSkip = (A, B) => A.kind === 'lampLo' && B.kind === 'lampHi' || A.kind === 'critLo' && B.kind === 'critHi' && B.r / A.r - 1 < 3 * CRIT;
+  const noSplit = new Set(), pkey = (A, B) => A.r + ':' + B.r;
+  const pairSkip = (A, B) => A.kind === 'lampLo' && B.kind === 'lampHi' || A.kind === 'critLo' && B.kind === 'critHi' && B.r / A.r - 1 < 3 * CRIT || noSplit.has(pkey(A, B));
   const nearLamp = (A, B) => {
     const dl = row => { if (row.rl === undefined) { let m = Infinity; for (const arc of row.arcs) for (let i = 0; i < arc.n; i += Math.max(1, arc.n >> 6)) { const p = at(row.r, [arc.U[3 * i], arc.U[3 * i + 1], arc.U[3 * i + 2]]); m = Math.min(m, Math.hypot(p[0] - L[0], p[1] - L[1], p[2] - L[2])); } row.rl = m; } return row.rl; };
     return B.r - A.r > 0.35 * Math.max(Math.min(dl(A), dl(B)), 2e-3 * D);
@@ -607,6 +1072,9 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       if (pairSkip(A, B)) continue;
       const ratio = B.r / A.r - 1, mid = Math.sqrt(A.r * B.r);
       if (an.event) { if (ratio > EPSR) { ins.set(mid, [A, B]); why.ev++; } continue; }
+      // A budget limits visual density, but a band wider than the triangle
+      // acceptance limit would be dropped altogether. Resolve it first.
+      if (an.gap > 0.7 * MAXEDGE && ratio > EPSR) { ins.set(mid, [A, B]); continue; }
       if (ratio <= 4 * EPSR) continue;
       if (over) continue;
       if (an.gap > GAPSKY || nearLamp(A, B) || an.lineDev > tol3(B.r)) { ins.set(mid, [A, B]); if (log) { if (an.gap > GAPSKY) why.gap++; else if (an.lineDev > tol3(B.r)) why.line++; else why.lamp++; } }
@@ -632,14 +1100,27 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       }
       if (dev > 2 * tol3(B.r)) { ins.set(Math.sqrt(A.r * B.r), [A, B]); ins.set(Math.sqrt(B.r * C.r), [B, C]); if (log) { why.rad++; if (why.radR.length < 6) why.radR.push(`${B.r.toFixed(3)}:${dev.toFixed(3)}`); } }
     }
-    if (!ins.size || calls >= MAXCALLS || rows.length >= MAXROWS) break;
+    if (!ins.size) break;
+    if (calls >= MAXCALLS || rows.length >= MAXROWS || Date.now() - t0 > SOFTMS) { stat.capped = Date.now() - t0 > SOFTMS ? 'time' : 'rows'; break; }
     const add = [];
     for (const [r, [A, B]] of [...ins.entries()].sort((p, q) => p[0] - q[0])) {
-      if (calls >= MAXCALLS || rows.length + add.length >= MAXROWS) break;
-      add.push(buildRow(r, A, B, 'ref'));
+      if (calls >= MAXCALLS || rows.length + add.length >= MAXROWS || Date.now() - t0 > SOFTMS) break;
+      const M = checkedRow(r, A, B, 'ref');
+      if (M) add.push(M); else noSplit.add(pkey(A, B));
     }
     rows = rows.concat(add).sort((p, q) => p.r - q.r);
     if (log) log(`pass ${pass}: +${add.length} shells (${rows.length}) [事件 ${why.ev}, 天空间距 ${why.gap}, 边界线弦高 ${why.line}, 近灯 ${why.lamp}, 径向弯曲 ${why.rad} ${why.radR.join(' ')}]`);
+  }
+  // 预算收尾: 拓扑变化多的一段, 二分加的层不受预算管 (每层都是整圈轮廓), 顶点数会超出几倍. 加密完再按实际层数把段内点距
+  //   放大到预算以内 (至多 3°; 交界层照旧按 SKY0, 与相邻段对得上)
+  {
+    const v = vEst(rows);
+    if (v > 1.25 * VBUDGET && SKY < 3 * DEG) {
+      // 只放大点距. 层间距 (GAPSKY) 不跟着放大: 层已经按原来的 GAPSKY 加好了, 再放大它, 就近缝的 "够得着" 范围跟着变成
+      //   二十几度, 会把天上隔着 20° 的两个小闭环缝到一起 (3-5-6-8 Lowitz Σ34.5 蓝边 2 的两个尖顶之间多出一张假面)
+      SKY = Math.min(3 * DEG, SKY * v / VBUDGET); MAXEDGE = Math.max(MAXEDGE, 2.5 * SKY);
+      stat.coarsened = +(SKY / DEG).toFixed(2);
+    }
   }
   relink(rows);
   if (opt.debugFinal) opt.debugFinal(rows, analyze);      // 测试 / 排查用: 看最终各层的特殊点与对应
@@ -647,6 +1128,7 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   // ---- 4) / 6) 三角形
   // 每层的顶点: 每条弧上 = 全部特殊点 + 相邻两个特殊点之间按点距均匀取; 上下两条带共用
   const vertsOf = (row, arc) => {
+    if (arc.base) return vertsOf(row, arc.base);       // 克隆的闭合弧 (joinPieces): 顶点是原弧的
     if (arc.vt) return arc.vt;
     const ts = arc.sp.filter(q => q.type !== 'focal').map(q => q.t);
     if (!arc.closed) { ts.push(0, arc.S[arc.n - 1]); }
@@ -654,28 +1136,41 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     const all = [];
     const spans = arc.closed ? (T.length ? T.map((t, i) => [t, i + 1 < T.length ? T[i + 1] : T[0] + arc.len]) : [[0, arc.len]]) : T.slice(0, -1).map((t, i) => [t, T[i + 1]]);
     // 每段按点距取, 但小弧也要保住形状: 闭环全周至少 8 段, 开弧至少 4 段 (比点距还短的小透镜原来只剩一个点, 铺不出三角形)
-    const minSeg = arc.closed ? 8 : 4;
+    const minSeg = arc.closed ? 8 : 4, sky = row.seam ? SKY0 : SKY;
     for (const [a, b] of spans) {
-      const m = Math.max(1, Math.ceil((b - a) / SKY), arc.len > 0 ? Math.ceil(minSeg * (b - a) / arc.len) : 1);
+      const m = Math.max(1, Math.ceil((b - a) / sky), arc.len > 0 ? Math.ceil(minSeg * (b - a) / arc.len) : 1);
       for (let k = 0; k < m; k++) all.push(a + (b - a) * k / m);
     }
     if (!arc.closed) all.push(T[T.length - 1]);
     const vt = { t: Float64Array.from(all), id: new Int32Array(all.length) };
-    for (let i = 0; i < all.length; i++) { const u = uOn(arc, all[i]); vt.id[i] = addV(at(row.r, u), u); }
+    const fs = row.seam ? (row.r === rMin ? 2 : 4) : 0;
+    for (let i = 0; i < all.length; i++) { const u = uOn(arc, all[i]); vt.id[i] = addV(at(row.r, u), u, fs | (!arc.closed && (i === 0 || i === all.length - 1) ? 1 : 0)); }
     arc.vt = vt;
     return vt;
   };
+  const cumFr = ids => { const c = [0]; for (let k = 1; k < ids.length; k++) c.push(c[k - 1] + vang(ids[k - 1], ids[k])); const t = c[c.length - 1] || 1; return c.map(x => x / t); };
+  const lineV = Q => Q.map(p => { stat.lineVerts++; return addV(p, unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]]), 1); });
   // 段 → 顶点序号串 (按 t0 → t1) 与各点在段内的比例
   const pieceVerts = (row, pc) => {
-    const vt = vertsOf(row, pc.arc), n = vt.t.length, ids = [], fr = [];
+    if (pc.virt) {                                     // 拼接段: 各弧自己的顶点 (与上下两条带共用) + 线上的点
+      const ids = [];
+      for (const it of pc.virt) {
+        if (it.Q) { if (!it.V) it.V = lineV(it.Q); ids.push(...it.V); continue; }
+        const V = pieceVerts(row, it.pc);
+        if (it.rev) for (let k = V.ids.length - 1; k >= 0; k--) ids.push(V.ids[k]); else ids.push(...V.ids);
+      }
+      if (pc.loop) ids.push(ids[0]);
+      return { ids, fr: cumFr(ids) };
+    }
+    const vt = vertsOf(row, pc.arc), n = vt.t.length, ids = [], fr = [], ts = [];       // ts: 各顶点在弧上的参数 (鞍点处切段用)
     const L0 = pc.arc.len, span = Math.max(1e-15, pc.t1 - pc.t0);
     if (pc.loop) {
-      for (let i = 0; i < n; i++) { ids.push(vt.id[i]); fr.push((vt.t[i] - vt.t[0]) / L0); }
-      ids.push(vt.id[0]); fr.push(1);
-      return { ids, fr };
+      for (let i = 0; i < n; i++) { ids.push(vt.id[i]); fr.push((vt.t[i] - vt.t[0]) / L0); ts.push(vt.t[i]); }
+      ids.push(vt.id[0]); fr.push(1); ts.push(vt.t[0] + L0);
+      return { ids, fr, ts };
     }
     const eps = 1e-10;
-    const push = (i, t) => { ids.push(vt.id[i]); fr.push((t - pc.t0) / span); };
+    const push = (i, t) => { ids.push(vt.id[i]); fr.push((t - pc.t0) / span); ts.push(t); };
     if (!pc.arc.closed) {
       for (let i = 0; i < n; i++) if (vt.t[i] >= pc.t0 - eps && vt.t[i] <= pc.t1 + eps) push(i, vt.t[i]);
     } else {                                           // 闭环: 从 t0 起绕着走到 t1 (可越过起点, 整周时回到起点)
@@ -689,16 +1184,17 @@ export function meshShellSurface(compute, L, E, opt = {}) {
         push(i, tt);
       }
     }
-    return { ids, fr };
+    return { ids, fr, ts };
   };
   // 两串顶点按比例拉链
-  const zipFr = (A, B, i0 = 0, i1 = A.ids.length - 1, j0 = 0, j1 = B.ids.length - 1) => {
+  const zipFr = (A, B, i0 = 0, i1 = A.ids.length - 1, j0 = 0, j1 = B.ids.length - 1, em = emit) => {
     let i = i0, j = j0;
     while (i < i1 || j < j1) {
-      if (j >= j1 || (i < i1 && A.fr[i + 1] <= B.fr[j + 1])) { emit(A.ids[i], A.ids[i + 1], B.ids[j]); i++; }
-      else { emit(A.ids[i], B.ids[j + 1], B.ids[j]); j++; }
+      if (j >= j1 || (i < i1 && A.fr[i + 1] <= B.fr[j + 1])) { em(A.ids[i], A.ids[i + 1], B.ids[j]); i++; }
+      else { em(A.ids[i], B.ids[j + 1], B.ids[j]); j++; }
     }
   };
+  const emitAny = (a, b, c) => { if (a !== b && b !== c && c !== a) tris.push(a, b, c); };      // 不查边长 (对应关系可信的地方)
   const revV = V => ({ ids: V.ids.slice().reverse(), fr: V.fr.slice().reverse().map(f => 1 - f) });
   // 段端的特殊点在两层上落在同一条三维边界线上: 两层之间沿这条线插入它的点 (边界线就是网格的边)
   const sideLine = (A, B, qa, qb) => {
@@ -706,24 +1202,35 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     if (!sh) return null;
     const Q = linePts(sh.id, sh.sa, sh.sb);
     if (!Q.length || !lineOk(Q, qa.p, qb.p, A.r, B.r)) return null;
-    return Q.map(p => { stat.lineVerts++; return addV(p, unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]])); });
+    return Q.map(p => { stat.lineVerts++; return addV(p, unit([p[0] - E[0], p[1] - E[1], p[2] - E[2]]), 1); });
   };
-  const spAt = (row, pc, end) => {                      // 段一端的特殊点 (按链号)
+  const spAt = (row, pc, end) => {                      // 段一端的特殊点 (链延续到对面的才算)
     const k = end ? pc.k1 : pc.k0;
-    return typeof k === 'number' && k >= 0 ? row.sp.find(q => q.chain === k && q.arc === pc.arc) : null;
+    return typeof k === 'number' && k >= 0 ? (end ? pc.q1 : pc.q0) || null : null;
   };
   const loopAlign = (VA, VB) => {             // 闭环: VB 转到离 VA 起点最近的点起, 两个走向里取四分点对得近的; 比例按累计天空弧长
     const ring = VB.ids.slice(0, -1), m = ring.length;
-    let j0 = 0, bd = Infinity;
-    for (let j = 0; j < m; j++) { const d = vang(VA.ids[0], ring[j]); if (d < bd) { bd = d; j0 = j; } }
-    const mk = sgn => { const ids = []; for (let k = 0; k <= m; k++) ids.push(ring[((j0 + sgn * k) % m + m) % m]); return ids; };
+    let bd = Infinity;
+    for (let j = 0; j < m; j++) bd = Math.min(bd, vang(VA.ids[0], ring[j]));
+    const mk = (j0, sgn) => { const ids = []; for (let k = 0; k <= m; k++) ids.push(ring[((j0 + sgn * k) % m + m) % m]); return ids; };
     const frOf = ids => { const c = [0]; for (let k = 1; k < ids.length; k++) c.push(c[k - 1] + vang(ids[k - 1], ids[k])); const t = c[c.length - 1] || 1; return c.map(x => x / t); };
     const fa = frOf(VA.ids), A2 = { ids: VA.ids, fr: fa };
     const at4 = (V, f) => { let k = 0; while (k + 1 < V.fr.length && V.fr[k + 1] < f) k++; return V.ids[k]; };
-    const cand = [1, -1].map(sg => { const ids = mk(sg); const V = { ids, fr: frOf(ids) }; let c = 0; for (const f of [0.25, 0.5, 0.75]) c += vang(at4(A2, f), at4(V, f)); return [c, V]; });
-    return [A2, cand[0][0] <= cand[1][0] ? cand[0][1] : cand[1][1]];
+    // 起点: 离 VA 起点差不多最近的几个点都试 (闭环自己打叉时最近的地方有两处, 见 analyze), 两个走向都试, 取 7 个等分点对得最近的
+    let best = null, bc = Infinity;
+    const lim = bd + Math.max(SKY, 0.5 * DEG);
+    for (let j0 = 0; j0 < m; j0++) {
+      if (vang(VA.ids[0], ring[j0]) > lim) continue;
+      for (const sg of [1, -1]) {
+        const ids = mk(j0, sg), V = { ids, fr: frOf(ids) };
+        let c = 0;
+        for (let k = 1; k < 8; k++) c += vang(at4(A2, k / 8), at4(V, k / 8));
+        if (c < bc) { bc = c; best = V; }
+      }
+    }
+    return [A2, best];
   };
-  const strip = (A, B, pa, pb, rev) => {
+  const strip = (A, B, pa, pb, rev, trim = null) => {
     let VA = pieceVerts(A, pa), VB = pieceVerts(B, pb);
     if (pa.loop && pb.loop) { if (VA.ids.length > 2 && VB.ids.length > 2) { [VA, VB] = loopAlign(VA, VB); zipFr(VA, VB); } return; }
     if (rev) VB = revV(VB);
@@ -734,29 +1241,61 @@ export function meshShellSurface(compute, L, E, opt = {}) {
       return;
     }
     let i0 = 0, j0 = 0, i1 = VA.ids.length - 1, j1 = VB.ids.length - 1;
+    // 末端沿边界线滑得快的一头 (analyze 里的 sideTrim): 多出来的那一层的这一头与两层之间的那段边界线拉链
+    //   (线: 对面那层的末端 → 这层的末端; 弧: 这层上从截口走到末端), 剩下的部分再与对面那层按比例拉链
+    const longSide = (tr, e) => {
+      const VX = tr.who === 'B' ? VB : VA, pcX = tr.who === 'B' ? pb : pa, n = VX.ids.length;
+      const fx = tr.x / Math.max(1e-15, pcX.len);
+      let m;
+      if (e === 0) { m = 0; while (m + 1 < n - 1 && VX.fr[m + 1] <= fx + 1e-9) m++; if (m < 1) return false; }
+      else { m = n - 1; while (m - 1 > 0 && VX.fr[m - 1] >= 1 - fx - 1e-9) m--; if (m > n - 2) return false; }
+      const Qv = lineV(tr.Q), endA = e === 0 ? VA.ids[0] : VA.ids[VA.ids.length - 1], endB = e === 0 ? VB.ids[0] : VB.ids[VB.ids.length - 1];
+      const X = tr.who === 'B' ? [endA, ...Qv, endB] : [endB, ...Qv.reverse(), endA], Y = [];
+      if (e === 0) for (let k = m; k >= 0; k--) Y.push(VX.ids[k]); else for (let k = m; k <= n - 1; k++) Y.push(VX.ids[k]);
+      // 不查边长: 这一头夹在边界 (线 / 截断球面的切口) 与弧之间, 没有线上的点可插时 (截断点) 三角形又细又长, 但位置是对的
+      zipFr({ ids: X, fr: cumFr(X) }, { ids: Y, fr: cumFr(Y) }, 0, X.length - 1, 0, Y.length - 1, emitAny);
+      if (tr.who === 'B') { if (e === 0) j0 = m; else j1 = m; } else if (e === 0) i0 = m; else i1 = m;
+      stat.longSides = (stat.longSides || 0) + 1;
+      return true;
+    };
+    const t0 = !!(trim && trim[0]) && longSide(trim[0], 0), t1 = !!(trim && trim[1]) && longSide(trim[1], 1);
     // 起点一侧
-    const s0 = VA.ids.length > 2 && VB.ids.length > 2 ? sideLine(A, B, spAt(A, pa, false), spAt(B, pb, rev)) : null;
+    const s0 = !t0 && VA.ids.length > 2 && VB.ids.length > 2 && i1 - i0 >= 1 && j1 - j0 >= 1 ? sideLine(A, B, spAt(A, pa, false), spAt(B, pb, rev)) : null;
     if (s0) {
       const S = [VA.ids[0], ...s0, VB.ids[0]], m = S.length >> 1;
       for (let k = 0; k + 1 < S.length; k++) emit(S[k], S[k + 1], k < m ? VA.ids[1] : VB.ids[1]);
       emit(VA.ids[1], S[m], VB.ids[1]);
       i0 = 1; j0 = 1;
     }
-    const s1 = VA.ids.length > 2 && VB.ids.length > 2 && i1 - i0 >= 1 && j1 - j0 >= 1 ? sideLine(A, B, spAt(A, pa, true), spAt(B, pb, !rev)) : null;
+    const s1 = !t1 && VA.ids.length > 2 && VB.ids.length > 2 && i1 - i0 >= 1 && j1 - j0 >= 1 ? sideLine(A, B, spAt(A, pa, true), spAt(B, pb, !rev)) : null;
     if (s1) {
       const S = [VA.ids[i1], ...s1, VB.ids[j1]], m = S.length >> 1;
       for (let k = 0; k + 1 < S.length; k++) emit(S[k], S[k + 1], k < m ? VA.ids[i1 - 1] : VB.ids[j1 - 1]);
       emit(VA.ids[i1 - 1], S[m], VB.ids[j1 - 1]);
       i1--; j1--;
     }
-    zipFr(VA, VB, i0, i1, j0, j1);
+    if (t0 || t1) {
+      const sub = (V, a, b) => { const f0 = V.fr[a], sp = Math.max(1e-15, V.fr[b] - f0); return { ids: V.ids.slice(a, b + 1), fr: V.fr.slice(a, b + 1).map(f => (f - f0) / sp) }; };
+      zipFr(sub(VA, i0, i1), sub(VB, j0, j1));
+    } else zipFr(VA, VB, i0, i1, j0, j1);
+  };
+  // 月牙 (analyze 里的 lens): 弧与两端之间的那段边界线拉链 (网格的边 = 精确边界线)
+  const lensZip = (row, pc) => {
+    const sub = pc.virt[0], jn = pc.virt[1];
+    let V = pieceVerts(row, sub.pc);
+    if (sub.rev) V = revV(V);
+    if (V.ids.length < 2) return;
+    if (!jn.V) jn.V = lineV(jn.Q);
+    const X = [V.ids[0], ...jn.V.slice().reverse(), V.ids[V.ids.length - 1]];       // 线存的是出口端 → 入口端
+    zipFr({ ids: V.ids, fr: cumFr(V.ids) }, { ids: X, fr: cumFr(X) });
+    stat.lineCaps = (stat.lineCaps || 0) + 1;
   };
   let lampV = -1;
   const capTo = (row, pc, toLamp) => {
     const V = pieceVerts(row, pc);
     if (!V.ids.length) return;
     let c;
-    if (toLamp) { if (lampV < 0) lampV = addV(L, [Dx / D, Dy / D, Dz / D]); c = lampV; }
+    if (toLamp) { if (lampV < 0) lampV = addV(L, [Dx / D, Dy / D, Dz / D], 1); c = lampV; }
     else {
       let x = 0, y = 0, z = 0;
       for (const v of V.ids) { x += VU[3 * v]; y += VU[3 * v + 1]; z += VU[3 * v + 2]; }
@@ -765,9 +1304,34 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     for (let i = 0; i + 1 < V.ids.length; i++) emit(V.ids[i], V.ids[i + 1], c);
     stat.caps++;
   };
+  // 闭环收口 (晕面在这里到了头: 离眼最远 / 最近处与球壳相切). 小的、圆的: 扇形收到中心; 大的 (晕面的顶很平, 最后一层的
+  //   闭环还有几十度长 —— 多半是又扁又长的一条): 从相距最远的两个顶点处分成两半, 两半互相拉链 (三角形横跨窄的方向).
+  //   不查三角形边长: 这一圈里面本来就该铺满
+  const capLoop = (row, pc) => {
+    const V = pieceVerts(row, pc), ring = V.ids[0] === V.ids[V.ids.length - 1] ? V.ids.slice(0, -1) : V.ids.slice(), n = ring.length;
+    if (n < 3) return;
+    let x = 0, y = 0, z = 0;
+    for (const v of ring) { x += VU[3 * v]; y += VU[3 * v + 1]; z += VU[3 * v + 2]; }
+    const c = unit([x, y, z]);
+    let rad = 0;
+    for (const v of ring) rad = Math.max(rad, angU(c, vu(v)));
+    if (rad <= 0.5 * MAXEDGE || n < 6) { capTo(row, pc, false); return; }
+    let bi = 0, bj = 1, bd = -1;
+    const st = Math.max(1, Math.floor(n / 400));
+    for (let i = 0; i < n; i += st) for (let j = i + 1; j < n; j += st) { const d = vang(ring[i], ring[j]); if (d > bd) { bd = d; bi = i; bj = j; } }
+    const C1 = ring.slice(bi, bj + 1), C2 = [];
+    for (let k = bi; k !== bj; k = (k - 1 + n) % n) C2.push(ring[k]);
+    C2.push(ring[bj]);
+    const f1 = cumFr(C1), f2 = cumFr(C2);
+    for (let i = 0, j = 0; i < C1.length - 1 || j < C2.length - 1;) {
+      if (j >= C2.length - 1 || (i < C1.length - 1 && f1[i + 1] <= f2[j + 1])) { if (C1[i] !== C2[j] && C1[i + 1] !== C2[j]) tris.push(C1[i], C1[i + 1], C2[j]); i++; }
+      else { if (C1[i] !== C2[j] && C1[i] !== C2[j + 1]) tris.push(C1[i], C2[j + 1], C2[j]); j++; }
+    }
+    stat.caps++;
+  };
   // 对不上的段 (相邻两层几乎重合时): 每个点找对面对不上的段上视方向最近的点 (LIM 之内), 同一段上脚点单调的一串一串拉链.
   //   ok(w, i, q, j) 可再筛候选 (同一层自缝时排除沿线的近邻). 对面一个候选也没有的点连成串, 放进 lone (调用方再处理)
-  const LIM = 2.5 * GAPSKY;
+  const LIM = 2.5 * GAPSKY + (stat.coarsened ? SKY : 0);
   const sewPass = (S, T, flip, ok, lone) => {
     S.forEach((w, wi) => {
       const ft = w.ids.map((v, i) => { let bq = -1, bj = -1, bd = LIM; T.forEach((x, q) => { for (let j = 0; j < x.ids.length; j++) { if (ok && !ok(wi, i, q, j)) continue; const d = vang(v, x.ids[j]); if (d < bd) { bd = d; bq = q; bj = j; } } }); return bq < 0 ? null : [bq, bj]; });
@@ -839,11 +1403,165 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     };
     return (VB.length ? fanTo(loneA, VB) : selfSew(loneA)) + (VA.length ? fanTo(loneB, VA) : selfSew(loneB));
   };
+  // ---- 鞍点 (晕面内部的拓扑变化: 两条轮廓在两层之间碰到一起、换了搭档 —— 闭环掐成两个 / 两条弧交换端点 / 弧上掐下
+  //   一个闭环; 反过来也一样). 每层上挨得最近的那一对 "不相邻" 的点是双曲线的两个顶点, 两层的四个点围着鞍点.
+  //   各段在这些点处切开; 切出来的小段两两对应成 "臂" (一端是同一条特殊线、另一端是鞍点, 或两端都是鞍点), 每条臂照常
+  //   拉链; 四条臂在中间围出的四边形 (两层各两个点, 交替) 补两个三角形. 这样铺出来的面不重叠、不留洞
+  //   (就近缝 looseSew: 两个方向各缝一遍, 互相重叠, 中间还剩一个洞). 认不出来 (不是鞍点) → false, 调用方退回就近缝
+  const saddleSew = (A, B, UA, UB) => {
+    const why = c => { if (log) log(`saddle? r ${A.r.toFixed(5)}..${B.r.toFixed(5)}: no (${c}), pieces ${UA.length}|${UB.length}`); return false; };
+    if (!UA.length || !UB.length || UA.length + UB.length > 8 || UA.some(pc => pc.virt) || UB.some(pc => pc.virt)) return why(1);
+    const LIMS = 2.5 * GAPSKY, cl = Math.cos(LIMS);
+    const mk = (row, U) => U.map(pc => { const V = pieceVerts(row, pc); return { pc, V, cyc: V.ids.length > 2 && V.ids[0] === V.ids[V.ids.length - 1], cuts: [] }; });
+    const SA = mk(A, UA), SB = mk(B, UB);
+    if (SA.some(s => !s.V.ts) || SB.some(s => !s.V.ts)) return why(2);
+    // 一层上最近的一对不相邻的点 (不同的弧上; 或同一条弧上沿线隔得比直线距离远 3 倍以上). near: 只在这些方向的 LIMS 之内找;
+    //   used: 已经定下的鞍点附近不再找
+    const closest = (S, near, used) => {
+      const C = [];
+      S.forEach((s, p) => {
+        const n = s.V.ids.length - (s.cyc ? 1 : 0), al = s.pc.arc.len;
+        for (let i = 0; i < n; i++) {
+          const u = vu(s.V.ids[i]);
+          if (near && !near.some(q => dot(u, q) > cl)) continue;
+          if (used.some(q => dot(u, q) > cl)) continue;
+          C.push({ p, i, id: s.V.ids[i], u, arc: s.pc.arc, t: s.pc.arc.closed ? ((s.V.ts[i] % al) + al) % al : s.V.ts[i] });
+        }
+      });
+      let best = null, bd = LIMS, cb = cl;
+      for (let x = 0; x < C.length; x++) for (let y = x + 1; y < C.length; y++) {
+        const a = C[x], b = C[y], c = dot(a.u, b.u);
+        if (c <= cb) continue;
+        const d = c >= 1 ? 0 : Math.acos(c);
+        if (a.arc === b.arc) {
+          let al = Math.abs(a.t - b.t);
+          if (a.arc.closed) al = Math.min(al, a.arc.len - al);
+          if (al <= 3 * d || al < 2 * SKY) continue;
+        }
+        bd = d; cb = c; best = { a, b, d };
+      }
+      return best;
+    };
+    const sites = [], usedA = [], usedB = [];
+    for (let it = 0; it < 4; it++) {
+      const a = closest(SA, null, usedA);
+      if (!a) break;
+      const b = closest(SB, [a.a.u, a.b.u], usedB);
+      usedA.push(a.a.u, a.b.u);
+      if (!b) continue;
+      if (Math.max(angU(a.a.u, b.a.u), angU(a.a.u, b.b.u), angU(a.b.u, b.a.u), angU(a.b.u, b.b.u)) > LIMS) continue;
+      usedB.push(b.a.u, b.b.u);
+      const k = sites.length;
+      sites.push({ m: [a.a.id, a.b.id], n: [b.a.id, b.b.id] });
+      SA[a.a.p].cuts.push([a.a.i, k]); SA[a.b.p].cuts.push([a.b.i, k]);
+      SB[b.a.p].cuts.push([b.a.i, k]); SB[b.b.p].cuts.push([b.b.i, k]);
+    }
+    if (!sites.length) return why(3);
+    // 切段: 每段 { pc (给 strip 用的小段), d0, d1 (两端的身份: 'c' + 链号 / 's' + 鞍点号), v0, v1 (两端的顶点) }
+    const subsOf = S => {
+      const out = [];
+      for (const s of S) {
+        const pc = s.pc, V = s.V, n = V.ids.length;
+        if (!s.cuts.length) return null;                                   // 有一段不沾鞍点: 不是单纯的鞍点
+        const cs = s.cuts.slice().sort((x, y) => x[0] - y[0]);
+        for (let k = 1; k < cs.length; k++) if (cs[k][0] === cs[k - 1][0]) return null;
+        const sub = (i0, i1, t0, t1, e0, e1) => {                          // e = [身份, 链号 (给 strip 找边界线) 或 null, 特殊点]
+          const q = { arc: pc.arc, t0, t1, len: t1 - t0, loop: false, k0: e0[1] === null ? uniq-- : e0[1], k1: e1[1] === null ? uniq-- : e1[1], q0: e0[2], q1: e1[2] };
+          q.mid = uOn(pc.arc, 0.5 * (t0 + t1));
+          out.push({ pc: q, d0: e0[0], d1: e1[0], v0: V.ids[i0], v1: V.ids[i1] });
+        };
+        const cutE = c => ['s' + c[1], null, null];
+        if (s.cyc && pc.loop) {                                            // 闭环: k 个切点 → k 段 (一个切点: 整圈, 从切点回到切点)
+          for (let k = 0; k < cs.length; k++) {
+            const a = cs[k], b = cs[(k + 1) % cs.length], wrap = k + 1 >= cs.length;
+            sub(a[0], b[0], V.ts[a[0]], V.ts[b[0]] + (wrap ? pc.arc.len : 0), cutE(a), cutE(b));
+          }
+          continue;
+        }
+        if (cs[0][0] <= 0 || cs[cs.length - 1][0] >= n - 1) return null;   // 切点落在段的端点上
+        const head = [typeof pc.k0 === 'number' && pc.k0 >= 0 ? 'c' + pc.k0 : 'u' + (uniq--), typeof pc.k0 === 'number' && pc.k0 >= 0 ? pc.k0 : null, pc.q0 || null];
+        const tail = [typeof pc.k1 === 'number' && pc.k1 >= 0 ? 'c' + pc.k1 : 'u' + (uniq--), typeof pc.k1 === 'number' && pc.k1 >= 0 ? pc.k1 : null, pc.q1 || null];
+        sub(0, cs[0][0], pc.t0, V.ts[cs[0][0]], head, cutE(cs[0]));
+        for (let k = 0; k + 1 < cs.length; k++) sub(cs[k][0], cs[k + 1][0], V.ts[cs[k][0]], V.ts[cs[k + 1][0]], cutE(cs[k]), cutE(cs[k + 1]));
+        sub(cs[cs.length - 1][0], n - 1, V.ts[cs[cs.length - 1][0]], pc.t1, cutE(cs[cs.length - 1]), tail);
+      }
+      return out;
+    };
+    const XA = subsOf(SA), XB = subsOf(SB);
+    if (!XA || !XB) return why(4);
+    // 臂: 两端身份相同的一对 (多个候选取中点最近的); 走向: 身份不同的两端直接定, 相同的按四分点
+    const gapOf = (pa, pb, rev) => { let g = 0; for (let k = 0; k <= 8; k++) g = Math.max(g, angU(uOn(pa.arc, pa.t0 + k / 8 * pa.len), uOn(pb.arc, pb.t0 + (rev ? 1 - k / 8 : k / 8) * pb.len))); return g; };
+    const same = (a, b) => (a.d0 === b.d0 && a.d1 === b.d1) || (a.d0 === b.d1 && a.d1 === b.d0);
+    const revOf = (a, b) => {
+      if (a.d0 !== a.d1) return a.d0 !== b.d0;
+      const cst = r2 => { let c = 0; for (const f of [0.25, 0.5, 0.75]) c += angU(uOn(a.pc.arc, a.pc.t0 + f * a.pc.len), uOn(b.pc.arc, b.pc.t0 + (r2 ? 1 - f : f) * b.pc.len)); return c; };
+      return cst(true) < cst(false);
+    };
+    const arms = [], usedX = new Set();
+    for (const a of XA) {
+      let best = null, bd = Infinity;
+      for (const b of XB) {
+        if (usedX.has(b) || !same(a, b)) continue;
+        const d = angU(a.pc.mid, b.pc.mid);
+        if (d < bd) { bd = d; best = b; }
+      }
+      if (!best) continue;
+      const rev = revOf(a, best);
+      if (gapOf(a.pc, best.pc, rev) > MAXEDGE) return why(6);
+      usedX.add(best); usedX.add(a);
+      arms.push({ a, b: best, rev });
+    }
+    if (!arms.length) return why(5);
+    // 没配上的小段. 同一层上两条、两端是同样的两个鞍点 (s_k, s_l, k ≠ l): 晕面的一道折回脊斜穿过这两层 —— 这一层上两条轮廓
+    //   中间那一截面对面挨着, 到对面那层已经汇合消失; 两截互相拉链. 两端是同一个鞍点的小段 (对面那层在鞍点处的发夹弯):
+    //   留着, 它与各臂在鞍点处围成的小多边形由最后的补洞补上. 别的 (带着特殊线的端却没有对应) → 认不出来
+    const ridges = [];
+    for (const [X, row] of [[XA, A], [XB, B]]) {
+      const left = X.filter(x => !usedX.has(x));
+      for (let i = 0; i < left.length; i++) {
+        const a = left[i];
+        if (usedX.has(a)) continue;
+        if (a.d0[0] !== 's' || a.d1[0] !== 's') return why(4);
+        if (a.d0 === a.d1) { if (a.pc.len > 2 * LIMS) return why(7); continue; }
+        const b = left.find((x, j) => j > i && !usedX.has(x) && same(a, x));
+        if (!b) return why(7);
+        const rev = a.d0 !== b.d0;
+        if (gapOf(a.pc, b.pc, rev) > MAXEDGE) return why(6);
+        usedX.add(a); usedX.add(b);
+        ridges.push({ row, a, b, rev });
+      }
+    }
+    for (const { a, b, rev } of arms) strip(A, B, a.pc, b.pc, rev);
+    for (const { row, a, b, rev } of ridges) {
+      const VX = pieceVerts(row, a.pc);
+      let VY = pieceVerts(row, b.pc);
+      if (rev) VY = revV(VY);
+      if (VX.ids.length >= 2 && VY.ids.length >= 2) zipFr({ ids: VX.ids, fr: cumFr(VX.ids) }, { ids: VY.ids, fr: cumFr(VY.ids) });
+    }
+    // 每个鞍点: 四条臂的鞍点端连出的四条边正好是 m0-n0, m0-n1, m1-n0, m1-n1 时, 中间的四边形补两个三角形
+    //   (不是这种的 —— 有折回脊 / 发夹弯 —— 留给最后的补洞)
+    for (let k = 0; k < sites.length; k++) {
+      const { m, n } = sites[k], got = new Set();
+      let ok = true;
+      for (const { a, b, rev } of arms) for (const e of [0, 1]) {
+        if ((e ? a.d1 : a.d0) !== 's' + k) continue;
+        const va = e ? a.v1 : a.v0, vb = (e ? !rev : rev) ? b.v1 : b.v0;
+        const i = m.indexOf(va), j = n.indexOf(vb);
+        if (i < 0 || j < 0) ok = false; else got.add(i * 2 + j);
+      }
+      if (!ok || got.size !== 4) continue;
+      if (vang(m[0], m[1]) <= vang(n[0], n[1])) { emit(m[0], n[0], m[1]); emit(m[0], m[1], n[1]); }
+      else { emit(n[0], m[0], n[1]); emit(n[0], n[1], m[1]); }
+    }
+    stat.saddles = (stat.saddles || 0) + sites.length;
+    return true;
+  };
   for (let k = 0; k + 1 < rows.length; k++) {
     const A = rows[k], B = rows[k + 1];
     if (!A.arcs.length && !B.arcs.length) continue;
     const an = analyze(A, B);
-    for (const [pa, pb, rev] of an.pairs) strip(A, B, pa, pb, rev);
+    for (const [pa, pb, rev, trim] of an.pairs) strip(A, B, pa, pb, rev, trim);
+    for (const { row, pc } of an.lens) lensZip(row, pc);
     if (!an.unA.length && !an.unB.length) continue;
     // 灯两侧那一对层: 晕面若过灯, 灯旁的段缩向灯的方向 (锥顶) —— 对不上的、靠近灯方向 (20° 内) 的段收到灯上
     if (A.kind === 'lampLo' && B.kind === 'lampHi') {
@@ -852,7 +1570,8 @@ export function meshShellSurface(compute, L, E, opt = {}) {
         const V = pieceVerts(row, pc);
         if (V.ids.every(v => angU(vu(v), ul) < 20 * DEG)) capTo(row, pc, true); else out.push(pc);
       }
-      if (UA.length || UB.length) { const unc = looseSew(A, B, UA, UB); if (unc > 1.5 * SKY) { stat.loose++; stat.looseDeg += unc / DEG; } }
+      // 剩下的: 多半是两个闭环在灯这个点上碰着 (另一侧是一个绕过灯的闭环) —— 就是掐断点在灯上的鞍点
+      if ((UA.length || UB.length) && !saddleSew(A, B, UA, UB)) { const unc = looseSew(A, B, UA, UB); if (unc > 1.5 * SKY) { stat.loose++; stat.looseDeg += unc / DEG; } }
       continue;
     }
     stat.events++;
@@ -865,9 +1584,40 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     // 一侧只剩一个闭环、对面什么也没有: 晕面像穹顶一样收成一点 (离眼最远 / 最近处与球壳在一点相切), 闭环收成扇形.
     //   (两个闭环同时消失 —— 一里一外 —— 是一圈折回, 留给下面的同层自缝; 单个闭环对边的沿线距离只有直线的 π/2 倍, 自缝不缝它)
     //   3-5-6-8 Parry Σ34.5: r≈14.43 处最后一层还剩 8.8° 的闭环, 原来中间留一个五边形的洞
-    if (!UB.length && UA.length === 1 && UA[0].loop) { capTo(A, UA[0], false); UA.length = 0; }
-    if (!UA.length && UB.length === 1 && UB[0].loop) { capTo(B, UB[0], false); UB.length = 0; }
-    if (UA.length || UB.length) {
+    //   几个闭环同时消失: 互不相套的 (几个互不相干的尖顶 / 几条并排的扁长条) 各收各的; 套在一起的才是一圈折回
+    const domes = (row, U) => {
+      // 点 c 在不在闭环 ring 里面: 绕 c 的方位角转过的圈数
+      const inside = (c, ring) => {
+        const e1 = unit(Math.abs(c[2]) < 0.9 ? [-c[1], c[0], 0] : [0, -c[2], c[1]]), e2 = [c[1] * e1[2] - c[2] * e1[1], c[2] * e1[0] - c[0] * e1[2], c[0] * e1[1] - c[1] * e1[0]];
+        let w = 0, prev = null;
+        for (let k = 0; k <= ring.length; k++) {
+          const u = vu(ring[k % ring.length]), x = dot(u, e1), y = dot(u, e2);
+          if (x === 0 && y === 0) return true;
+          const b = Math.atan2(y, x);
+          if (prev !== null) { let d = b - prev; if (d > Math.PI) d -= 2 * Math.PI; else if (d < -Math.PI) d += 2 * Math.PI; w += d; }
+          prev = b;
+        }
+        return Math.abs(w) > Math.PI;
+      };
+      const info = U.map(pc => {
+        if (!pc.loop) return null;
+        const V = pieceVerts(row, pc), ring = V.ids[0] === V.ids[V.ids.length - 1] ? V.ids.slice(0, -1) : V.ids;
+        let x = 0, y = 0, z = 0;
+        for (const v of ring) { x += VU[3 * v]; y += VU[3 * v + 1]; z += VU[3 * v + 2]; }
+        return { c: unit([x, y, z]), ring };
+      });
+      return U.filter((pc, i) => {
+        const a = info[i];
+        if (!a) return true;
+        // 套在一起的 (一个的中心落在另一个里面): 一圈折回, 不单独收
+        for (let j = 0; j < U.length; j++) if (j !== i && info[j] && (inside(a.c, info[j].ring) || inside(info[j].c, a.ring))) return true;
+        capLoop(row, pc);
+        return false;
+      });
+    };
+    if (!UB.length && UA.length) { const U2 = domes(A, UA); UA.length = 0; UA.push(...U2); }
+    if (!UA.length && UB.length) { const U2 = domes(B, UB); UB.length = 0; UB.push(...U2); }
+    if ((UA.length || UB.length) && !saddleSew(A, B, UA, UB)) {
       const unc = looseSew(A, B, UA, UB);
       if (unc > 1.5 * SKY) { stat.loose++; stat.looseDeg += unc / DEG; }
     }
@@ -876,9 +1626,9 @@ export function meshShellSurface(compute, L, E, opt = {}) {
   // ---- 特殊线输出 (折叠线、焦线): 各链按半径排的点
   const chains = new Map();
   for (const row of rows) for (const q of row.sp) {
-    if (q.type !== 'fold' && q.type !== 'focal') continue;
+    if (q.type !== 'fold' && q.type !== 'focal' && !q.foldAt) continue;
     let c = chains.get(q.chain);
-    if (!c) { c = { kind: q.type, pts: [], dirs: [] }; chains.set(q.chain, c); }
+    if (!c) { c = { kind: q.type === 'focal' ? 'focal' : 'fold', pts: [], dirs: [] }; chains.set(q.chain, c); }
     c.pts.push(...q.p); c.dirs.push(...q.u);
   }
   // 折叠线只画延续得够长的: 径向跨度不到所在半径 15% 的 (且两头都不碰这一段的半径边界 —— 碰到的可能接着下一段) 不画.
@@ -916,6 +1666,83 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     }
     special.push({ kind: c.kind, p: Float32Array.from(c.pts), d: Float32Array.from(c.dirs) });
     if (c.kind === 'fold') stat.folds++; else stat.focal++;
+  }
+
+  // ---- 自检与补洞 ("贴边检验"). 把所有三角形的边数一遍: 只属于一个三角形的边 (开口边) 应该都是晕面的真边界 —— 两端都是
+  //   末端点 / 截断点 / 边界线上的点, 或都在这一段的最里 (最外) 一层上 (与相邻段相接). 其余的开口边是缺口: 拓扑变化处就近缝
+  //   剩下的小洞 (鞍点: 两条弧在两层之间换了搭档, 中间剩一个四边形 …). 围成小闭环的 (或两头在边界上、隔得很近的一小串)
+  //   补上 (最小面积三角化); 补不了的记进 stat.openDeg (天空里的总长, 度), 页面与测试拿它判这一段网格是否完整
+  stat.openN = 0; stat.openDeg = 0; stat.holesFilled = 0;
+  {
+    // 位置相同的顶点并成一个 (沿边界线插的点, 相邻几条带各加了一次)
+    const canon = new Int32Array(nv), km = new Map();
+    for (let v = 0; v < nv; v++) {
+      const k = VP[3 * v] + ',' + VP[3 * v + 1] + ',' + VP[3 * v + 2], c = km.get(k);
+      if (c === undefined) { km.set(k, v); canon[v] = v; } else { canon[v] = c; VF[c] |= VF[v]; }
+      // 截断球面上 (离灯 ≥ 截断距离) 与灯旁的顶点也算在边界上: 截断处晕面的边是截断球面的切口, 灯是锥顶
+      const dl = Math.hypot(VP[3 * v] - L[0], VP[3 * v + 1] - L[1], VP[3 * v + 2] - L[2]);
+      if (dl >= maxD * (1 - 2e-3) || dl < 3e-3 * D) VF[canon[v]] |= 1;
+    }
+    const K = 4194304, cnt = new Map();
+    const add = (u, v) => { const k = u < v ? u * K + v : v * K + u; cnt.set(k, (cnt.get(k) || 0) + 1); };
+    for (let i = 0; i < tris.length; i += 3) {
+      const a = canon[tris[i]], b = canon[tris[i + 1]], c = canon[tris[i + 2]];
+      if (a === b || b === c || c === a) continue;
+      add(a, b); add(b, c); add(c, a);
+    }
+    const adj = new Map();
+    const nb = (u, v) => { const l = adj.get(u); if (l) l.push(v); else adj.set(u, [v]); };
+    for (const [k, n] of cnt) {
+      if (n !== 1) continue;
+      const a = Math.floor(k / K), b = k % K;
+      if ((VF[a] & 1 && VF[b] & 1) || (VF[a] & VF[b] & 6)) continue;
+      nb(a, b); nb(b, a);
+    }
+    const fillLoop = seq => {                              // 最小面积三角化 (动态规划; 顶点数 ≤ 28)
+      const n = seq.length, X = seq.map(v => [VP[3 * v], VP[3 * v + 1], VP[3 * v + 2]]);
+      const area = (i, j, k) => {
+        const ux = X[j][0] - X[i][0], uy = X[j][1] - X[i][1], uz = X[j][2] - X[i][2], vx = X[k][0] - X[i][0], vy = X[k][1] - X[i][1], vz = X[k][2] - X[i][2];
+        return Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
+      };
+      const C = new Float64Array(n * n), Kx = new Int32Array(n * n).fill(-1);
+      for (let len = 2; len < n; len++) for (let i = 0; i + len < n; i++) {
+        const j = i + len;
+        let best = Infinity, bk = -1;
+        for (let k = i + 1; k < j; k++) { const c = C[i * n + k] + C[k * n + j] + area(i, k, j); if (c < best) { best = c; bk = k; } }
+        C[i * n + j] = best; Kx[i * n + j] = bk;
+      }
+      const rec = (i, j) => { if (j - i < 2) return; const k = Kx[i * n + j]; tris.push(seq[i], seq[k], seq[j]); rec(i, k); rec(k, j); };
+      rec(0, n - 1);
+    };
+    const seen = new Set();
+    for (const v0 of adj.keys()) {
+      if (seen.has(v0)) continue;
+      const comp = [], st = [v0];
+      seen.add(v0);
+      while (st.length) { const v = st.pop(); comp.push(v); for (const w of adj.get(v)) if (!seen.has(w)) { seen.add(w); st.push(w); } }
+      const deg1 = [];
+      let simple = true, ne = 0;
+      for (const v of comp) { const d = adj.get(v).length; ne += d; if (d === 1) deg1.push(v); else if (d !== 2) simple = false; }
+      let loop = null;
+      if (simple && comp.length >= 3 && comp.length <= 28 && (deg1.length === 0 || deg1.length === 2)) {
+        const start = deg1.length ? deg1[0] : comp[0], seq = [start];
+        for (let prev = -1, cur = start; seq.length <= comp.length;) {
+          const l = adj.get(cur), nx = l[0] !== prev ? l[0] : l[1];
+          if (nx === undefined || nx === start) break;
+          seq.push(nx); prev = cur; cur = nx;
+        }
+        if (seq.length === comp.length) {
+          let diam = 0;
+          for (let i = 0; i < seq.length; i++) for (let j = i + 1; j < seq.length; j++) diam = Math.max(diam, vang(seq[i], seq[j]));
+          // 一小串 (不闭合): 两头在边界上、隔得很近才补 (补上的那条弦成了新的边界边)
+          if (diam <= MAXEDGE && (deg1.length === 0 || (VF[seq[0]] & 1 && VF[seq[seq.length - 1]] & 1 && vang(seq[0], seq[seq.length - 1]) <= 2.5 * GAPSKY))) loop = seq;
+        }
+      }
+      if (loop) { fillLoop(loop); stat.holesFilled++; continue; }
+      if (log) { let l = 0; for (const v of comp) for (const w of adj.get(v)) if (v < w) l += vang(v, w) / DEG; const v = comp[0], rr = Math.hypot(VP[3 * v] - E[0], VP[3 * v + 1] - E[1], VP[3 * v + 2] - E[2]); log(`open: ${ne / 2} edges ${l.toFixed(2)}° at r ${rr.toFixed(4)} sky ${(Math.atan2(VU[3 * v + 1], VU[3 * v]) / DEG).toFixed(2)}/${(Math.asin(VU[3 * v + 2]) / DEG).toFixed(2)}, ${comp.length} verts, deg1 ${deg1.length}, simple ${simple}`); }
+      stat.openN += ne / 2;
+      for (const v of comp) for (const w of adj.get(v)) if (v < w) stat.openDeg += vang(v, w) / DEG;
+    }
   }
 
   // ---- 输出: 每个三角形三个顶点依次排; 法向 = 共顶点且朝向相近 (夹角 < 60°) 的面法向之和 (至多看 48 个)
@@ -961,5 +1788,6 @@ export function meshShellSurface(compute, L, E, opt = {}) {
     prev = row;
   }
   stat.rows = rows.filter(r => r.arcs.length).length; stat.calls = calls; stat.ms = Date.now() - t0; stat.skipped = nSkip;
+  if (log) log('stat ' + JSON.stringify(stat));
   return { pos, dir, h: hh, nrm, nTri: nT, lines, special, stat, rowR: rows.filter(r => r.arcs.length).map(r => r.r) };
 }

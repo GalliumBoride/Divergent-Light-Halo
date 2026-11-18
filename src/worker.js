@@ -20,7 +20,7 @@ import { surfaceMesh1 } from './engine/mesh1.js';
 import { lightCone2DofLayers, parallelArc2Dof, edges2Dof, resolveSurface, causticRims2Dof, rank1Fences } from './engine/epdiv.js';
 import * as OC from './engine/obscaustic.js';
 import { fold2DofFine, fold1DofFine, seam1DofFine } from './engine/obsfine.js';
-import { computeShell, computeShell2Dof } from './engine/divshell.js';
+import { computeShell, computeShell2Dof, poleLines2Dof } from './engine/divshell.js';
 import { trimFill } from './app/spacing.js';
 import { stitchLayers2 } from './engine/stitch2.js';
 import { skyStepOf } from './engine/mesh2s.js';
@@ -101,7 +101,7 @@ const RUN = {
     try { m = meshShellSurface(compute, L, E, { maxD: a.maxD, lines, skyStep: sky, budget: a.budget, rMin: a.rMin, rMax: a.rMax, rows: a.rows, cancelled: () => Date.now() - t0 > limit }); }
     catch (e) { return { ok: false, why: String(e && e.message || e) }; }
     if (!(m.nTri > 0) && !m.special.length) return { ok: false, why: 'empty' };
-    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, special: m.special, rows: m.stat.rows, loose: m.stat.looseDeg, ms: Date.now() - t0 };
+    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, special: m.special, rows: m.stat.rows, loose: m.stat.looseDeg, skipped: m.stat.skipped, open: m.stat.openDeg, filled: m.stat.holesFilled, ms: Date.now() - t0 };
   },
 
   bdry1: a => {
@@ -195,6 +195,15 @@ const RUN = {
     const lp = a.fp.map(lpFaceFromCompact);
     const surf = resolveSurface(lp, a.surf);
     const e = edges2Dof(lp, a.el, a.dist, a.eye, a.maxD, a.lowitz, a.zeta, a.theta, surf, null, true);
+    // 极点线 (engine/divshell.js poleLines2Dof): 只在一个灯光仰角上存在的边界线 (Lowitz: 过灯的水平面里), 上面按 h 延拓的
+    //   追不出来; 闭式直接给, 按角点上的另一条边界归到同一个桶里 (画法、网格骨架都与其它边界线一样)
+    if (surf && surf !== 'caustic') {
+      const el = a.el * Math.PI / 180, L = [a.dist * Math.cos(el), 0, a.dist * Math.sin(el)], E = [0, 0, a.eye];
+      for (const pl of poleLines2Dof(a.fp.map(baseNormalFromCompact), a.lowitz ? 'lowitz' : 'column', a.lowitz ? a.theta : a.zeta, a.n, L, E, true, a.maxD, surf.replace('deg', 'seam'))) {
+        e[pl.other === 'entry' ? 'entry' : pl.other.startsWith('seam') ? 'seam' : 'tir'].push({ p: pl.p, d: pl.d });
+        e.tracks.push({ kind: 'pole', label: surf + '|' + pl.other, n: pl.p.length / 3, h0: NaN, h1: NaN, nShadow: 0 });
+      }
+    }
     e.parArc = parallelArc2Dof(lp, a.el, a.eye, a.nG, a.lowitz, a.zeta, a.theta, surf, true);
     e.surf = surf;
     return e;
@@ -233,10 +242,10 @@ const RUN = {
       return { arcs: res.curves.filter(c => (wantC ? c.kind === 0 : allF ? c.kind !== 0 : c.name === sf) && c.p.length >= 1).map(c => ({ p: c.p, d: c.dir, closed: c.closed })), focal: wantC ? res.focalP : [], states: res.states || null };
     };
     let m;
-    try { m = meshShellSurface(compute, a.L, a.E, { maxD: a.maxD, lines: a.lines || [], skyStep: sky, budget: a.budget, rMin: a.rMin, rMax: a.rMax, rows: a.rows, cancelled: () => Date.now() - t0 > limit }); }
+    try { m = meshShellSurface(compute, a.L, a.E, { maxD: a.maxD, lines: a.lines || [], skyStep: sky, budget: a.budget, rMin: a.rMin, rMax: a.rMax, rows: a.rows, union: allF, cancelled: () => Date.now() - t0 > limit }); }
     catch (e) { return { ok: false, why: String(e && e.message || e) }; }
     if (!(m.nTri > 0) && !m.special.length) return { ok: false, why: 'empty' };
-    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, special: m.special, rows: m.stat.rows, loose: m.stat.looseDeg, ms: Date.now() - t0 };
+    return { ok: true, pos: m.pos, dir: m.dir, h: m.h, nrm: m.nrm, nTri: m.nTri, lines: m.lines, special: m.special, rows: m.stat.rows, loose: m.stat.looseDeg, skipped: m.stat.skipped, open: m.stat.openDeg, filled: m.stat.holesFilled, ms: Date.now() - t0 };
   },
 
   shell1: a => {
